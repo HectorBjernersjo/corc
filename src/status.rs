@@ -11,7 +11,8 @@
 //! | Idle    | pane alive, turn complete, viewed since  | empty < 1h, else coarse |
 //! | Dead    | no pane                                  | coarse age, hours+     |
 //!
-//! Seconds are never shown anywhere.
+//! Every time column is a single largest unit — `9s`, `4m`, `2h`, `3d`, `5w`
+//! — so the column stays narrow. Idle/Dead are never finer than hours.
 
 use crate::discovery::{Meta, TurnState};
 use std::time::SystemTime;
@@ -62,16 +63,13 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
     match status {
         Status::Running => meta
             .and_then(|m| m.turn_started_at)
-            .map(|start| fmt_minutes(now.saturating_sub(start)))
+            .map(|start| fmt_duration(now.saturating_sub(start)))
             .unwrap_or_default(),
         Status::Unseen => meta
             .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
-            .map(|(start, done)| fmt_minutes(done.saturating_sub(start)))
+            .map(|(start, done)| fmt_duration(done.saturating_sub(start)))
             .unwrap_or_default(),
-        Status::Idle => {
-            let age = now.saturating_sub(last_activity(meta, created_at));
-            if age < 3600 { String::new() } else { coarse_age(age) }
-        }
+        Status::Idle => coarse_age(now.saturating_sub(last_activity(meta, created_at))),
         Status::Dead => coarse_age(now.saturating_sub(last_activity(meta, created_at))),
     }
 }
@@ -86,22 +84,29 @@ pub fn last_activity(meta: Option<&Meta>, created_at: u64) -> u64 {
         .unwrap_or(created_at)
 }
 
-/// Minute-granular duration: `4m`, `1h12m`, `2h`. Never seconds.
-fn fmt_minutes(secs: u64) -> String {
-    let mins = secs / 60;
-    match (mins / 60, mins % 60) {
-        (0, m) => format!("{m}m"),
-        (h, 0) => format!("{h}h"),
-        (h, m) => format!("{h}h{m}m"),
+/// Largest-unit duration: `9s`, `4m`, `2h`, `3d`, `5w`. Always exactly one
+/// unit, so the time column stays narrow.
+fn fmt_duration(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    match secs {
+        s if s < MIN => format!("{s}s"),
+        s if s < HOUR => format!("{}m", s / MIN),
+        s if s < DAY => format!("{}h", s / HOUR),
+        s if s < WEEK => format!("{}d", s / DAY),
+        s => format!("{}w", s / WEEK),
     }
 }
 
-/// Coarse age: `5h`, `3d` — never finer than hours, empty under an hour.
+/// Coarse age for Idle/Dead: single unit, never finer than hours, empty
+/// under an hour.
 fn coarse_age(secs: u64) -> String {
-    match secs / 3600 {
-        0 => String::new(),
-        h if h < 24 => format!("{h}h"),
-        h => format!("{}d", h / 24),
+    if secs < 3600 {
+        String::new()
+    } else {
+        fmt_duration(secs)
     }
 }
 
@@ -147,8 +152,11 @@ mod tests {
         let running = meta(TurnState::Mid, Some(now - 4 * 60 - 30), None);
         assert_eq!(time_column(Status::Running, Some(&running), 0, now), "4m");
 
+        // Under a minute shows seconds; only ever one unit past that.
+        let fresh = meta(TurnState::Mid, Some(now - 9), None);
+        assert_eq!(time_column(Status::Running, Some(&fresh), 0, now), "9s");
         let long = meta(TurnState::Mid, Some(now - 3600 - 12 * 60), None);
-        assert_eq!(time_column(Status::Running, Some(&long), 0, now), "1h12m");
+        assert_eq!(time_column(Status::Running, Some(&long), 0, now), "1h");
 
         let done = meta(TurnState::Complete, Some(1000), Some(1000 + 25 * 60));
         assert_eq!(time_column(Status::Unseen, Some(&done), 0, now), "25m");
@@ -172,6 +180,11 @@ mod tests {
         assert_eq!(
             time_column(Status::Dead, Some(&idle(now - 3 * 86_400)), 0, now),
             "3d"
+        );
+        // Past a week, collapse to weeks — still a single unit.
+        assert_eq!(
+            time_column(Status::Dead, Some(&idle(now - 8 * 86_400)), 0, now),
+            "1w"
         );
         // No jsonl yet: age falls back to created_at.
         assert_eq!(time_column(Status::Dead, None, now - 7200, now), "2h");

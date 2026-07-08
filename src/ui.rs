@@ -17,7 +17,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -846,8 +846,7 @@ impl App {
             .map(|&i| ListItem::new(truncate(&display_dir(&p.dirs[i].to_string_lossy()), width)))
             .collect();
         let mut list_state = ListState::default().with_selected(Some(p.selected));
-        let list =
-            List::new(items).highlight_style(Style::default().bg(Color::Rgb(45, 50, 68)));
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, rows[1], &mut list_state);
     }
 
@@ -870,8 +869,8 @@ impl App {
                     let (dot, color) = match status {
                         Status::Running => ("●", Color::Yellow),
                         Status::Unseen => ("●", Color::Blue),
-                        Status::Idle => ("●", Color::DarkGray),
-                        Status::Dead => ("○", Color::DarkGray),
+                        Status::Idle => ("●", Color::Gray),
+                        Status::Dead => ("○", Color::Gray),
                     };
                     let meta = self.store.meta(&conv.id);
                     let title = meta
@@ -894,11 +893,8 @@ impl App {
                         Span::raw(marker),
                         Span::styled(dot, Style::default().fg(color)),
                         Span::raw(" "),
-                        Span::styled(
-                            format!("{time:>5} "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(truncate(title, 30), title_style),
+                        Span::styled(format!("{time:>3} "), Style::default().fg(Color::Gray)),
+                        Span::styled(truncate(title, 32), title_style),
                     ]))
                 }
             })
@@ -915,7 +911,7 @@ impl App {
         self.list_state.select(Some(self.selected));
         let list = List::new(items)
             .block(Block::default().title(title))
-            .highlight_style(Style::default().bg(Color::Rgb(45, 50, 68)));
+            .highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
 
@@ -935,7 +931,7 @@ impl App {
         if self.picker.is_some() {
             let text = "type to filter · enter spawn · esc cancel";
             f.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)).dim(),
+                Paragraph::new(text).style(Style::default().fg(Color::Gray)),
                 area,
             );
             return;
@@ -962,9 +958,9 @@ impl App {
         let style = if self.status_msg.is_some() && !self.filter_input {
             Style::default().fg(Color::Red)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
-        f.render_widget(Paragraph::new(text).style(style).dim(), area);
+        f.render_widget(Paragraph::new(text).style(style), area);
     }
 }
 
