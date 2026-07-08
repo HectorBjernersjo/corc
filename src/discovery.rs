@@ -192,6 +192,15 @@ fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
+            // A Ctrl+C interrupt is written as a user record too, but it ends
+            // the turn — it never produces an end_turn / turn_duration record,
+            // so if we let it fall through as a prompt the state would stay
+            // Mid (Running) forever.
+            if v.get("interruptedMessageId").is_some() {
+                meta.turn_state = TurnState::Complete;
+                meta.turn_completed_at = record_timestamp(v);
+                return;
+            }
             meta.turn_state = TurnState::Mid;
             // Only a real prompt starts a turn (D7); tool results arriving
             // mid-turn keep the state Mid but never reset the start time.
@@ -422,5 +431,39 @@ mod tests {
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, parse_iso8601("2026-07-08T10:10:00Z"));
         assert_eq!(meta.turn_completed_at, None);
+    }
+
+    /// A Ctrl+C interrupt is written as a user record (with an
+    /// `interruptedMessageId`) but no end_turn / turn_duration follows, so it
+    /// must complete the turn itself — otherwise the state stays Running.
+    #[test]
+    fn interrupt_completes_turn() {
+        let mut meta = Meta::default();
+
+        // A prompt starts a turn, assistant works…
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"do the thing"},
+                    "timestamp":"2026-07-08T10:01:00Z"}),
+        );
+        apply(
+            &mut meta,
+            &json!({"type":"assistant","message":{"stop_reason":"tool_use"},
+                    "timestamp":"2026-07-08T10:01:30Z"}),
+        );
+        assert_eq!(meta.turn_state, TurnState::Mid);
+
+        // …then Ctrl+C. The interrupt record ends the turn.
+        apply(
+            &mut meta,
+            &json!({"type":"user",
+                    "message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},
+                    "interruptedMessageId":"msg_015bfD7CH2nhHASfMRsjVfT4",
+                    "timestamp":"2026-07-08T10:02:00Z"}),
+        );
+        assert_eq!(meta.turn_state, TurnState::Complete);
+        assert_eq!(meta.turn_completed_at, parse_iso8601("2026-07-08T10:02:00Z"));
+        // The interrupt is not a prompt: it never becomes the title stand-in.
+        assert_eq!(meta.first_prompt.as_deref(), Some("do the thing"));
     }
 }
