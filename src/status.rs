@@ -1,78 +1,179 @@
-use crate::discovery::{Conversation, TurnState};
-use crate::procs::ClaudeProc;
-use crate::tmux::{self, Pane};
-use std::collections::HashMap;
-use std::path::PathBuf;
+//! Conversation status, derived from exact bookkeeping: pane liveness from
+//! the state file + tmux, turn state and timing from the jsonl, `last_viewed`
+//! from the state file. No guessing (D1).
+//!
+//! The four states and their time columns (PLAN.md D6):
+//!
+//! | State   | Condition                                | Time column            |
+//! |---------|------------------------------------------|------------------------|
+//! | Running | pane alive, turn in flight               | elapsed since turn start |
+//! | Unseen  | pane alive, turn completed after viewing | completed turn's duration |
+//! | Idle    | pane alive, turn complete, viewed since  | empty < 1h, else coarse |
+//! | Dead    | no pane                                  | coarse age, hours+     |
+//!
+//! Seconds are never shown anywhere.
+
+use crate::discovery::{Meta, TurnState};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// A live claude is working on this conversation.
+    /// Pane alive, turn in flight.
     Running,
-    /// A live claude sits at the prompt waiting for input.
-    Waiting,
-    /// No live process — history only.
+    /// Pane alive, turn completed after the user last viewed it.
+    Unseen,
+    /// Pane alive, turn complete, viewed since completion.
     Idle,
+    /// No pane; resumable from the state file.
+    Dead,
 }
 
 impl Status {
     pub fn label(&self) -> &'static str {
         match self {
             Status::Running => "running",
-            Status::Waiting => "waiting",
+            Status::Unseen => "unseen",
             Status::Idle => "idle",
+            Status::Dead => "dead",
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Annotated {
-    pub conv: Conversation,
-    pub status: Status,
-    pub pane: Option<Pane>,
+/// Derive the state per the D6 table. `is_viewed` marks the conversation
+/// currently in the content pane: it counts as continuously viewed, so it
+/// goes straight to Idle and never turns Unseen.
+pub fn derive(pane_alive: bool, meta: Option<&Meta>, last_viewed: u64, is_viewed: bool) -> Status {
+    if !pane_alive {
+        return Status::Dead;
+    }
+    match meta.map(|m| m.turn_state).unwrap_or(TurnState::Unknown) {
+        TurnState::Mid => Status::Running,
+        TurnState::Complete if !is_viewed => match meta.and_then(|m| m.turn_completed_at) {
+            Some(completed) if completed > last_viewed => Status::Unseen,
+            _ => Status::Idle,
+        },
+        // Complete-and-viewed, or a fresh pane with no turn yet.
+        TurnState::Complete | TurnState::Unknown => Status::Idle,
+    }
 }
 
-/// Match live claude processes to conversations by working directory.
-///
-/// A directory with K live processes gets its K most recently active
-/// conversations marked alive. When several conversations share a directory
-/// the pane pairing is best effort (exact pairing needs a hook).
-pub fn annotate(convs: &[&Conversation], procs: &[ClaudeProc], panes: &[Pane]) -> Vec<Annotated> {
-    let mut procs_by_dir: HashMap<PathBuf, Vec<&ClaudeProc>> = HashMap::new();
-    for proc in procs {
-        procs_by_dir.entry(proc.cwd.clone()).or_default().push(proc);
+/// The per-state time column (D6/D7). `now` and `created_at` in unix seconds.
+pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u64) -> String {
+    match status {
+        Status::Running => meta
+            .and_then(|m| m.turn_started_at)
+            .map(|start| fmt_minutes(now.saturating_sub(start)))
+            .unwrap_or_default(),
+        Status::Unseen => meta
+            .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
+            .map(|(start, done)| fmt_minutes(done.saturating_sub(start)))
+            .unwrap_or_default(),
+        Status::Idle => {
+            let age = now.saturating_sub(last_activity(meta, created_at));
+            if age < 3600 { String::new() } else { coarse_age(age) }
+        }
+        Status::Dead => coarse_age(now.saturating_sub(last_activity(meta, created_at))),
     }
-    for list in procs_by_dir.values_mut() {
-        list.sort_by_key(|p| p.pid);
+}
+
+/// When the conversation last did anything, in unix seconds: the jsonl mtime
+/// when known, else the spawn time.
+pub fn last_activity(meta: Option<&Meta>, created_at: u64) -> u64 {
+    meta.map(|m| m.mtime)
+        .filter(|t| *t != SystemTime::UNIX_EPOCH)
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(created_at)
+}
+
+/// Minute-granular duration: `4m`, `1h12m`, `2h`. Never seconds.
+fn fmt_minutes(secs: u64) -> String {
+    let mins = secs / 60;
+    match (mins / 60, mins % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m}m"),
+    }
+}
+
+/// Coarse age: `5h`, `3d` — never finer than hours, empty under an hour.
+fn coarse_age(secs: u64) -> String {
+    match secs / 3600 {
+        0 => String::new(),
+        h if h < 24 => format!("{h}h"),
+        h => format!("{}d", h / 24),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(state: TurnState, started: Option<u64>, completed: Option<u64>) -> Meta {
+        Meta {
+            turn_state: state,
+            turn_started_at: started,
+            turn_completed_at: completed,
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
+            ..Meta::default()
+        }
     }
 
-    // convs is already sorted most-recent-first, so counting per directory
-    // hands each live process to the newest conversations in its cwd.
-    let mut claimed: HashMap<PathBuf, usize> = HashMap::new();
-    convs
-        .iter()
-        .map(|conv| {
-            let live = conv.cwd.as_ref().and_then(|cwd| {
-                let list = procs_by_dir.get(cwd)?;
-                let idx = claimed.entry(cwd.clone()).or_insert(0);
-                let proc = list.get(*idx)?;
-                *idx += 1;
-                Some(*proc)
-            });
-            let (status, pane) = match live {
-                Some(proc) => {
-                    let status = match conv.turn_state {
-                        TurnState::Mid => Status::Running,
-                        TurnState::Complete | TurnState::Unknown => Status::Waiting,
-                    };
-                    (status, tmux::pane_for_pid(panes, proc.pid).cloned())
-                }
-                None => (Status::Idle, None),
-            };
-            Annotated {
-                conv: (*conv).clone(),
-                status,
-                pane,
-            }
-        })
-        .collect()
+    /// The D6 table.
+    #[test]
+    fn derive_states() {
+        let running = meta(TurnState::Mid, Some(100), None);
+        let done = meta(TurnState::Complete, Some(100), Some(500));
+
+        // No pane ⇒ Dead, whatever the jsonl says.
+        assert_eq!(derive(false, Some(&running), 0, false), Status::Dead);
+        // Turn in flight ⇒ Running, even while viewed.
+        assert_eq!(derive(true, Some(&running), 0, false), Status::Running);
+        assert_eq!(derive(true, Some(&running), 0, true), Status::Running);
+        // Completed after last_viewed ⇒ Unseen…
+        assert_eq!(derive(true, Some(&done), 200, false), Status::Unseen);
+        // …but the viewed conversation counts as continuously viewed.
+        assert_eq!(derive(true, Some(&done), 200, true), Status::Idle);
+        // Viewed since completion ⇒ Idle.
+        assert_eq!(derive(true, Some(&done), 600, false), Status::Idle);
+        // Fresh pane, no transcript yet ⇒ Idle.
+        assert_eq!(derive(true, None, 0, false), Status::Idle);
+    }
+
+    /// Time column per state; seconds never appear.
+    #[test]
+    fn time_columns() {
+        let now = 1_000_000;
+        let running = meta(TurnState::Mid, Some(now - 4 * 60 - 30), None);
+        assert_eq!(time_column(Status::Running, Some(&running), 0, now), "4m");
+
+        let long = meta(TurnState::Mid, Some(now - 3600 - 12 * 60), None);
+        assert_eq!(time_column(Status::Running, Some(&long), 0, now), "1h12m");
+
+        let done = meta(TurnState::Complete, Some(1000), Some(1000 + 25 * 60));
+        assert_eq!(time_column(Status::Unseen, Some(&done), 0, now), "25m");
+
+        // Idle: empty under an hour of age, then coarse.
+        let idle = |mtime: u64| Meta {
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime),
+            ..Meta::default()
+        };
+        assert_eq!(time_column(Status::Idle, Some(&idle(now - 300)), 0, now), "");
+        assert_eq!(
+            time_column(Status::Idle, Some(&idle(now - 5 * 3600)), 0, now),
+            "5h"
+        );
+
+        // Dead: coarse age, days past 24h, never finer than hours.
+        assert_eq!(
+            time_column(Status::Dead, Some(&idle(now - 5 * 3600 - 59 * 60)), 0, now),
+            "5h"
+        );
+        assert_eq!(
+            time_column(Status::Dead, Some(&idle(now - 3 * 86_400)), 0, now),
+            "3d"
+        );
+        // No jsonl yet: age falls back to created_at.
+        assert_eq!(time_column(Status::Dead, None, now - 7200, now), "2h");
+    }
 }

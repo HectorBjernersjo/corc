@@ -1,54 +1,20 @@
-use crate::procs;
-use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+//! tmux plumbing for the hidden-session / swap-pane topology (ADR-0001).
+//!
+//! All Claude panes live in the hidden session `_orcim`, one window per
+//! conversation, window name = conversation uuid. Viewing swaps a Claude
+//! pane with the placeholder in the content pane slot; parking swaps it
+//! back. Nothing is ever destroyed by a view/park.
+
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone)]
-pub struct Pane {
-    pub session: String,
-    pub window_index: u32,
-    pub window_name: String,
-    pub pane_id: String,
-    pub pid: u32,
-}
-
-impl Pane {
-    pub fn target(&self) -> String {
-        format!("{}:{}", self.session, self.window_index)
-    }
-}
-
-/// All panes across every tmux session; empty if tmux isn't running.
-pub fn list_panes() -> Vec<Pane> {
-    let Ok(output) = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_pid}",
-        ])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            Some(Pane {
-                session: parts.next()?.to_string(),
-                window_index: parts.next()?.parse().ok()?,
-                window_name: parts.next()?.to_string(),
-                pane_id: parts.next()?.to_string(),
-                pid: parts.next()?.parse().ok()?,
-            })
-        })
-        .collect()
-}
+pub const HIDDEN_SESSION: &str = "_orcim";
+/// The visible session the TUI lives in (D15).
+pub const ORCIM_SESSION: &str = "orcim";
+/// Transient window that keeps `_orcim` alive while it has no conversation
+/// windows; killed as soon as a real window exists.
+const STUB_WINDOW: &str = "_stub";
 
 fn tmux(args: &[&str]) -> Result<String> {
     let output = Command::new("tmux")
@@ -65,114 +31,157 @@ fn tmux(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Bring an existing pane into view and switch the client to it.
-pub fn focus(pane: &Pane) -> Result<()> {
-    tmux(&["select-window", "-t", &pane.target()])?;
-    tmux(&["select-pane", "-t", &pane.pane_id])?;
-    tmux(&["switch-client", "-t", &pane.session])?;
-    Ok(())
-}
-
-/// Session naming convention from new.sh: basename with '.' → '_'.
-pub fn session_name_for(dir: &Path) -> String {
-    dir.file_name()
-        .map(|n| n.to_string_lossy().replace('.', "_"))
-        .unwrap_or_else(|| "orcim-unknown".to_string())
-}
-
-fn session_exists(name: &str) -> bool {
+pub fn session_exists(name: &str) -> bool {
     tmux(&["has-session", "-t", &format!("={name}")]).is_ok()
 }
 
-/// Create a detached session, honoring the per-project .tmux.sh hook just
-/// like new.sh does.
-fn create_session(name: &str, dir: &Path) -> Result<()> {
-    tmux(&["new-session", "-d", "-s", name, "-c", &dir.to_string_lossy()])?;
-    let hook = dir.join(".tmux.sh");
-    if is_executable(&hook) {
-        let _ = Command::new(&hook).arg(name).arg(dir).status();
+/// Make sure the hidden session exists. A tmux session needs at least one
+/// window, so an empty hidden session gets a stub window that is removed
+/// once a conversation window exists.
+pub fn ensure_hidden_session() -> Result<()> {
+    if !session_exists(HIDDEN_SESSION) {
+        tmux(&["new-session", "-d", "-s", HIDDEN_SESSION, "-n", STUB_WINDOW])?;
     }
     Ok(())
 }
 
-/// Find or create the tmux session for a directory.
-fn ensure_session(dir: &Path) -> Result<String> {
-    let name = session_name_for(dir);
-    if !session_exists(&name) {
-        create_session(&name, dir)?;
+/// Make sure the visible `orcim` session exists with the TUI running in it
+/// (D15). `exe` is the absolute path to the orcim binary (the TUI becomes
+/// the pane command, so quitting it closes its window).
+///
+/// The session can exist without a TUI pane — either because it shares its
+/// name with a real session (a project directory named `orcim`) or because
+/// something went wrong — in which case the TUI gets a fresh window there.
+/// If a TUI pane already exists its window is selected instead, so the
+/// upcoming switch-client lands on it.
+pub fn ensure_orcim_session(exe: &str) -> Result<()> {
+    if !session_exists(ORCIM_SESSION) {
+        tmux(&["new-session", "-d", "-s", ORCIM_SESSION, exe])?;
+        return Ok(());
     }
-    Ok(name)
+    let tui_name = Path::new(exe)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "orcim".to_string());
+    // Skip the pane this very command runs in (`orcim open` from a shell in
+    // the session would otherwise see itself as the TUI).
+    let self_pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let out = tmux(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &format!("={ORCIM_SESSION}"),
+        "-F",
+        "#{pane_id} #{window_index} #{pane_current_command}",
+    ])?;
+    let tui_window = out.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let pane = parts.next()?;
+        let window = parts.next()?;
+        let cmd = parts.next()?;
+        (pane != self_pane && cmd == tui_name).then(|| window.to_string())
+    });
+    match tui_window {
+        Some(window) => {
+            tmux(&["select-window", "-t", &format!("={ORCIM_SESSION}:{window}")])?;
+        }
+        None => {
+            tmux(&["new-window", "-t", &format!("={ORCIM_SESSION}:"), exe])?;
+        }
+    }
+    Ok(())
 }
 
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+fn kill_stub() {
+    let _ = tmux(&[
+        "kill-window",
+        "-t",
+        &format!("={HIDDEN_SESSION}:={STUB_WINDOW}"),
+    ]);
 }
 
-/// Open a new window in the directory's session (without focusing it) and
-/// type `command` into it. The window keeps its shell so it survives claude
-/// exiting. Returns (pane_id, session:window target).
-pub fn spawn_window(dir: &Path, command: &str) -> Result<(String, String)> {
+/// Spawn a conversation in a new hidden window named by its uuid, running
+/// claude directly as the pane command (no wrapping shell, D12) so the
+/// window dies when Claude exits. Returns the new pane id.
+pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> {
     if !dir.is_dir() {
         bail!("directory {} no longer exists", dir.display());
     }
-    let name = ensure_session(dir)?;
     let dir_str = dir.to_string_lossy();
-    let out = tmux(&[
-        "new-window",
-        "-d",
-        "-t",
-        &format!("{name}:"),
-        "-c",
-        &dir_str,
-        "-P",
-        "-F",
-        "#{pane_id}\t#{session_name}:#{window_index}",
-    ])?;
-    let (pane_id, target) = out
-        .trim()
-        .split_once('\t')
-        .context("unexpected new-window output")?;
-    tmux(&["send-keys", "-t", pane_id, command, "Enter"])?;
-    Ok((pane_id.to_string(), target.to_string()))
+    let flag = if resume { "--resume" } else { "--session-id" };
+    let pane_id;
+    if session_exists(HIDDEN_SESSION) {
+        // Multiple trailing arguments make tmux exec the command directly.
+        pane_id = tmux(&[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("={HIDDEN_SESSION}:"),
+            "-n",
+            id,
+            "-c",
+            &dir_str,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "claude",
+            flag,
+            id,
+        ])?;
+        kill_stub();
+    } else {
+        pane_id = tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            HIDDEN_SESSION,
+            "-n",
+            id,
+            "-c",
+            &dir_str,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "claude",
+            flag,
+            id,
+        ])?;
+    }
+    Ok(pane_id.trim().to_string())
 }
 
-/// Open a new window in the directory's session, type `command` and switch
-/// the client there.
-pub fn open_in_new_window(dir: &Path, command: &str) -> Result<()> {
-    let (_, target) = spawn_window(dir, command)?;
-    tmux(&["switch-client", "-t", &target])?;
+/// Split orcim's own window: sidebar (this pane) fixed at 40 columns on the
+/// left, a plain-shell placeholder content pane on the right (D10).
+/// Returns the placeholder pane id.
+pub fn split_content_pane(sidebar_pane: &str) -> Result<String> {
+    let out = tmux(&[
+        "split-window",
+        "-h",
+        "-d",
+        "-t",
+        sidebar_pane,
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ])?;
+    tmux(&["resize-pane", "-t", sidebar_pane, "-x", "40"])?;
+    Ok(out.trim().to_string())
+}
+
+/// Swap two panes without touching active/last-pane state.
+pub fn swap_panes(a: &str, b: &str) -> Result<()> {
+    tmux(&["swap-pane", "-d", "-s", a, "-t", b])?;
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct PaneHome {
-    pub session: String,
-    pub window_id: String,
-    pub dir: String,
+pub fn select_pane(pane_id: &str) -> Result<()> {
+    tmux(&["select-pane", "-t", pane_id])?;
+    Ok(())
 }
 
-pub fn pane_home(pane_id: &str) -> Result<PaneHome> {
-    let out = tmux(&[
-        "display-message",
-        "-p",
-        "-t",
-        pane_id,
-        "#{session_name}\t#{window_id}\t#{pane_current_path}",
-    ])?;
-    let mut parts = out.trim().split('\t');
-    let (Some(session), Some(window_id), Some(dir)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        bail!("unexpected display-message output");
-    };
-    Ok(PaneHome {
-        session: session.to_string(),
-        window_id: window_id.to_string(),
-        dir: dir.to_string(),
-    })
+pub fn kill_pane(pane_id: &str) -> Result<()> {
+    tmux(&["kill-pane", "-t", pane_id])?;
+    Ok(())
 }
 
 pub fn pane_exists(pane_id: &str) -> bool {
@@ -181,73 +190,154 @@ pub fn pane_exists(pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn window_exists(window_id: &str) -> bool {
-    tmux(&["list-windows", "-a", "-F", "#{window_id}"])
-        .map(|out| out.lines().any(|l| l == window_id))
-        .unwrap_or(false)
+/// Which session a pane currently lives in.
+pub fn pane_session(pane_id: &str) -> Result<String> {
+    let out = tmux(&["display-message", "-p", "-t", pane_id, "#{session_name}"])?;
+    Ok(out.trim().to_string())
 }
 
-pub fn select_pane(pane_id: &str) -> Result<()> {
-    tmux(&["select-pane", "-t", pane_id])?;
-    Ok(())
+fn hidden_window_exists(name: &str) -> bool {
+    tmux(&[
+        "list-windows",
+        "-t",
+        &format!("={HIDDEN_SESSION}"),
+        "-F",
+        "#{window_name}",
+    ])
+    .map(|out| out.lines().any(|l| l == name))
+    .unwrap_or(false)
 }
 
-/// Switch the client to a pane wherever it currently lives.
-pub fn focus_pane(pane_id: &str) -> Result<()> {
-    let home = pane_home(pane_id)?;
-    tmux(&["select-window", "-t", pane_id])?;
-    tmux(&["select-pane", "-t", pane_id])?;
-    tmux(&["switch-client", "-t", &home.session])?;
-    Ok(())
-}
-
-/// Move a pane in next to the sidebar pane and focus it.
-pub fn embed(src_pane: &str, sidebar_pane: &str) -> Result<()> {
-    tmux(&["join-pane", "-h", "-s", src_pane, "-t", sidebar_pane])?;
-    let _ = tmux(&["resize-pane", "-t", sidebar_pane, "-x", "35%"]);
-    tmux(&["select-pane", "-t", src_pane])?;
-    Ok(())
-}
-
-/// Send an embedded pane back to where it came from. Joining a pane out of
-/// a session can have destroyed its window or even the whole session (if the
-/// pane was the only one there), so recreate what's missing.
-pub fn unembed(pane_id: &str, home: &PaneHome) -> Result<()> {
-    if !pane_exists(pane_id) {
-        return Ok(());
-    }
-    if window_exists(&home.window_id) {
-        tmux(&["join-pane", "-d", "-s", pane_id, "-t", &home.window_id])?;
-        let _ = tmux(&["select-layout", "-t", &home.window_id, "-E"]);
-        return Ok(());
-    }
-    if !session_exists(&home.session) {
-        create_session(&home.session, Path::new(&home.dir))?;
+/// Park a Claude pane stranded outside `_orcim` (orcim crashed mid-view,
+/// D16) back into a hidden window named by its conversation uuid.
+pub fn park_stray(pane_id: &str, id: &str) -> Result<()> {
+    ensure_hidden_session()?;
+    // If the uuid window still exists it can only hold the placeholder shell
+    // that was swapped out when the conversation was viewed — remove it so
+    // the window name stays unique.
+    if hidden_window_exists(id) {
+        let _ = tmux(&["kill-window", "-t", &format!("={HIDDEN_SESSION}:={id}")]);
     }
     tmux(&[
         "break-pane",
         "-d",
+        "-n",
+        id,
         "-s",
         pane_id,
         "-t",
-        &format!("{}:", home.session),
+        &format!("={HIDDEN_SESSION}:"),
+    ])?;
+    kill_stub();
+    Ok(())
+}
+
+/// Kill the hidden window named by a conversation uuid (used to reclaim the
+/// placeholder when the viewed Claude died, leaving its shell parked there).
+pub fn kill_hidden_window(id: &str) -> Result<()> {
+    tmux(&["kill-window", "-t", &format!("={HIDDEN_SESSION}:={id}")])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Real-session helpers, kept for digit jump (step 4).
+// ---------------------------------------------------------------------------
+
+/// Session naming convention from new.sh: basename with '.' → '_'.
+pub fn session_name_for(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().replace('.', "_"))
+        .unwrap_or_else(|| "orcim-unknown".to_string())
+}
+
+/// Create a detached session, honoring the per-project .tmux.sh hook just
+/// like new.sh does. Never used for the hidden session.
+pub fn create_session(name: &str, dir: &Path) -> Result<()> {
+    tmux(&["new-session", "-d", "-s", name, "-c", &dir.to_string_lossy()])?;
+    let hook = dir.join(".tmux.sh");
+    if is_executable(&hook) {
+        let _ = Command::new(&hook).arg(name).arg(dir).status();
+    }
+    Ok(())
+}
+
+pub fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+pub fn window_exists(session: &str, index: u8) -> bool {
+    tmux(&[
+        "list-windows",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{window_index}",
+    ])
+    .map(|out| out.lines().any(|l| l == index.to_string()))
+    .unwrap_or(false)
+}
+
+/// Create window `index` of a real session (digit jump, D13). `cmd` becomes
+/// the pane command when given (window 1 is created running nvim).
+pub fn create_window_at(session: &str, index: u8, dir: &Path, cmd: Option<&str>) -> Result<()> {
+    let target = format!("={session}:{index}");
+    let dir_str = dir.to_string_lossy();
+    let mut args: Vec<&str> = vec!["new-window", "-d", "-t", &target, "-c", &dir_str];
+    if let Some(cmd) = cmd {
+        args.push(cmd);
+    }
+    tmux(&args)?;
+    Ok(())
+}
+
+/// Foreground command of the active pane in a real-session window — how the
+/// digit jump tells an idle shell prompt from a busy process (D13).
+pub fn window_current_command(session: &str, index: u8) -> Result<String> {
+    let out = tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("={session}:{index}"),
+        "#{pane_current_command}",
+    ])?;
+    Ok(out.trim().to_string())
+}
+
+/// Type a line + Enter into a real-session window's active pane.
+pub fn send_line(session: &str, index: u8, text: &str) -> Result<()> {
+    tmux(&[
+        "send-keys",
+        "-t",
+        &format!("={session}:{index}"),
+        text,
+        "Enter",
     ])?;
     Ok(())
 }
 
-/// Find the pane a process lives in by walking up its parent chain until we
-/// hit a pane's root shell.
-pub fn pane_for_pid(panes: &[Pane], pid: u32) -> Option<&Pane> {
-    let by_pid: HashMap<u32, &Pane> = panes.iter().map(|p| (p.pid, p)).collect();
-    let mut current = pid;
-    for _ in 0..20 {
-        if let Some(pane) = by_pid.get(&current) {
-            return Some(pane);
-        }
-        current = procs::ppid_of(current)?;
-        if current <= 1 {
-            return None;
-        }
+pub fn select_window(session: &str, index: u8) -> Result<()> {
+    tmux(&["select-window", "-t", &format!("={session}:{index}")])?;
+    Ok(())
+}
+
+/// Switch the attached client to a session; orcim keeps running in its own.
+pub fn switch_client(session: &str) -> Result<()> {
+    tmux(&["switch-client", "-t", &format!("={session}")])?;
+    Ok(())
+}
+
+/// Attach the calling terminal to a session — what `orcim open` does when
+/// run outside tmux, where switch-client has no client to move.
+pub fn attach(session: &str) -> Result<()> {
+    let status = Command::new("tmux")
+        .args(["attach-session", "-t", &format!("={session}")])
+        .status()
+        .context("failed to run tmux")?;
+    if !status.success() {
+        bail!("could not attach; from a terminal run: tmux attach -t {session}");
     }
-    None
+    Ok(())
 }

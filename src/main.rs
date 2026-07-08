@@ -1,111 +1,96 @@
 mod discovery;
-mod procs;
+mod picker;
+mod state;
 mod status;
 mod tmux;
 mod ui;
 
-use anyhow::Result;
-use discovery::Store;
-use status::{Annotated, Status};
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => ui::run(),
-        Some("list") => list(args.iter().any(|a| a == "--all")),
-        Some("watch") => watch(),
-        Some(other) => anyhow::bail!("unknown command: {other} (expected: list, watch)"),
+        Some("open") => open(),
+        Some("list") => list(),
+        Some(other) => anyhow::bail!("unknown command: {other} (expected: open, list)"),
     }
 }
 
-fn snapshot(store: &mut Store) -> Result<Vec<Annotated>> {
-    store.refresh()?;
-    let convs = store.conversations();
-    let procs = procs::scan();
-    let panes = tmux::list_panes();
-    Ok(status::annotate(&convs, &procs, &panes))
+/// `orcim open` (D15): make sure the visible `orcim` session exists with the
+/// TUI running in it, then take the client there. Bound to Ctrl+q in
+/// tmux.conf via run-shell.
+fn open() -> Result<()> {
+    let exe = std::env::current_exe().context("locating the orcim binary")?;
+    tmux::ensure_orcim_session(&exe.to_string_lossy())?;
+    // switch-client only works from inside tmux; that covers both a shell in
+    // a pane (TMUX set) and the Ctrl+q run-shell binding (TMUX_PANE set).
+    // From a plain terminal, attach instead.
+    if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
+        tmux::switch_client(tmux::ORCIM_SESSION)
+    } else {
+        tmux::attach(tmux::ORCIM_SESSION)
+    }
 }
 
-fn list(all: bool) -> Result<()> {
-    let mut store = Store::new()?;
-    let rows = snapshot(&mut store)?;
-    let week = Duration::from_secs(7 * 24 * 3600);
-    let now = SystemTime::now();
+/// Print every conversation orcim owns, grouped by project in display order.
+fn list() -> Result<()> {
+    let state = state::State::load()?;
+    let mut store = discovery::Store::new()?;
+    let known: Vec<(String, PathBuf)> = state
+        .conversations
+        .iter()
+        .map(|c| (c.id.clone(), c.cwd.clone()))
+        .collect();
+    store.refresh(&known)?;
 
-    // rows are sorted most-recent-first, so projects appear in recency order.
-    let mut groups: Vec<(String, Vec<&Annotated>)> = Vec::new();
-    for row in &rows {
-        let recent = now
-            .duration_since(row.conv.mtime)
-            .map(|age| age < week)
-            .unwrap_or(true);
-        if !all && !recent && row.status == Status::Idle {
+    if state.conversations.is_empty() {
+        println!("no conversations");
+        return Ok(());
+    }
+    let now = state::unix_now();
+    for project in &state.projects {
+        let convs: Vec<_> = state
+            .conversations
+            .iter()
+            .filter(|c| c.cwd.display().to_string() == *project)
+            .collect();
+        if convs.is_empty() {
             continue;
         }
-        let project = display_dir(&row.conv.project_dir());
-        match groups.iter_mut().find(|(name, _)| *name == project) {
-            Some((_, list)) => list.push(row),
-            None => groups.push((project, vec![row])),
-        }
-    }
-
-    if groups.is_empty() {
-        println!("no conversations found");
-    }
-    for (project, list) in &groups {
-        println!("\n{project}");
-        for row in list {
-            let pane = row
-                .pane
-                .as_ref()
-                .map(|p| p.target())
-                .unwrap_or_else(|| "-".to_string());
+        println!("\n{}", display_dir(project));
+        for conv in convs {
+            let alive = conv
+                .pane_id
+                .as_deref()
+                .is_some_and(tmux::pane_exists);
+            let meta = store.meta(&conv.id);
+            let s = status::derive(alive, meta, conv.last_viewed, false);
+            let title = meta
+                .and_then(|m| m.display_title())
+                .unwrap_or("(untitled)");
+            let pane = conv.pane_id.as_deref().unwrap_or("-");
             println!(
-                "  {} {:7}  {:>4}  {:12}  {}",
-                status_icon(row.status),
-                row.status.label(),
-                age(now, row.conv.mtime),
+                "  {} {:7}  {:>6}  {:5}  {}  {}",
+                status_icon(s),
+                s.label(),
+                status::time_column(s, meta, conv.created_at, now),
                 pane,
-                truncate(row.conv.display_title(), 70),
+                conv.id,
+                truncate(title, 60),
             );
         }
     }
     Ok(())
 }
 
-fn watch() -> Result<()> {
-    let mut store = Store::new()?;
-    let mut last: HashMap<String, Status> = HashMap::new();
-    println!("polling every 1s, printing status transitions (ctrl-c to stop)");
-    loop {
-        let rows = snapshot(&mut store)?;
-        let now = SystemTime::now();
-        for row in &rows {
-            let id = row.conv.session_id.clone();
-            let prev = last.insert(id, row.status);
-            if prev.is_some_and(|p| p != row.status) {
-                let prev = prev.unwrap();
-                println!(
-                    "{}  {}  {}  {} → {}",
-                    hhmmss(now),
-                    display_dir(&row.conv.project_dir()),
-                    truncate(row.conv.display_title(), 50),
-                    prev.label(),
-                    row.status.label(),
-                );
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-pub fn status_icon(status: Status) -> &'static str {
+pub fn status_icon(status: status::Status) -> &'static str {
     match status {
-        Status::Running => "\x1b[33m●\x1b[0m",
-        Status::Waiting => "\x1b[32m●\x1b[0m",
-        Status::Idle => "\x1b[90m○\x1b[0m",
+        status::Status::Running => "\x1b[33m●\x1b[0m",
+        status::Status::Unseen => "\x1b[34m●\x1b[0m",
+        status::Status::Idle => "\x1b[90m●\x1b[0m",
+        status::Status::Dead => "\x1b[90m○\x1b[0m",
     }
 }
 
@@ -114,25 +99,6 @@ pub fn display_dir(dir: &str) -> String {
         Ok(home) => dir.replacen(&home, "~", 1),
         Err(_) => dir.to_string(),
     }
-}
-
-pub fn age(now: SystemTime, then: SystemTime) -> String {
-    let secs = now.duration_since(then).map(|d| d.as_secs()).unwrap_or(0);
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m", secs / 60),
-        3600..=86399 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86400),
-    }
-}
-
-pub fn hhmmss(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let day = secs % 86400;
-    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
