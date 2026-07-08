@@ -66,7 +66,7 @@ fn list() -> Result<()> {
                 .as_deref()
                 .is_some_and(tmux::pane_exists);
             let meta = store.meta(&conv.id);
-            let s = status::derive(alive, meta, conv.last_viewed, false);
+            let s = status::derive(alive, meta, conv.last_viewed, false, now, conv.created_at);
             let title = meta
                 .and_then(|m| m.display_title())
                 .unwrap_or("(untitled)");

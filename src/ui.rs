@@ -32,6 +32,9 @@ enum Item {
 
 /// Dead conversations older than this are hidden unless `a` is on (D12).
 const HIDE_DEAD_AFTER_SECS: u64 = 7 * 24 * 3600;
+/// Most recent conversations shown per project before the rest are hidden
+/// (D13) — the `a` toggle reveals them. Keeps each project's list short.
+const MAX_PER_PROJECT: usize = 7;
 
 /// Foreground commands that count as an idle shell prompt for the digit
 /// jump's window-1 nvim rule (D13); anything else is busy and never touched.
@@ -149,6 +152,7 @@ pub fn run() -> Result<()> {
         last_refresh: Instant::now(),
     };
     app.refresh();
+    app.view_last();
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -314,6 +318,29 @@ impl App {
         false
     }
 
+    /// Rows item `idx` occupies on screen: headers are two rows (a blank
+    /// spacer line above the rule), conversations one.
+    fn item_height(&self, idx: usize) -> u16 {
+        match self.items.get(idx) {
+            Some(Item::Header(_)) => 2,
+            _ => 1,
+        }
+    }
+
+    /// The item under list row `row`, walking item heights from the list's
+    /// scroll offset — headers are taller than one row.
+    fn item_at_row(&self, row: u16) -> Option<usize> {
+        let mut top = 0u16;
+        for idx in self.list_state.offset()..self.items.len() {
+            let next = top + self.item_height(idx);
+            if row < next {
+                return Some(idx);
+            }
+            top = next;
+        }
+        None
+    }
+
     /// Mouse (D11): click a row = select + view; the wheel moves the
     /// selection. Ignored while the picker overlay is open.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -324,16 +351,14 @@ impl App {
             MouseEventKind::ScrollDown => self.select_next(1),
             MouseEventKind::ScrollUp => self.select_next(-1),
             MouseEventKind::Down(MouseButton::Left) => {
-                // Row 0 is the list title; content rows map through the
-                // list's persistent scroll offset.
-                let Some(row) = mouse.row.checked_sub(1) else {
-                    return;
-                };
-                if row >= self.list_rows {
+                // Rows map to items through the list's persistent scroll
+                // offset.
+                if mouse.row >= self.list_rows {
                     return; // footer / below the list
                 }
-                let idx = self.list_state.offset() + row as usize;
-                if matches!(self.items.get(idx), Some(Item::Conv(_))) {
+                if let Some(idx) = self.item_at_row(mouse.row)
+                    && matches!(self.items.get(idx), Some(Item::Conv(_)))
+                {
                     self.selected = idx;
                     self.view_selected();
                 }
@@ -407,6 +432,7 @@ impl App {
         }
 
         let viewed = self.viewed.clone();
+        let now = state::unix_now();
         self.statuses = self
             .state
             .conversations
@@ -417,6 +443,8 @@ impl App {
                     self.store.meta(&c.id),
                     c.last_viewed,
                     viewed.as_deref() == Some(c.id.as_str()),
+                    now,
+                    c.created_at,
                 )
             })
             .collect();
@@ -512,6 +540,14 @@ impl App {
                 }
                 kept.push(i);
             }
+            // Cap each project to its most-recent conversations (D13). `kept`
+            // is already in the sticky recency order, so truncating drops the
+            // ones with the oldest history without reshuffling the rest. The
+            // `a` toggle and an active filter both bypass the cap.
+            if !self.show_all && filter.is_empty() && kept.len() > MAX_PER_PROJECT {
+                self.hidden += kept.len() - MAX_PER_PROJECT;
+                kept.truncate(MAX_PER_PROJECT);
+            }
             if kept.is_empty() {
                 continue;
             }
@@ -582,6 +618,27 @@ impl App {
         self.status_msg = self.view(&id).err().map(|e| e.to_string());
         // Re-derive immediately so an Unseen row flips to Idle the moment
         // it is swapped in, not a tick later.
+        self.refresh();
+    }
+
+    /// On startup, swap in whichever conversation the user last had open so
+    /// corc resumes where they left off, and highlight its sidebar row.
+    fn view_last(&mut self) {
+        let Some(id) = self
+            .state
+            .conversations
+            .iter()
+            .max_by_key(|c| c.last_viewed)
+            .map(|c| c.id.clone())
+        else {
+            return;
+        };
+        if let Some(pos) = self.items.iter().position(
+            |i| matches!(i, Item::Conv(idx) if self.state.conversations[*idx].id == id),
+        ) {
+            self.selected = pos;
+        }
+        self.status_msg = self.view(&id).err().map(|e| e.to_string());
         self.refresh();
     }
 
@@ -1039,68 +1096,79 @@ impl App {
         f.render_stateful_widget(list, rows[1], &mut list_state);
     }
 
+    /// A project header: a blank spacer line, then `─ name ────` filled to
+    /// the full width (`item_height` agrees on the two rows).
+    fn render_header(&self, name: &str, width: usize) -> ListItem<'static> {
+        let dim = Style::default().fg(Color::DarkGray);
+        let fill = "─".repeat(width.saturating_sub(name.chars().count() + 3));
+        ListItem::new(vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("─ ", dim),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {fill}"), dim),
+            ]),
+        ])
+    }
+
+    /// A conversation row: `● title………time`, the time right-aligned and
+    /// dim. Status colors per D6: Running yellow ●, Unseen blue ●, Idle
+    /// gray ●, Dead hollow ○; the viewed conversation's ● is green.
+    fn render_conv(&self, idx: usize, i: usize, width: usize, now: u64) -> ListItem<'static> {
+        let conv = &self.state.conversations[i];
+        let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
+        let (dot, color) = match status {
+            Status::Running => ("●", Color::Yellow),
+            Status::Unseen => ("●", Color::Blue),
+            Status::Idle => ("●", Color::Gray),
+            Status::Dead => ("○", Color::Gray),
+        };
+        let meta = self.store.meta(&conv.id);
+        let title = meta
+            .and_then(|m| m.display_title())
+            .unwrap_or("(untitled)")
+            .to_string();
+        let time = status::time_column(status, meta, conv.created_at, now);
+        let viewed = self.viewed.as_deref() == Some(conv.id.as_str());
+        let color = if viewed { Color::Green } else { color };
+        let title_style = if idx == self.selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else if status == Status::Dead {
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default()
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        let time_w = time.chars().count();
+        let gap = if time_w > 0 { 1 } else { 0 };
+        let t = truncate(&title, width.saturating_sub(3 + time_w + gap));
+        let pad = width.saturating_sub(3 + t.chars().count() + time_w);
+        ListItem::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(dot, Style::default().fg(color)),
+            Span::raw(" "),
+            Span::styled(t, title_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(time, dim),
+        ]))
+    }
+
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         let now = state::unix_now();
-        let items: Vec<ListItem> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| match item {
-                Item::Header(name) => ListItem::new(Line::from(Span::styled(
-                    name.clone(),
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-                ))),
-                Item::Conv(i) => {
-                    let conv = &self.state.conversations[*i];
-                    let status = self.statuses.get(*i).copied().unwrap_or(Status::Dead);
-                    // The four looks (D6): Running yellow ●, Unseen blue ●,
-                    // Idle gray ●, Dead hollow ○.
-                    let (dot, color) = match status {
-                        Status::Running => ("●", Color::Yellow),
-                        Status::Unseen => ("●", Color::Blue),
-                        Status::Idle => ("●", Color::Gray),
-                        Status::Dead => ("○", Color::Gray),
-                    };
-                    let meta = self.store.meta(&conv.id);
-                    let title = meta
-                        .and_then(|m| m.display_title())
-                        .unwrap_or("(untitled)");
-                    let time = status::time_column(status, meta, conv.created_at, now);
-                    let title_style = if idx == self.selected {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else if status == Status::Dead {
-                        Style::default().fg(Color::Gray)
-                    } else {
-                        Style::default()
-                    };
-                    let marker = if self.viewed.as_deref() == Some(conv.id.as_str()) {
-                        "▸ "
-                    } else {
-                        "  "
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(marker),
-                        Span::styled(dot, Style::default().fg(color)),
-                        Span::raw(" "),
-                        Span::styled(format!("{time:>3} "), Style::default().fg(Color::Gray)),
-                        Span::styled(truncate(title, 32), title_style),
-                    ]))
-                }
+        let width = area.width as usize;
+        let items: Vec<ListItem> = (0..self.items.len())
+            .map(|idx| match &self.items[idx] {
+                Item::Header(name) => self.render_header(name, width),
+                Item::Conv(i) => self.render_conv(idx, *i, width, now),
             })
             .collect();
 
-        let running = self
-            .statuses
-            .iter()
-            .filter(|s| **s == Status::Running)
-            .count();
-        let title = format!(" corc — {running} running ");
-        // The title takes the block's first row; what remains is content.
-        self.list_rows = area.height.saturating_sub(1);
+        self.list_rows = area.height;
         self.list_state.select(Some(self.selected));
-        let list = List::new(items)
-            .block(Block::default().title(title))
-            .highlight_style(Style::default().bg(Color::DarkGray));
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
 

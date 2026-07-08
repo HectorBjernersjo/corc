@@ -40,15 +40,38 @@ impl Status {
     }
 }
 
+/// A turn that hasn't touched its transcript in this long has stalled and is
+/// no longer treated as Running. Covers the interrupt that leaves no
+/// completion record (Ctrl+C before any assistant output): the transcript
+/// stays Mid forever, but its mtime stops advancing.
+const STALE_SECS: u64 = 3600;
+
 /// Derive the state per the D6 table. `is_viewed` marks the conversation
 /// currently in the content pane: it counts as continuously viewed, so it
-/// goes straight to Idle and never turns Unseen.
-pub fn derive(pane_alive: bool, meta: Option<&Meta>, last_viewed: u64, is_viewed: bool) -> Status {
+/// goes straight to Idle and never turns Unseen. `now`/`created_at` are unix
+/// seconds, used to age out a stalled turn (see `STALE_SECS`).
+pub fn derive(
+    pane_alive: bool,
+    meta: Option<&Meta>,
+    last_viewed: u64,
+    is_viewed: bool,
+    now: u64,
+    created_at: u64,
+) -> Status {
     if !pane_alive {
         return Status::Dead;
     }
     match meta.map(|m| m.turn_state).unwrap_or(TurnState::Unknown) {
-        TurnState::Mid => Status::Running,
+        // A turn in flight is Running only while the transcript is still
+        // moving; once it has been silent for an hour it has stalled (e.g.
+        // interrupted before any assistant output) and settles to Idle.
+        TurnState::Mid => {
+            if now.saturating_sub(last_activity(meta, created_at)) >= STALE_SECS {
+                Status::Idle
+            } else {
+                Status::Running
+            }
+        }
         TurnState::Complete if !is_viewed => match meta.and_then(|m| m.turn_completed_at) {
             Some(completed) if completed > last_viewed => Status::Unseen,
             _ => Status::Idle,
@@ -124,25 +147,47 @@ mod tests {
         }
     }
 
-    /// The D6 table.
+    /// The D6 table. The `meta` helper stamps mtime at 1000s, so `now = 1000`
+    /// keeps every in-flight turn fresh (age 0).
     #[test]
     fn derive_states() {
         let running = meta(TurnState::Mid, Some(100), None);
         let done = meta(TurnState::Complete, Some(100), Some(500));
+        let now = 1000;
 
         // No pane ⇒ Dead, whatever the jsonl says.
-        assert_eq!(derive(false, Some(&running), 0, false), Status::Dead);
+        assert_eq!(derive(false, Some(&running), 0, false, now, 0), Status::Dead);
         // Turn in flight ⇒ Running, even while viewed.
-        assert_eq!(derive(true, Some(&running), 0, false), Status::Running);
-        assert_eq!(derive(true, Some(&running), 0, true), Status::Running);
+        assert_eq!(derive(true, Some(&running), 0, false, now, 0), Status::Running);
+        assert_eq!(derive(true, Some(&running), 0, true, now, 0), Status::Running);
         // Completed after last_viewed ⇒ Unseen…
-        assert_eq!(derive(true, Some(&done), 200, false), Status::Unseen);
+        assert_eq!(derive(true, Some(&done), 200, false, now, 0), Status::Unseen);
         // …but the viewed conversation counts as continuously viewed.
-        assert_eq!(derive(true, Some(&done), 200, true), Status::Idle);
+        assert_eq!(derive(true, Some(&done), 200, true, now, 0), Status::Idle);
         // Viewed since completion ⇒ Idle.
-        assert_eq!(derive(true, Some(&done), 600, false), Status::Idle);
+        assert_eq!(derive(true, Some(&done), 600, false, now, 0), Status::Idle);
         // Fresh pane, no transcript yet ⇒ Idle.
-        assert_eq!(derive(true, None, 0, false), Status::Idle);
+        assert_eq!(derive(true, None, 0, false, now, 0), Status::Idle);
+    }
+
+    /// A Mid turn whose transcript has been silent for an hour has stalled
+    /// (e.g. Ctrl+C before any assistant output, which writes no completion
+    /// record) — it settles to Idle instead of hanging on Running forever.
+    #[test]
+    fn stalled_turn_ages_out() {
+        // mtime stamped at 1000s by the helper.
+        let running = meta(TurnState::Mid, Some(100), None);
+
+        // Still moving under the hour ⇒ Running.
+        assert_eq!(
+            derive(true, Some(&running), 0, false, 1000 + 3599, 0),
+            Status::Running
+        );
+        // Silent for an hour ⇒ Idle.
+        assert_eq!(
+            derive(true, Some(&running), 0, false, 1000 + 3600, 0),
+            Status::Idle
+        );
     }
 
     /// Time column per state; seconds never appear.
