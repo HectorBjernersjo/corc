@@ -1,4 +1,4 @@
-//! The sidebar TUI. orcim's pane is the sidebar (40 columns, left); the
+//! The sidebar TUI. corc's pane is the sidebar (40 columns, left); the
 //! content pane to its right holds either a plain-shell placeholder or the
 //! currently viewed conversation's Claude pane, swapped in from the hidden
 //! session (ADR-0001).
@@ -63,9 +63,9 @@ struct App {
     store: Store,
     /// Pane statuses derived on refresh, parallel to `state.conversations`.
     statuses: Vec<Status>,
-    /// The pane orcim runs in (left, fixed 40 columns).
+    /// The pane corc runs in (left, fixed 40 columns).
     sidebar_pane: String,
-    /// The plain-shell pane orcim created on the right. While a conversation
+    /// The plain-shell pane corc created on the right. While a conversation
     /// is viewed, this pane sits parked in that conversation's hidden window.
     placeholder_pane: String,
     /// Conversation currently swapped into the content slot.
@@ -103,7 +103,7 @@ struct App {
 
 pub fn run() -> Result<()> {
     let sidebar_pane =
-        std::env::var("TMUX_PANE").map_err(|_| anyhow::anyhow!("orcim must run inside tmux"))?;
+        std::env::var("TMUX_PANE").map_err(|_| anyhow::anyhow!("corc must run inside tmux"))?;
 
     let mut state = State::load()?;
     reconcile(&mut state)?;
@@ -162,7 +162,7 @@ pub fn run() -> Result<()> {
 
 /// Startup reconciliation (D16): drop pane ids that no longer exist (the
 /// conversation is Dead) and park Claude panes stranded outside the hidden
-/// session (orcim crashed mid-view) back into uuid-named hidden windows.
+/// session (corc crashed mid-view) back into uuid-named hidden windows.
 fn reconcile(state: &mut State) -> Result<()> {
     for conv in &mut state.conversations {
         let Some(pane_id) = conv.pane_id.clone() else {
@@ -176,7 +176,7 @@ fn reconcile(state: &mut State) -> Result<()> {
             Ok(session) if session == tmux::HIDDEN_SESSION => {}
             Ok(_) => {
                 if let Err(e) = tmux::park_stray(&pane_id, &conv.id) {
-                    eprintln!("orcim: failed to park stray pane {pane_id}: {e}");
+                    eprintln!("corc: failed to park stray pane {pane_id}: {e}");
                     conv.pane_id = None;
                 }
             }
@@ -759,7 +759,7 @@ impl App {
                 }
             }
             tmux::select_window(&session, n)?;
-            // orcim keeps running in its own session.
+            // corc keeps running in its own session.
             tmux::switch_client(&session)
         })();
         self.status_msg = result.err().map(|e| e.to_string());
@@ -909,7 +909,7 @@ impl App {
             .iter()
             .filter(|s| **s == Status::Running)
             .count();
-        let title = format!(" orcim — {running} running ");
+        let title = format!(" corc — {running} running ");
         // The title takes the block's first row; what remains is content.
         self.list_rows = area.height.saturating_sub(1);
         self.list_state.select(Some(self.selected));
@@ -970,7 +970,7 @@ impl App {
 
 /// Project group header (D8): directory basename only. A git worktree —
 /// detected by `.git` being a *file* with a `gitdir:` pointer — shows as
-/// `{repo}/{worktree}`, e.g. `orcim/fix-ui`. Branches are never shown.
+/// `{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
 fn project_display(path: &str) -> String {
     let dir = Path::new(path);
     let base = dir
@@ -1004,7 +1004,7 @@ mod tests {
     /// D8: basename for plain dirs, `{repo}/{worktree}` for git worktrees.
     #[test]
     fn project_headers() {
-        let base = std::env::temp_dir().join("orcim-test-project-display");
+        let base = std::env::temp_dir().join("corc-test-project-display");
         let _ = fs::remove_dir_all(&base);
 
         let plain = base.join("myproj");
@@ -1020,10 +1020,10 @@ mod tests {
         fs::create_dir_all(&wt).unwrap();
         fs::write(
             wt.join(".git"),
-            "gitdir: /home/hector/Projects/orcim/.git/worktrees/fix-ui\n",
+            "gitdir: /home/hector/Projects/corc/.git/worktrees/fix-ui\n",
         )
         .unwrap();
-        assert_eq!(project_display(&wt.to_string_lossy()), "orcim/fix-ui");
+        assert_eq!(project_display(&wt.to_string_lossy()), "corc/fix-ui");
 
         let _ = fs::remove_dir_all(&base);
     }

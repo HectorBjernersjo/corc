@@ -1,5 +1,5 @@
 //! Metadata for known conversations, read from their jsonl transcripts under
-//! ~/.claude/projects. orcim only ever looks up the files of conversations
+//! ~/.claude/projects. corc only ever looks up the files of conversations
 //! it spawned (known uuid + cwd) — there is no tree scan and no adoption of
 //! foreign history (PLAN.md D1). The jsonl files are read-only: never
 //! modified, never deleted.
@@ -70,7 +70,7 @@ struct FileState {
     meta: Meta,
 }
 
-/// Incrementally parsed metadata for the conversations orcim owns.
+/// Incrementally parsed metadata for the conversations corc owns.
 pub struct Store {
     root: PathBuf,
     files: HashMap<String, FileState>,

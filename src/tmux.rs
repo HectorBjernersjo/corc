@@ -1,6 +1,6 @@
 //! tmux plumbing for the hidden-session / swap-pane topology (ADR-0001).
 //!
-//! All Claude panes live in the hidden session `_orcim`, one window per
+//! All Claude panes live in the hidden session `_corc-sessions`, one window per
 //! conversation, window name = conversation uuid. Viewing swaps a Claude
 //! pane with the placeholder in the content pane slot; parking swaps it
 //! back. Nothing is ever destroyed by a view/park.
@@ -9,10 +9,20 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Command;
 
-pub const HIDDEN_SESSION: &str = "_orcim";
-/// The visible session the TUI lives in (D15).
-pub const ORCIM_SESSION: &str = "orcim";
-/// Transient window that keeps `_orcim` alive while it has no conversation
+/// Base name for everything the program creates in tmux — change this one
+/// macro to rename the app. (A macro because `concat!` below only takes
+/// literals, not `const`s.)
+macro_rules! app_name {
+    () => {
+        "corc"
+    };
+}
+pub const APP_NAME: &str = app_name!();
+pub const HIDDEN_SESSION: &str = concat!("_", app_name!(), "-sessions");
+/// The visible session the TUI lives in (D15). Prefixed with `_` so it never
+/// clashes with a project session named after a directory.
+pub const TUI_SESSION: &str = concat!("_", app_name!());
+/// Transient window that keeps `_corc-sessions` alive while it has no conversation
 /// windows; killed as soon as a real window exists.
 const STUB_WINDOW: &str = "_stub";
 
@@ -45,32 +55,31 @@ pub fn ensure_hidden_session() -> Result<()> {
     Ok(())
 }
 
-/// Make sure the visible `orcim` session exists with the TUI running in it
-/// (D15). `exe` is the absolute path to the orcim binary (the TUI becomes
+/// Make sure the TUI session exists with the TUI running in it (D15).
+/// `exe` is the absolute path to the corc binary (the TUI becomes
 /// the pane command, so quitting it closes its window).
 ///
-/// The session can exist without a TUI pane — either because it shares its
-/// name with a real session (a project directory named `orcim`) or because
-/// something went wrong — in which case the TUI gets a fresh window there.
-/// If a TUI pane already exists its window is selected instead, so the
-/// upcoming switch-client lands on it.
-pub fn ensure_orcim_session(exe: &str) -> Result<()> {
-    if !session_exists(ORCIM_SESSION) {
-        tmux(&["new-session", "-d", "-s", ORCIM_SESSION, exe])?;
+/// The session can exist without a TUI pane (something went wrong), in
+/// which case the TUI gets a fresh window there. If a TUI pane already
+/// exists its window is selected instead, so the upcoming switch-client
+/// lands on it.
+pub fn ensure_tui_session(exe: &str) -> Result<()> {
+    if !session_exists(TUI_SESSION) {
+        tmux(&["new-session", "-d", "-s", TUI_SESSION, exe])?;
         return Ok(());
     }
     let tui_name = Path::new(exe)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "orcim".to_string());
-    // Skip the pane this very command runs in (`orcim open` from a shell in
+        .unwrap_or_else(|| APP_NAME.to_string());
+    // Skip the pane this very command runs in (`corc open` from a shell in
     // the session would otherwise see itself as the TUI).
     let self_pane = std::env::var("TMUX_PANE").unwrap_or_default();
     let out = tmux(&[
         "list-panes",
         "-s",
         "-t",
-        &format!("={ORCIM_SESSION}"),
+        &format!("={TUI_SESSION}"),
         "-F",
         "#{pane_id} #{window_index} #{pane_current_command}",
     ])?;
@@ -83,10 +92,10 @@ pub fn ensure_orcim_session(exe: &str) -> Result<()> {
     });
     match tui_window {
         Some(window) => {
-            tmux(&["select-window", "-t", &format!("={ORCIM_SESSION}:{window}")])?;
+            tmux(&["select-window", "-t", &format!("={TUI_SESSION}:{window}")])?;
         }
         None => {
-            tmux(&["new-window", "-t", &format!("={ORCIM_SESSION}:"), exe])?;
+            tmux(&["new-window", "-t", &format!("={TUI_SESSION}:"), exe])?;
         }
     }
     Ok(())
@@ -150,7 +159,7 @@ pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> 
     Ok(pane_id.trim().to_string())
 }
 
-/// Split orcim's own window: sidebar (this pane) fixed at 40 columns on the
+/// Split corc's own window: sidebar (this pane) fixed at 40 columns on the
 /// left, a plain-shell placeholder content pane on the right (D10).
 /// Returns the placeholder pane id.
 pub fn split_content_pane(sidebar_pane: &str) -> Result<String> {
@@ -208,7 +217,7 @@ fn hidden_window_exists(name: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Park a Claude pane stranded outside `_orcim` (orcim crashed mid-view,
+/// Park a Claude pane stranded outside `_corc-sessions` (corc crashed mid-view,
 /// D16) back into a hidden window named by its conversation uuid.
 pub fn park_stray(pane_id: &str, id: &str) -> Result<()> {
     ensure_hidden_session()?;
@@ -247,7 +256,7 @@ pub fn kill_hidden_window(id: &str) -> Result<()> {
 pub fn session_name_for(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().replace('.', "_"))
-        .unwrap_or_else(|| "orcim-unknown".to_string())
+        .unwrap_or_else(|| format!("{APP_NAME}-unknown"))
 }
 
 /// Create a detached session, honoring the per-project .tmux.sh hook just
@@ -323,13 +332,13 @@ pub fn select_window(session: &str, index: u8) -> Result<()> {
     Ok(())
 }
 
-/// Switch the attached client to a session; orcim keeps running in its own.
+/// Switch the attached client to a session; corc keeps running in its own.
 pub fn switch_client(session: &str) -> Result<()> {
     tmux(&["switch-client", "-t", &format!("={session}")])?;
     Ok(())
 }
 
-/// Attach the calling terminal to a session — what `orcim open` does when
+/// Attach the calling terminal to a session — what `corc open` does when
 /// run outside tmux, where switch-client has no client to move.
 pub fn attach(session: &str) -> Result<()> {
     let status = Command::new("tmux")

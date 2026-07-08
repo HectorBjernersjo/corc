@@ -92,9 +92,9 @@ mod tests {
     #[test]
     fn word_matching() {
         assert!(matches_words("", "anything"));
-        assert!(matches_words("orc", "~/Projects/orcim"));
-        assert!(matches_words("proj orc", "~/Projects/orcim"));
-        assert!(matches_words("ORC", "~/projects/orcim"));
-        assert!(!matches_words("proj xyz", "~/Projects/orcim"));
+        assert!(matches_words("orc", "~/Projects/corc"));
+        assert!(matches_words("proj orc", "~/Projects/corc"));
+        assert!(matches_words("ORC", "~/projects/corc"));
+        assert!(!matches_words("proj xyz", "~/Projects/corc"));
     }
 }

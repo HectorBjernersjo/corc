@@ -18,23 +18,23 @@ fn main() -> Result<()> {
     }
 }
 
-/// `orcim open` (D15): make sure the visible `orcim` session exists with the
+/// `corc open` (D15): make sure the visible `corc` session exists with the
 /// TUI running in it, then take the client there. Bound to Ctrl+q in
 /// tmux.conf via run-shell.
 fn open() -> Result<()> {
-    let exe = std::env::current_exe().context("locating the orcim binary")?;
-    tmux::ensure_orcim_session(&exe.to_string_lossy())?;
+    let exe = std::env::current_exe().context("locating the corc binary")?;
+    tmux::ensure_tui_session(&exe.to_string_lossy())?;
     // switch-client only works from inside tmux; that covers both a shell in
     // a pane (TMUX set) and the Ctrl+q run-shell binding (TMUX_PANE set).
     // From a plain terminal, attach instead.
     if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
-        tmux::switch_client(tmux::ORCIM_SESSION)
+        tmux::switch_client(tmux::TUI_SESSION)
     } else {
-        tmux::attach(tmux::ORCIM_SESSION)
+        tmux::attach(tmux::TUI_SESSION)
     }
 }
 
-/// Print every conversation orcim owns, grouped by project in display order.
+/// Print every conversation corc owns, grouped by project in display order.
 fn list() -> Result<()> {
     let state = state::State::load()?;
     let mut store = discovery::Store::new()?;
