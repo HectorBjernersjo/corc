@@ -6,14 +6,93 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Path to the shared directory list (also read by new.sh).
+fn directories_file() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".config/tmux/directories.txt"))
+}
+
+/// Expand a leading `~` to `$HOME`; other paths pass through unchanged.
+pub fn expand_tilde(s: &str) -> String {
+    let home = std::env::var("HOME").ok();
+    match (s, home) {
+        ("~", Some(home)) => home,
+        (s, Some(home)) if s.starts_with("~/") => format!("{home}/{}", &s[2..]),
+        _ => s.to_string(),
+    }
+}
+
+/// Directory completions for a path being typed in the `p` overlay: the real
+/// subdirectories of the input's parent whose name starts with its trailing
+/// component (case-insensitive), sorted. A trailing `/` lists the whole dir.
+pub fn complete_dirs(input: &str) -> Vec<PathBuf> {
+    let expanded = expand_tilde(input);
+    let (parent, prefix) = split_parent_prefix(&expanded);
+    let prefix = prefix.to_lowercase();
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_lowercase().starts_with(&prefix))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Split a path string into (parent directory, trailing component). A trailing
+/// `/` means the whole thing is the directory and the prefix is empty.
+fn split_parent_prefix(s: &str) -> (PathBuf, String) {
+    if s.ends_with('/') {
+        return (PathBuf::from(s), String::new());
+    }
+    let path = Path::new(s);
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let prefix = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    (parent, prefix)
+}
+
+/// Append `dir` to directories.txt unless it is already listed. Returns
+/// whether the entry was newly added.
+pub fn add_directory(dir: &Path) -> Result<bool> {
+    let file = directories_file()?;
+    let line = dir.to_string_lossy();
+    let mut content = std::fs::read_to_string(&file).unwrap_or_default();
+    if content.lines().any(|l| l.trim() == line) {
+        return Ok(false);
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&line);
+    content.push('\n');
+    std::fs::write(&file, content)
+        .with_context(|| format!("failed to write {}", file.display()))?;
+    Ok(true)
+}
 
 /// The candidate directories, in directories.txt order, each followed by its
 /// git worktrees, deduped, `/.git/` internals dropped, non-directories dropped.
 pub fn list_directories() -> Result<Vec<PathBuf>> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let file = PathBuf::from(home).join(".config/tmux/directories.txt");
+    let file = directories_file()?;
     let text = std::fs::read_to_string(&file)
         .with_context(|| format!("directory list file not found: {}", file.display()))?;
 
@@ -86,7 +165,8 @@ fn worktrees(repo_root: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_words;
+    use super::{matches_words, split_parent_prefix};
+    use std::path::PathBuf;
 
     /// Word-substring semantics shared with the `/` filter.
     #[test]
@@ -96,5 +176,23 @@ mod tests {
         assert!(matches_words("proj orc", "~/Projects/corc"));
         assert!(matches_words("ORC", "~/projects/corc"));
         assert!(!matches_words("proj xyz", "~/Projects/corc"));
+    }
+
+    /// A trailing `/` lists the whole directory; otherwise the last component
+    /// is the prefix to complete against.
+    #[test]
+    fn parent_prefix_split() {
+        assert_eq!(
+            split_parent_prefix("/home/hector/"),
+            (PathBuf::from("/home/hector/"), String::new())
+        );
+        assert_eq!(
+            split_parent_prefix("/home/hector/Pro"),
+            (PathBuf::from("/home/hector"), "Pro".to_string())
+        );
+        assert_eq!(
+            split_parent_prefix("/"),
+            (PathBuf::from("/"), String::new())
+        );
     }
 }

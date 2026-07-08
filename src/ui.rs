@@ -46,6 +46,17 @@ struct Picker {
     selected: usize,
 }
 
+/// The `p` overlay: type a filesystem path (prefilled with `$HOME`), Tab/▼▲
+/// to complete against real subdirectories. Enter appends the directory to
+/// directories.txt and spawns a fresh conversation there.
+struct PathPrompt {
+    input: String,
+    /// Subdirectories completing the current input, sorted.
+    completions: Vec<PathBuf>,
+    /// Index into `completions`.
+    selected: usize,
+}
+
 impl Picker {
     /// Indices into `dirs` that match the current input, in source order.
     fn filtered(&self) -> Vec<usize> {
@@ -87,8 +98,10 @@ struct App {
     show_all: bool,
     /// How many week-old Dead conversations the current list is hiding.
     hidden: usize,
-    /// The `n` directory-picker overlay, when open (D14).
+    /// The `N` directory-picker overlay, when open (D14).
     picker: Option<Picker>,
+    /// The `p` add-directory path prompt, when open.
+    path_prompt: Option<PathPrompt>,
     /// Move mode (D9): `K`/`J` reorder the selected row's project.
     move_mode: bool,
     /// Persistent list state so the scroll offset survives between frames —
@@ -128,6 +141,7 @@ pub fn run() -> Result<()> {
         show_all: false,
         hidden: 0,
         picker: None,
+        path_prompt: None,
         move_mode: false,
         list_state: ListState::default(),
         list_rows: 0,
@@ -221,6 +235,11 @@ impl App {
             self.handle_picker_key(code);
             return false;
         }
+        // The add-directory path prompt likewise owns the keyboard.
+        if self.path_prompt.is_some() {
+            self.handle_path_key(code);
+            return false;
+        }
         // A pending `x` on a Running conversation: only y/n answer it (D12).
         if let Some(id) = self.pending_kill.clone() {
             match code {
@@ -269,7 +288,6 @@ impl App {
             return false;
         }
         match code {
-            KeyCode::Char('q') => return true,
             KeyCode::Char('j') | KeyCode::Down => self.select_next(1),
             KeyCode::Char('k') | KeyCode::Up => self.select_next(-1),
             KeyCode::Char('g') | KeyCode::Home => self.select_edge(true),
@@ -280,7 +298,9 @@ impl App {
                 self.rebuild_items();
             }
             KeyCode::Enter => self.view_selected(),
-            KeyCode::Char('n') => self.open_picker(),
+            KeyCode::Char('n') => self.new_conversation_here(),
+            KeyCode::Char('N') => self.open_picker(),
+            KeyCode::Char('p') => self.open_path_prompt(),
             KeyCode::Char('x') => self.kill_or_remove(),
             KeyCode::Char('V') => self.move_mode = true,
             KeyCode::Char(c @ '1'..='9') => self.digit_jump(c as u8 - b'0'),
@@ -339,6 +359,7 @@ impl App {
                 }
             }
         }
+        let mut died_id = None;
         if viewed_died {
             // The Claude in the content slot exited: its pane is gone and our
             // placeholder shell is parked in its hidden window. Reclaim the
@@ -349,6 +370,7 @@ impl App {
                 Ok(pane) => self.placeholder_pane = pane,
                 Err(e) => self.status_msg = Some(e.to_string()),
             }
+            died_id = Some(id);
         } else if self.viewed.is_none() && !tmux::pane_exists(&self.placeholder_pane) {
             // Someone closed the placeholder shell; put it back.
             if let Ok(pane) = tmux::split_content_pane(&self.sidebar_pane) {
@@ -364,6 +386,15 @@ impl App {
             .collect();
         if let Err(e) = self.store.refresh(&known) {
             self.status_msg = Some(e.to_string());
+        }
+
+        // A conversation whose Claude exited before a single message was ever
+        // sent is forgotten rather than left as an (untitled) Dead row (D17).
+        if let Some(id) = died_id
+            && self.is_empty_conversation(&id)
+        {
+            self.discard_conversation(&id);
+            dirty = false; // discard_conversation already saved.
         }
 
         // The conversation in the content pane counts as continuously
@@ -598,6 +629,15 @@ impl App {
         let Some(id) = self.viewed.take() else {
             return;
         };
+        // Pick up a message sent moments before leaving, so a conversation
+        // that was just written to is never mistaken for empty (D17).
+        let known: Vec<(String, PathBuf)> = self
+            .state
+            .conversations
+            .iter()
+            .map(|c| (c.id.clone(), c.cwd.clone()))
+            .collect();
+        let _ = self.store.refresh(&known);
         if let Some(c) = self.state.conversation_mut(&id) {
             c.last_viewed = state::unix_now();
         }
@@ -622,6 +662,35 @@ impl App {
                 }
             }
         }
+        // A conversation the user opened but never sent a message in is
+        // discarded on leave, rather than lingering as an (untitled) row (D17).
+        if self.is_empty_conversation(&id) {
+            self.discard_conversation(&id);
+        }
+    }
+
+    /// True for a conversation with no generated title and no first user
+    /// prompt — one the user opened but never sent a message in. The jsonl
+    /// (if Claude even wrote one) has no real prompt to lose (D17).
+    fn is_empty_conversation(&self, id: &str) -> bool {
+        self.store
+            .meta(id)
+            .and_then(|m| m.display_title())
+            .is_none()
+    }
+
+    /// Forget an empty conversation: kill its Claude pane and hidden window
+    /// (if any survive) and drop it from the state file. The jsonl under
+    /// ~/.claude is never touched (D1).
+    fn discard_conversation(&mut self, id: &str) {
+        if let Some(pane) = self.state.conversation(id).and_then(|c| c.pane_id.clone())
+            && tmux::kill_hidden_window(id).is_err()
+            && tmux::pane_exists(&pane)
+        {
+            let _ = tmux::kill_pane(&pane);
+        }
+        self.state.conversations.retain(|c| c.id != id);
+        self.status_msg = self.state.save().err().map(|e| e.to_string());
     }
 
     /// `x` per state (D12): a live conversation's Claude and hidden window
@@ -671,7 +740,7 @@ impl App {
         self.refresh();
     }
 
-    /// `n`: open the directory-picker overlay (D14).
+    /// `N`: open the directory-picker overlay (D14).
     fn open_picker(&mut self) {
         match picker::list_directories() {
             Ok(dirs) => {
@@ -714,6 +783,87 @@ impl App {
             KeyCode::Char(c) => {
                 p.input.push(c);
                 p.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// `n`: spawn a fresh conversation in the same directory as the selected
+    /// conversation — "new here", no picker. A no-op when nothing is selected.
+    fn new_conversation_here(&mut self) {
+        let Some(id) = self.selected_conv_id() else {
+            return;
+        };
+        let Some(dir) = self.state.conversation(&id).map(|c| c.cwd.clone()) else {
+            return;
+        };
+        self.new_conversation_in(dir);
+    }
+
+    /// `p`: open the add-directory path prompt, prefilled with `$HOME/`.
+    fn open_path_prompt(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let input = if home.is_empty() {
+            String::new()
+        } else {
+            format!("{home}/")
+        };
+        let completions = picker::complete_dirs(&input);
+        self.path_prompt = Some(PathPrompt {
+            input,
+            completions,
+            selected: 0,
+        });
+    }
+
+    /// Keys while the path prompt is open: type/Backspace to edit, Tab to
+    /// descend into the highlighted match, ▲/▼ to move, Enter to add the
+    /// directory to directories.txt and spawn there, Esc to cancel.
+    fn handle_path_key(&mut self, code: KeyCode) {
+        let Some(p) = &mut self.path_prompt else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.path_prompt = None,
+            KeyCode::Down => {
+                if !p.completions.is_empty() {
+                    p.selected = (p.selected + 1).min(p.completions.len() - 1);
+                }
+            }
+            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+            KeyCode::Tab => {
+                if let Some(dir) = p.completions.get(p.selected) {
+                    p.input = format!("{}/", dir.to_string_lossy());
+                    p.completions = picker::complete_dirs(&p.input);
+                    p.selected = 0;
+                }
+            }
+            KeyCode::Backspace => {
+                p.input.pop();
+                p.completions = picker::complete_dirs(&p.input);
+                p.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                p.input.push(c);
+                p.completions = picker::complete_dirs(&p.input);
+                p.selected = 0;
+            }
+            KeyCode::Enter => {
+                // Prefer the exact typed path if it is a directory; otherwise
+                // take the highlighted completion.
+                let typed = PathBuf::from(picker::expand_tilde(&p.input));
+                let chosen = if typed.is_dir() {
+                    Some(typed)
+                } else {
+                    p.completions.get(p.selected).cloned()
+                };
+                if let Some(dir) = chosen {
+                    self.path_prompt = None;
+                    match picker::add_directory(&dir) {
+                        Ok(_) => self.new_conversation_in(dir),
+                        Err(e) => self.status_msg = Some(e.to_string()),
+                    }
+                }
             }
             _ => {}
         }
@@ -812,6 +962,45 @@ impl App {
         self.draw_list(f, outer[0]);
         self.draw_footer(f, outer[1]);
         self.draw_picker(f);
+        self.draw_path_prompt(f);
+    }
+
+    /// The `p` overlay: an input line prefilled with `$HOME/`, plus the
+    /// matching subdirectories to Tab through.
+    fn draw_path_prompt(&mut self, f: &mut Frame) {
+        let Some(p) = &mut self.path_prompt else {
+            return;
+        };
+        if !p.completions.is_empty() {
+            p.selected = p.selected.min(p.completions.len() - 1);
+        }
+
+        let area = f.area();
+        let rect = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: (p.completions.len() as u16 + 3).clamp(4, area.height.saturating_sub(2).max(4)),
+        };
+        f.render_widget(Clear, rect);
+        let block = Block::bordered().title(" add directory ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        f.render_widget(Paragraph::new(format!("▸ {}▏", display_dir(&p.input))), rows[0]);
+
+        let width = inner.width as usize;
+        let items: Vec<ListItem> = p
+            .completions
+            .iter()
+            .map(|d| ListItem::new(truncate(&display_dir(&d.to_string_lossy()), width)))
+            .collect();
+        let mut list_state = ListState::default().with_selected(Some(p.selected));
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+        f.render_stateful_widget(list, rows[1], &mut list_state);
     }
 
     /// The `n` overlay (D14): an input line plus the matching directories.
@@ -936,6 +1125,14 @@ impl App {
             );
             return;
         }
+        if self.path_prompt.is_some() {
+            let text = "type path · tab complete · enter add · esc cancel";
+            f.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::Gray)),
+                area,
+            );
+            return;
+        }
         let text = if self.filter_input {
             format!("/{}▏  (enter: keep, esc: clear)", self.filter)
         } else if let Some(msg) = &self.status_msg {
@@ -953,7 +1150,7 @@ impl App {
             } else {
                 String::new()
             };
-            format!("{filter}{hidden}enter view · n new · x kill · q quit")
+            format!("{filter}{hidden}enter view · n/N new · p add · x kill")
         };
         let style = if self.status_msg.is_some() && !self.filter_input {
             Style::default().fg(Color::Red)
