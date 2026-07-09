@@ -8,11 +8,12 @@
 //! |---------|------------------------------------------|------------------------|
 //! | Running | pane alive, turn in flight               | elapsed since turn start |
 //! | Unseen  | pane alive, turn completed after viewing | completed turn's duration |
-//! | Idle    | pane alive, turn complete, viewed since  | empty < 1h, else coarse |
-//! | Dead    | no pane                                  | coarse age, hours+     |
+//! | Idle    | pane alive, turn complete, viewed since  | age since last active  |
+//! | Dead    | no pane                                  | age since last active  |
 //!
 //! Every time column is a single largest unit — `9s`, `4m`, `2h`, `3d`, `5w`
-//! — so the column stays narrow. Idle/Dead are never finer than hours.
+//! — so the column stays narrow. Idle/Dead always show how long since the
+//! conversation was last active (down to the minute), never blank.
 
 use crate::discovery::{Meta, TurnState};
 use std::time::SystemTime;
@@ -92,8 +93,8 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
             .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
             .map(|(start, done)| fmt_duration(done.saturating_sub(start)))
             .unwrap_or_default(),
-        Status::Idle => coarse_age(now.saturating_sub(last_activity(meta, created_at))),
-        Status::Dead => coarse_age(now.saturating_sub(last_activity(meta, created_at))),
+        Status::Idle => age(now.saturating_sub(last_activity(meta, created_at))),
+        Status::Dead => age(now.saturating_sub(last_activity(meta, created_at))),
     }
 }
 
@@ -123,11 +124,14 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// Coarse age for Idle/Dead: single unit, never finer than hours, empty
-/// under an hour.
-fn coarse_age(secs: u64) -> String {
-    if secs < 3600 {
-        String::new()
+/// Time since the conversation was last active, for the Idle/Dead columns: a
+/// single largest unit down to minutes (`<1m`, `4m`, `2h`, `3d`, `5w`), never
+/// blank — so every row shows how long since it last did anything, not only
+/// the Running ones. Sub-minute ages collapse to `<1m` rather than churning
+/// per second across a list of otherwise-quiet rows.
+fn age(secs: u64) -> String {
+    if secs < 60 {
+        "<1m".to_string()
     } else {
         fmt_duration(secs)
     }
@@ -206,12 +210,14 @@ mod tests {
         let done = meta(TurnState::Complete, Some(1000), Some(1000 + 25 * 60));
         assert_eq!(time_column(Status::Unseen, Some(&done), 0, now), "25m");
 
-        // Idle: empty under an hour of age, then coarse.
+        // Idle: always shows age since last active — minutes under an hour,
+        // `<1m` under a minute, then coarser. Never blank.
         let idle = |mtime: u64| Meta {
             mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime),
             ..Meta::default()
         };
-        assert_eq!(time_column(Status::Idle, Some(&idle(now - 300)), 0, now), "");
+        assert_eq!(time_column(Status::Idle, Some(&idle(now - 30)), 0, now), "<1m");
+        assert_eq!(time_column(Status::Idle, Some(&idle(now - 300)), 0, now), "5m");
         assert_eq!(
             time_column(Status::Idle, Some(&idle(now - 5 * 3600)), 0, now),
             "5h"

@@ -28,8 +28,19 @@ pub fn run() -> Result<()> {
         items.push(Choice::new(display_dir(&path), path));
     }
 
-    let Some(choice) = widget::run_filter_picker("switch project", items)? else {
-        return Ok(());
+    // `add_dir` appends an always-present, ranked-last "add directory" row, so
+    // an empty filter result becomes an escape hatch rather than a dead end.
+    let choice = match widget::run_filter_picker("switch project", items, true)? {
+        None => return Ok(()),
+        Some(widget::Picked::Value(v)) => v,
+        // No listed session or directory fit — let the user type a new one and
+        // open a session there directly. This never records the directory in
+        // corc's state (the TUI is the sole writer, D22); the created session
+        // itself is what makes it show up in the picker from now on.
+        Some(widget::Picked::AddDir) => match widget::run_path_prompt("add directory")? {
+            Some(dir) => dir.to_string_lossy().into_owned(),
+            None => return Ok(()),
+        },
     };
 
     if session_set.contains(choice.as_str()) {

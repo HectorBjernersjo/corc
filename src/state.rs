@@ -65,11 +65,34 @@ impl State {
     pub fn load() -> Result<Self> {
         let path = state_file()?;
         match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text)
-                .with_context(|| format!("corrupt state file {}", path.display())),
+            Ok(text) => {
+                let mut state: Self = serde_json::from_str(&text)
+                    .with_context(|| format!("corrupt state file {}", path.display()))?;
+                // Drop projects whose conversations have all gone away: they are
+                // invisible in the list but still occupy a slot in the move-mode
+                // order, which makes reordering skip "dead" steps (D9).
+                state.prune_empty_projects();
+                Ok(state)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// Remove any project from the display order that no longer has a
+    /// conversation. `state.projects` is otherwise only ever appended to
+    /// (`add_conversation`), so without this an emptied project lingers as an
+    /// invisible row that reorder still steps across. Returns whether anything
+    /// was removed.
+    pub fn prune_empty_projects(&mut self) -> bool {
+        let live: std::collections::HashSet<String> = self
+            .conversations
+            .iter()
+            .map(|c| c.cwd.display().to_string())
+            .collect();
+        let before = self.projects.len();
+        self.projects.retain(|project| live.contains(project));
+        self.projects.len() != before
     }
 
     /// Atomic write: temp file in the same directory, then rename over.

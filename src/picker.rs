@@ -131,6 +131,67 @@ pub fn matches_words(filter: &str, hay: &str) -> bool {
         .all(|w| hay.contains(w))
 }
 
+/// A fuzzy hit: the match score and the char positions in `hay` it consumed.
+pub struct FuzzyMatch {
+    /// Higher is a better match.
+    pub score: i32,
+    /// Char indices into `hay` (ascending) that the query matched — what the
+    /// picker highlights, the way Telescope/snacks do.
+    pub indices: Vec<usize>,
+}
+
+/// Fuzzy subsequence match used by the directory/session picker: every
+/// non-space character of `query` must appear in `hay` in order,
+/// case-insensitively (so "pr4" matches "pr-4"). Returns the score and the
+/// matched positions, or None when it doesn't match at all. The score rewards
+/// consecutive characters and matches at word boundaries (start, or after
+/// `-_/. ` or a case bump) so the tightest hit ranks first. An empty query
+/// matches everything with a neutral score and no highlights, preserving
+/// source order.
+pub fn fuzzy_match(query: &str, hay: &str) -> Option<FuzzyMatch> {
+    let q: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if q.is_empty() {
+        return Some(FuzzyMatch {
+            score: 0,
+            indices: Vec::new(),
+        });
+    }
+    let raw: Vec<char> = hay.chars().collect();
+    let lower: Vec<char> = hay.to_lowercase().chars().collect();
+
+    let mut qi = 0;
+    let mut score = 0i32;
+    let mut prev: Option<usize> = None;
+    let mut indices = Vec::with_capacity(q.len());
+    for hi in 0..lower.len() {
+        if qi >= q.len() || lower[hi] != q[qi] {
+            continue;
+        }
+        score += 1;
+        if prev == Some(hi.wrapping_sub(1)) {
+            score += 6; // consecutive run
+        }
+        let boundary = hi == 0
+            || matches!(raw[hi - 1], '-' | '_' | '/' | '.' | ' ')
+            || (raw[hi - 1].is_lowercase() && raw[hi].is_uppercase());
+        if boundary {
+            score += 4;
+        }
+        indices.push(hi);
+        prev = Some(hi);
+        qi += 1;
+    }
+    // Shorter haystacks with the same coverage read as tighter matches.
+    (qi == q.len()).then(|| FuzzyMatch {
+        score: score - (lower.len() as i32) / 32,
+        indices,
+    })
+}
+
 /// The repo root to expand worktrees from: `rev-parse --show-toplevel` for a
 /// normal checkout, or the directory itself when it is a bare repo — matching
 /// new.sh's worktree handling. None outside a repo.
@@ -175,8 +236,13 @@ fn worktrees(repo_root: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches_words, split_parent_prefix};
+    use super::{fuzzy_match, matches_words, split_parent_prefix};
     use std::path::PathBuf;
+
+    /// Convenience: the score of a match, or None when it doesn't match.
+    fn fuzzy_score(query: &str, hay: &str) -> Option<i32> {
+        fuzzy_match(query, hay).map(|m| m.score)
+    }
 
     /// Word-substring semantics shared with the `/` filter.
     #[test]
@@ -186,6 +252,32 @@ mod tests {
         assert!(matches_words("proj orc", "~/Projects/corc"));
         assert!(matches_words("ORC", "~/projects/corc"));
         assert!(!matches_words("proj xyz", "~/Projects/corc"));
+    }
+
+    /// Fuzzy subsequence matching used by the directory picker: gaps and
+    /// separators are skipped, so "pr4" matches "pr-4".
+    #[test]
+    fn fuzzy_matching() {
+        assert!(fuzzy_score("pr4", "pr-4").is_some());
+        assert!(fuzzy_score("pr4", "pr-1").is_none()); // no '4'
+        assert!(fuzzy_score("PR4", "pr-4").is_some()); // case-insensitive
+        assert!(fuzzy_score("", "anything").is_some()); // empty matches all
+        assert!(fuzzy_score("xyz", "pr-4").is_none()); // out of order / absent
+
+        // A contiguous, boundary-aligned hit outranks a scattered one.
+        let tight = fuzzy_score("pr4", "pr-4").unwrap();
+        let loose = fuzzy_score("pr4", "parser/output4").unwrap();
+        assert!(tight > loose, "tight {tight} should beat loose {loose}");
+    }
+
+    /// The matched positions returned for highlighting are the char indices in
+    /// the haystack the query consumed, in order — skipping separators.
+    #[test]
+    fn fuzzy_indices() {
+        // "pr4" in "pr-4": p@0, r@1, 4@3 (the '-' at 2 is skipped).
+        assert_eq!(fuzzy_match("pr4", "pr-4").unwrap().indices, vec![0, 1, 3]);
+        // An empty query highlights nothing.
+        assert!(fuzzy_match("", "anything").unwrap().indices.is_empty());
     }
 
     /// A trailing `/` lists the whole directory; otherwise the last component

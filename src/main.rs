@@ -41,7 +41,10 @@ fn pick_dir(args: &[String]) -> Result<()> {
             widget::Choice::new(display_dir(&path), path)
         })
         .collect();
-    let choice = widget::run_filter_picker("new conversation", items)?;
+    let choice = match widget::run_filter_picker("new conversation", items, false)? {
+        Some(widget::Picked::Value(v)) => Some(v),
+        _ => None,
+    };
     emit_choice(args, choice.as_deref())
 }
 

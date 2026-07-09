@@ -8,6 +8,7 @@ mod cursor;
 
 use crate::discovery::{Meta, MetaSource};
 use anyhow::Result;
+use ratatui::style::Color;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,22 @@ pub const DEFAULT_ID: &str = "claude";
 /// the switch picker automatically.
 pub fn all() -> &'static [&'static dyn Provider] {
     &ALL
+}
+
+/// A subtle, near-white accent tint for a provider's conversation titles in
+/// the sidebar, so each agent CLI reads slightly differently at a glance
+/// without any of them being loud: Claude faintly warm/orange, Cursor faintly
+/// cool grey, Codex faintly blue. Keyed by the persisted id (not the trait) so
+/// tints for agents not yet wired up as providers already apply the moment
+/// they are added. Anything unrecognized falls back to a plain near-white.
+pub fn accent(id: &str) -> Color {
+    match id {
+        "claude" => Color::Rgb(234, 198, 164),
+        "cursor" => Color::Rgb(198, 200, 206),
+        "codex" => Color::Rgb(188, 202, 230),
+        "opencode" => Color::Rgb(196, 216, 200),
+        _ => Color::Rgb(214, 214, 214),
+    }
 }
 
 /// Resolve a persisted provider id, falling back to the default so an old or

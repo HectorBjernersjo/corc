@@ -79,6 +79,9 @@ struct App {
     viewed: Option<String>,
     items: Vec<Item>,
     selected: usize,
+    /// Pending vim-style count prefix: `3j` moves three rows. Digits
+    /// accumulate here until a motion consumes them or another key clears it.
+    count: Option<usize>,
     filter: String,
     filter_input: bool,
     /// Conversation id awaiting the `y/n` kill confirmation (`x` on a
@@ -137,6 +140,7 @@ pub fn run() -> Result<()> {
         viewed: None,
         items: Vec::new(),
         selected: 0,
+        count: None,
         filter: String::new(),
         filter_input: false,
         pending_kill: None,
@@ -219,7 +223,9 @@ impl App {
 
             if event::poll(Duration::from_millis(200))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         if self.handle_key(key.code, key.modifiers) {
                             return Ok(());
                         }
@@ -294,9 +300,36 @@ impl App {
             }
             return false;
         }
+        // Ctrl+d / Ctrl+u: hop one project group down / up (feature request).
+        if mods.contains(KeyModifiers::CONTROL) {
+            match code {
+                KeyCode::Char('d') => self.jump_project(1),
+                KeyCode::Char('u') => self.jump_project(-1),
+                _ => {}
+            }
+            self.count = None;
+            return false;
+        }
+        // Vim-style count prefix: bare digits accumulate a repeat count that
+        // the next motion consumes (`3j`, `4k`). A leading 0 is not a count.
+        // Window-jump lives on Alt+1..9, handled by tmux, so the digits are
+        // free here.
+        if let KeyCode::Char(c @ '0'..='9') = code
+            && !(c == '0' && self.count.is_none())
+        {
+            let d = (c as u8 - b'0') as usize;
+            self.count = Some(self.count.unwrap_or(0).saturating_mul(10).saturating_add(d));
+            return false;
+        }
         match code {
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select_next(-1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                let n = self.take_count();
+                self.move_selection(1, n);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let n = self.take_count();
+                self.move_selection(-1, n);
+            }
             KeyCode::Char('g') | KeyCode::Home => self.select_edge(true),
             KeyCode::Char('G') | KeyCode::End => self.select_edge(false),
             KeyCode::Char('/') => self.filter_input = true,
@@ -311,7 +344,6 @@ impl App {
             KeyCode::Char('s') => self.open_provider_picker(),
             KeyCode::Char('x') => self.kill_or_remove(),
             KeyCode::Char('V') => self.move_mode = true,
-            KeyCode::Char(c @ '1'..='9') => self.digit_jump(c as u8 - b'0'),
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
                 self.rebuild_items();
@@ -319,6 +351,8 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             _ => {}
         }
+        // Any non-digit key ends a dangling count prefix.
+        self.count = None;
         false
     }
 
@@ -582,6 +616,53 @@ impl App {
         }
     }
 
+    /// Consume the pending vim count, defaulting to 1 when none was typed.
+    fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1).max(1)
+    }
+
+    /// Move the selection `count` conversation rows in `dir` (±1), stopping at
+    /// the list edge. The count is clamped to the list length so a stray large
+    /// prefix (`999j`) can't spin.
+    fn move_selection(&mut self, dir: i64, count: usize) {
+        for _ in 0..count.min(self.items.len().max(1)) {
+            self.select_next(dir);
+        }
+    }
+
+    /// The item index of the first conversation in each project group, in
+    /// screen order — the landing spots for the Ctrl+d/u folder hop.
+    fn project_starts(&self) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut expect_first = false;
+        for (i, item) in self.items.iter().enumerate() {
+            match item {
+                Item::Header(_) => expect_first = true,
+                Item::Conv(_) if expect_first => {
+                    starts.push(i);
+                    expect_first = false;
+                }
+                Item::Conv(_) => {}
+            }
+        }
+        starts
+    }
+
+    /// Ctrl+d/u: move the selection to the first conversation of the next or
+    /// previous project group, clamping at the ends.
+    fn jump_project(&mut self, dir: i64) {
+        let starts = self.project_starts();
+        if starts.is_empty() {
+            return;
+        }
+        let cur = starts
+            .iter()
+            .rposition(|&s| s <= self.selected)
+            .unwrap_or(0);
+        let target = (cur as i64 + dir).clamp(0, starts.len() as i64 - 1) as usize;
+        self.selected = starts[target];
+    }
+
     fn select_edge(&mut self, top: bool) {
         let pos = if top {
             self.items.iter().position(|i| matches!(i, Item::Conv(_)))
@@ -785,6 +866,7 @@ impl App {
             let _ = tmux::kill_pane(&pane);
         }
         self.state.conversations.retain(|c| c.id != id);
+        self.state.prune_empty_projects();
         self.status_msg = self.state.save().err().map(|e| e.to_string());
     }
 
@@ -805,6 +887,7 @@ impl App {
                 if idx < self.statuses.len() {
                     self.statuses.remove(idx);
                 }
+                self.state.prune_empty_projects();
                 self.status_msg = self.state.save().err().map(|e| e.to_string());
                 self.refresh();
             }
@@ -969,20 +1052,6 @@ impl App {
         self.status_msg = result.err().map(|e| e.to_string());
     }
 
-    /// Digit jump (D13): take the client to window N of the selected row's
-    /// project's real session. The hop itself lives in `tmux::jump_to_window`
-    /// so the headless `corc jump N` (a tmux binding, run from inside the
-    /// Claude pane) shares the exact same behavior.
-    fn digit_jump(&mut self, n: u8) {
-        let Some(id) = self.selected_conv_id() else {
-            return;
-        };
-        let Some(dir) = self.state.conversation(&id).map(|c| c.cwd.clone()) else {
-            return;
-        };
-        self.status_msg = tmux::jump_to_window(&dir, n).err().map(|e| e.to_string());
-    }
-
     /// Move mode `K`/`J` (D9): shift the selected row's project one step in
     /// the persisted display order.
     fn move_project(&mut self, delta: i64) {
@@ -1094,7 +1163,14 @@ impl App {
     /// gray ●, Dead hollow ○. The viewed conversation carries a blue row
     /// background (`VIEWED_BG`) rather than a recolored dot, so its dot keeps
     /// showing status like any other row.
-    fn render_conv(&self, idx: usize, i: usize, width: usize, now: u64) -> ListItem<'static> {
+    fn render_conv(
+        &self,
+        idx: usize,
+        i: usize,
+        width: usize,
+        now: u64,
+        multi_provider: bool,
+    ) -> ListItem<'static> {
         let conv = &self.state.conversations[i];
         let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
         let (dot, color) = match status {
@@ -1110,12 +1186,21 @@ impl App {
             .to_string();
         let time = status::time_column(status, meta, conv.created_at, now);
         let viewed = self.viewed.as_deref() == Some(conv.id.as_str());
+        // Tint the title by which agent CLI spawned it (D6 addition) — but
+        // only when the list actually mixes providers, so a single-provider
+        // setup keeps its original untinted look. Dead rows stay gray:
+        // deadness reads louder than provider.
+        let accent = multi_provider.then(|| provider::accent(&conv.provider));
+        let base = match accent {
+            Some(c) => Style::default().fg(c),
+            None => Style::default(),
+        };
         let title_style = if idx == self.selected {
-            Style::default().add_modifier(Modifier::BOLD)
+            base.add_modifier(Modifier::BOLD)
         } else if status == Status::Dead {
             Style::default().fg(Color::Gray)
         } else {
-            Style::default()
+            base
         };
         let dim = Style::default().fg(Color::DarkGray);
         let time_w = time.chars().count();
@@ -1140,13 +1225,28 @@ impl App {
         }
     }
 
+    /// Whether the tracked conversations span more than one provider. The
+    /// provider title tints only apply when they do, so a setup that uses a
+    /// single agent looks exactly as it did before the tints existed.
+    fn uses_multiple_providers(&self) -> bool {
+        let mut seen: Option<&str> = None;
+        for c in &self.state.conversations {
+            match seen {
+                Some(p) if p != c.provider => return true,
+                _ => seen = Some(&c.provider),
+            }
+        }
+        false
+    }
+
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         let now = state::unix_now();
         let width = area.width as usize;
+        let multi = self.uses_multiple_providers();
         let items: Vec<ListItem> = (0..self.items.len())
             .map(|idx| match &self.items[idx] {
                 Item::Header(name) => self.render_header(name, width),
-                Item::Conv(i) => self.render_conv(idx, *i, width, now),
+                Item::Conv(i) => self.render_conv(idx, *i, width, now, multi),
             })
             .collect();
 
@@ -1194,7 +1294,12 @@ impl App {
             } else {
                 String::new()
             };
-            format!("{filter}{hidden}n/N new · s switch · x kill")
+            // Echo a pending vim count prefix (`3j`) like vim's corner.
+            let count = match self.count {
+                Some(n) => format!("{n}  "),
+                None => String::new(),
+            };
+            format!("{count}{filter}{hidden}n/N new · s switch · x kill")
         };
         let style = if self.status_msg.is_some() && !self.filter_input {
             Style::default().fg(Color::Red)
