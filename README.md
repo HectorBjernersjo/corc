@@ -12,8 +12,12 @@ they exit or you reboot.
 ## Requirements
 
 - **tmux** — corc is built on tmux and must run inside it.
-- **Claude Code CLI** (`claude`) on your `PATH` — corc spawns conversations
-  with `claude --session-id <uuid>` / `claude --resume <uuid>`.
+- **At least one agent CLI** on your `PATH`:
+  - **Claude Code** (`claude`) — corc spawns `claude --session-id <uuid>` /
+    `claude --resume <uuid>`.
+  - **Cursor CLI** (`cursor-agent`, optional) — corc mints a chat with
+    `cursor-agent create-chat` and attaches with `cursor-agent --resume <id>`.
+  - Switch which one new conversations use with `s` (see below).
 - **git** (optional) — only used to detect git worktrees for the project
   labels and the directory picker.
 
@@ -87,11 +91,19 @@ Launch with `corc open` (or `Ctrl+q` if you bound it). Inside the TUI:
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
 | `p` | add a directory to `directories.txt` (Tab-complete) → new conversation there |
+| `s` | switch which agent (Claude / Cursor) new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `1`–`9` | jump to window N of the project's normal tmux session |
 | `a` | also show dead conversations older than a week |
 | `/` | filter the list |
+
+Each conversation remembers which agent spawned it, so `Enter` resumes a dead
+one with the same CLI. The `s` picker only changes the agent used for
+conversations you start afterwards; it's persisted, so the choice survives
+restarts. Cursor conversations show their chat title in the sidebar once the
+first message has been sent (read from Cursor's local chat store); before that,
+and if the title can't be read, they show `(untitled)`.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`

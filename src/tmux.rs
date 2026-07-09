@@ -5,10 +5,12 @@
 //! pane with the placeholder in the content pane slot; parking swaps it
 //! back. Nothing is ever destroyed by a view/park.
 
+use crate::provider::Provider;
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Base name for everything the program creates in tmux — change this one
 /// macro to rename the app. (A macro because `concat!` below only takes
@@ -110,25 +112,35 @@ fn kill_stub() {
     ]);
 }
 
-/// Absolute path to the `claude` binary, resolved once per process.
+/// Absolute path to an agent binary (`claude`, `cursor-agent`), resolved once
+/// per name and cached.
 ///
-/// corc runs `claude` directly as a pane command (no wrapping shell, D12), so
+/// corc runs the agent directly as a pane command (no wrapping shell, D12), so
 /// tmux resolves it against the *tmux server's* environment — whose `PATH` is
 /// often the stripped default it was started with and omits `~/.local/bin`
-/// etc., leaving bare `claude` unspawnable. We resolve an absolute path once,
+/// etc., leaving a bare name unspawnable. We resolve an absolute path once,
 /// preferring the login shell's `PATH` (arbitrary install locations), then the
-/// installer's known locations, and cache it. Moving `claude` after corc has
+/// installer's known locations, and cache it. Moving the binary after corc has
 /// started needs a corc restart to pick up (rare; accepted tradeoff).
-pub fn claude_command() -> &'static str {
-    static CLAUDE: OnceLock<String> = OnceLock::new();
-    CLAUDE.get_or_init(resolve_claude)
+pub fn resolve_binary(name: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(name) {
+        return hit.clone();
+    }
+    let resolved = resolve_binary_uncached(name);
+    cache
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), resolved.clone());
+    resolved
 }
 
-fn resolve_claude() -> String {
+fn resolve_binary_uncached(name: &str) -> String {
     // 1. The login shell's PATH — covers wherever the user installed it.
     if let Ok(shell) = std::env::var("SHELL")
         && let Ok(out) = Command::new(&shell)
-            .args(["-lc", "command -v claude"])
+            .args(["-lc", &format!("command -v {name}")])
             .output()
         && out.status.success()
     {
@@ -139,64 +151,45 @@ fn resolve_claude() -> String {
     }
     // 2. The installer's known locations.
     if let Ok(home) = std::env::var("HOME") {
-        for rel in [".local/bin/claude", ".cargo/bin/claude", ".npm-global/bin/claude"] {
-            let cand = PathBuf::from(&home).join(rel);
+        for rel in [".local/bin", ".cargo/bin", ".npm-global/bin"] {
+            let cand = PathBuf::from(&home).join(rel).join(name);
             if cand.exists() {
                 return cand.to_string_lossy().into_owned();
             }
         }
     }
     // 3. Give up and let tmux try its own PATH (original behavior).
-    "claude".to_string()
+    name.to_string()
 }
 
-/// Spawn a conversation in a new hidden window named by its uuid, running
-/// claude directly as the pane command (no wrapping shell, D12) so the
-/// window dies when Claude exits. Returns the new pane id.
-pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> {
+/// Spawn a conversation in a new hidden window named by its id, running the
+/// provider's agent directly as the pane command (no wrapping shell, D12) so
+/// the window dies when the agent exits. Returns the new pane id.
+pub fn spawn_conversation(
+    dir: &Path,
+    provider: &dyn Provider,
+    id: &str,
+    resume: bool,
+) -> Result<String> {
     if !dir.is_dir() {
         bail!("directory {} no longer exists", dir.display());
     }
     let dir_str = dir.to_string_lossy();
-    let flag = if resume { "--resume" } else { "--session-id" };
-    let claude = claude_command();
-    let pane_id;
-    if session_exists(HIDDEN_SESSION) {
-        // Multiple trailing arguments make tmux exec the command directly.
-        pane_id = tmux(&[
-            "new-window",
-            "-d",
-            "-t",
-            &format!("={HIDDEN_SESSION}:"),
-            "-n",
-            id,
-            "-c",
-            &dir_str,
-            "-P",
-            "-F",
-            "#{pane_id}",
-            claude,
-            flag,
-            id,
-        ])?;
-        kill_stub();
+    let bin = resolve_binary(provider.binary());
+    let extra = provider.spawn_args(id, resume);
+    let hidden_target = format!("={HIDDEN_SESSION}:");
+    // Multiple trailing arguments make tmux exec the command directly.
+    let base: Vec<&str> = if session_exists(HIDDEN_SESSION) {
+        vec!["new-window", "-d", "-t", &hidden_target]
     } else {
-        pane_id = tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            HIDDEN_SESSION,
-            "-n",
-            id,
-            "-c",
-            &dir_str,
-            "-P",
-            "-F",
-            "#{pane_id}",
-            claude,
-            flag,
-            id,
-        ])?;
+        vec!["new-session", "-d", "-s", HIDDEN_SESSION]
+    };
+    let mut args = base;
+    args.extend(["-n", id, "-c", &dir_str, "-P", "-F", "#{pane_id}", &bin]);
+    args.extend(extra.iter().map(String::as_str));
+    let pane_id = tmux(&args)?;
+    if args[0] == "new-window" {
+        kill_stub();
     }
     Ok(pane_id.trim().to_string())
 }
@@ -215,8 +208,17 @@ pub fn split_content_pane(sidebar_pane: &str) -> Result<String> {
         "-F",
         "#{pane_id}",
     ])?;
-    tmux(&["resize-pane", "-t", sidebar_pane, "-x", "40"])?;
+    enforce_sidebar_width(sidebar_pane)?;
     Ok(out.trim().to_string())
+}
+
+/// Pin the sidebar back to 40 columns. tmux redistributes columns
+/// proportionally on any width change (terminal resize, font zoom, outer
+/// split), so the fixed width set at split time drifts and must be
+/// re-enforced — otherwise the sidebar grows and never snaps back.
+pub fn enforce_sidebar_width(sidebar_pane: &str) -> Result<()> {
+    tmux(&["resize-pane", "-t", sidebar_pane, "-x", "40"])?;
+    Ok(())
 }
 
 /// Swap two panes without touching active/last-pane state.

@@ -1,5 +1,6 @@
 mod discovery;
 mod picker;
+mod provider;
 mod state;
 mod status;
 mod tmux;
@@ -37,11 +38,11 @@ fn open() -> Result<()> {
 /// Print every conversation corc owns, grouped by project in display order.
 fn list() -> Result<()> {
     let state = state::State::load()?;
-    let mut store = discovery::Store::new()?;
-    let known: Vec<(String, PathBuf)> = state
+    let mut store = provider::MetaStore::new()?;
+    let known: Vec<(String, PathBuf, &'static str)> = state
         .conversations
         .iter()
-        .map(|c| (c.id.clone(), c.cwd.clone()))
+        .map(|c| (c.id.clone(), c.cwd.clone(), provider::by_id(&c.provider).id()))
         .collect();
     store.refresh(&known)?;
 

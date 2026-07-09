@@ -3,7 +3,7 @@
 //! currently viewed conversation's Claude pane, swapped in from the hidden
 //! session (ADR-0001).
 
-use crate::discovery::Store;
+use crate::provider::{self, MetaStore};
 use crate::state::{self, State};
 use crate::status::{self, Status};
 use crate::{display_dir, picker, tmux, truncate};
@@ -32,6 +32,11 @@ enum Item {
 
 /// Dead conversations older than this are hidden unless `a` is on (D12).
 const HIDE_DEAD_AFTER_SECS: u64 = 7 * 24 * 3600;
+/// Grace period before an empty conversation the user left is discarded
+/// (D17). A message sent an instant before leaving can still be flushing to
+/// disk — Cursor lags noticeably — so we wait and re-check emptiness rather
+/// than discarding on the spot.
+const DISCARD_GRACE: Duration = Duration::from_secs(5);
 /// Most recent conversations shown per project before the rest are hidden
 /// (D13) — the `a` toggle reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
@@ -72,9 +77,27 @@ impl Picker {
     }
 }
 
+/// The `s` provider-switch overlay: a fuzzy picker over the registered
+/// providers. Enter sets the provider for conversations spawned from now on.
+struct ProviderPicker {
+    input: String,
+    /// Index into the *filtered* provider list.
+    selected: usize,
+}
+
+impl ProviderPicker {
+    fn filtered(&self) -> Vec<&'static dyn provider::Provider> {
+        provider::all()
+            .iter()
+            .copied()
+            .filter(|p| picker::matches_words(&self.input, p.display_name()))
+            .collect()
+    }
+}
+
 struct App {
     state: State,
-    store: Store,
+    metas: MetaStore,
     /// Pane statuses derived on refresh, parallel to `state.conversations`.
     statuses: Vec<Status>,
     /// The pane corc runs in (left, fixed 40 columns).
@@ -105,8 +128,13 @@ struct App {
     picker: Option<Picker>,
     /// The `p` add-directory path prompt, when open.
     path_prompt: Option<PathPrompt>,
+    /// The `s` provider-switch overlay, when open.
+    provider_picker: Option<ProviderPicker>,
     /// Move mode (D9): `K`/`J` reorder the selected row's project.
     move_mode: bool,
+    /// Empty conversations the user has left, awaiting the `DISCARD_GRACE`
+    /// re-check before being discarded (D17). (id, when it was marked.)
+    pending_discard: Vec<(String, Instant)>,
     /// Persistent list state so the scroll offset survives between frames —
     /// what lets a mouse click map back to the item under the pointer (D11).
     list_state: ListState,
@@ -121,11 +149,11 @@ pub fn run() -> Result<()> {
     let sidebar_pane =
         std::env::var("TMUX_PANE").map_err(|_| anyhow::anyhow!("corc must run inside tmux"))?;
 
-    // Resolve claude's absolute path once now, so the login-shell lookup cost
-    // lands at startup rather than on the first conversation spawn.
-    let _ = tmux::claude_command();
-
+    // Resolve the active provider's binary once now, so the login-shell lookup
+    // cost lands at startup rather than on the first conversation spawn.
     let mut state = State::load()?;
+    let _ = tmux::resolve_binary(provider::by_id(&state.active_provider).binary());
+
     reconcile(&mut state)?;
     state.save()?;
 
@@ -133,7 +161,7 @@ pub fn run() -> Result<()> {
 
     let mut app = App {
         state,
-        store: Store::new()?,
+        metas: MetaStore::new()?,
         statuses: Vec::new(),
         sidebar_pane,
         placeholder_pane,
@@ -149,7 +177,9 @@ pub fn run() -> Result<()> {
         hidden: 0,
         picker: None,
         path_prompt: None,
+        provider_picker: None,
         move_mode: false,
+        pending_discard: Vec::new(),
         list_state: ListState::default(),
         list_rows: 0,
         status_msg: None,
@@ -167,6 +197,10 @@ pub fn run() -> Result<()> {
 
     // Swap the viewed pane home and remove the content pane we created (D10).
     app.park();
+    // On quit there is no next tick to run the grace re-check, so discard any
+    // still-empty conversations now rather than letting them persist as
+    // (untitled) rows across restarts (D17).
+    app.flush_pending_discards();
     if tmux::pane_exists(&app.placeholder_pane) {
         let _ = tmux::kill_pane(&app.placeholder_pane);
     }
@@ -224,6 +258,9 @@ impl App {
                         }
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Resize(_, _) => {
+                        let _ = tmux::enforce_sidebar_width(&self.sidebar_pane);
+                    }
                     _ => {}
                 }
             }
@@ -246,6 +283,11 @@ impl App {
         // The add-directory path prompt likewise owns the keyboard.
         if self.path_prompt.is_some() {
             self.handle_path_key(code);
+            return false;
+        }
+        // The provider-switch picker likewise owns the keyboard.
+        if self.provider_picker.is_some() {
+            self.handle_provider_key(code);
             return false;
         }
         // A pending `x` on a Running conversation: only y/n answer it (D12).
@@ -309,6 +351,7 @@ impl App {
             KeyCode::Char('n') => self.new_conversation_here(),
             KeyCode::Char('N') => self.open_picker(),
             KeyCode::Char('p') => self.open_path_prompt(),
+            KeyCode::Char('s') => self.open_provider_picker(),
             KeyCode::Char('x') => self.kill_or_remove(),
             KeyCode::Char('V') => self.move_mode = true,
             KeyCode::Char(c @ '1'..='9') => self.digit_jump(c as u8 - b'0'),
@@ -348,7 +391,7 @@ impl App {
     /// Mouse (D11): click a row = select + view; the wheel moves the
     /// selection. Ignored while the picker overlay is open.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.picker.is_some() {
+        if self.picker.is_some() || self.provider_picker.is_some() || self.path_prompt.is_some() {
             return;
         }
         match mouse.kind {
@@ -369,6 +412,15 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The (id, cwd, provider-id) triples the metadata store fans out over.
+    fn known_conversations(&self) -> Vec<(String, PathBuf, &'static str)> {
+        self.state
+            .conversations
+            .iter()
+            .map(|c| (c.id.clone(), c.cwd.clone(), provider::by_id(&c.provider).id()))
+            .collect()
     }
 
     fn refresh(&mut self) {
@@ -407,24 +459,20 @@ impl App {
             }
         }
 
-        let known: Vec<(String, PathBuf)> = self
-            .state
-            .conversations
-            .iter()
-            .map(|c| (c.id.clone(), c.cwd.clone()))
-            .collect();
-        if let Err(e) = self.store.refresh(&known) {
+        let known = self.known_conversations();
+        if let Err(e) = self.metas.refresh(&known) {
             self.status_msg = Some(e.to_string());
         }
 
-        // A conversation whose Claude exited before a single message was ever
-        // sent is forgotten rather than left as an (untitled) Dead row (D17).
+        // A conversation whose agent exited before a single message was ever
+        // sent is forgotten rather than left as an (untitled) Dead row (D17) —
+        // after the grace re-check, in case a final message is still flushing.
         if let Some(id) = died_id
             && self.is_empty_conversation(&id)
         {
-            self.discard_conversation(&id);
-            dirty = false; // discard_conversation already saved.
+            self.mark_pending_discard(id);
         }
+        self.process_pending_discards();
 
         // The conversation in the content pane counts as continuously
         // viewed (D6): its last_viewed follows along in memory and is
@@ -444,7 +492,7 @@ impl App {
             .map(|c| {
                 status::derive(
                     c.pane_id.is_some(),
-                    self.store.meta(&c.id),
+                    self.metas.meta(&c.id),
                     c.last_viewed,
                     viewed.as_deref() == Some(c.id.as_str()),
                     now,
@@ -482,7 +530,7 @@ impl App {
         indices.sort_by_key(|&i| {
             let conv = &self.state.conversations[i];
             let dead = self.statuses.get(i) == Some(&Status::Dead);
-            let activity = status::last_activity(self.store.meta(&conv.id), conv.created_at);
+            let activity = status::last_activity(self.metas.meta(&conv.id), conv.created_at);
             (dead, std::cmp::Reverse(activity))
         });
         self.row_order = indices
@@ -523,7 +571,7 @@ impl App {
                 if !self.show_all && self.statuses.get(i) == Some(&Status::Dead) {
                     let conv = &self.state.conversations[i];
                     let age = now.saturating_sub(status::last_activity(
-                        self.store.meta(&conv.id),
+                        self.metas.meta(&conv.id),
                         conv.created_at,
                     ));
                     if age > HIDE_DEAD_AFTER_SECS {
@@ -533,7 +581,7 @@ impl App {
                 }
                 if !filter.is_empty() {
                     let title = self
-                        .store
+                        .metas
                         .meta(&self.state.conversations[i].id)
                         .and_then(|m| m.display_title().map(str::to_string))
                         .unwrap_or_default();
@@ -666,7 +714,8 @@ impl App {
         let pane_id = match conv.pane_id {
             Some(p) if tmux::pane_exists(&p) => p,
             _ => {
-                let pane = tmux::spawn_conversation(&conv.cwd, id, true)?;
+                let prov = provider::by_id(&conv.provider);
+                let pane = tmux::spawn_conversation(&conv.cwd, prov, id, true)?;
                 let c = self.state.conversation_mut(id).unwrap();
                 c.pane_id = Some(pane.clone());
                 pane
@@ -692,13 +741,8 @@ impl App {
         };
         // Pick up a message sent moments before leaving, so a conversation
         // that was just written to is never mistaken for empty (D17).
-        let known: Vec<(String, PathBuf)> = self
-            .state
-            .conversations
-            .iter()
-            .map(|c| (c.id.clone(), c.cwd.clone()))
-            .collect();
-        let _ = self.store.refresh(&known);
+        let known = self.known_conversations();
+        let _ = self.metas.refresh(&known);
         if let Some(c) = self.state.conversation_mut(&id) {
             c.last_viewed = state::unix_now();
         }
@@ -724,8 +768,59 @@ impl App {
             }
         }
         // A conversation the user opened but never sent a message in is
-        // discarded on leave, rather than lingering as an (untitled) row (D17).
+        // discarded rather than left as an (untitled) row (D17) — but only
+        // after the grace re-check, so a message sent just before leaving
+        // (Cursor flushes with a lag) isn't mistaken for an empty one.
         if self.is_empty_conversation(&id) {
+            self.mark_pending_discard(id);
+        }
+    }
+
+    /// Queue an empty conversation for discard after `DISCARD_GRACE`, unless
+    /// it is already queued.
+    fn mark_pending_discard(&mut self, id: String) {
+        if !self.pending_discard.iter().any(|(pid, _)| *pid == id) {
+            self.pending_discard.push((id, Instant::now()));
+        }
+    }
+
+    /// Discard every still-empty queued conversation without waiting out the
+    /// grace — used at shutdown, where no further tick will run the re-check.
+    fn flush_pending_discards(&mut self) {
+        let ids: Vec<String> = std::mem::take(&mut self.pending_discard)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for id in ids {
+            if self.state.conversation(&id).is_some() && self.is_empty_conversation(&id) {
+                self.discard_conversation(&id);
+            }
+        }
+    }
+
+    /// Discard queued conversations whose grace period has elapsed and that
+    /// are still empty. A conversation cancels its own discard by gaining a
+    /// message (no longer empty), being viewed again, or already being gone.
+    fn process_pending_discards(&mut self) {
+        let now = Instant::now();
+        let mut discard = Vec::new();
+        let mut keep = Vec::new();
+        for (id, marked) in std::mem::take(&mut self.pending_discard) {
+            // Cancel: gone, re-viewed, or now has content.
+            if self.state.conversation(&id).is_none()
+                || self.viewed.as_deref() == Some(id.as_str())
+                || !self.is_empty_conversation(&id)
+            {
+                continue;
+            }
+            if now.duration_since(marked) >= DISCARD_GRACE {
+                discard.push(id);
+            } else {
+                keep.push((id, marked)); // keep waiting
+            }
+        }
+        self.pending_discard = keep;
+        for id in discard {
             self.discard_conversation(&id);
         }
     }
@@ -734,7 +829,7 @@ impl App {
     /// prompt — one the user opened but never sent a message in. The jsonl
     /// (if Claude even wrote one) has no real prompt to lose (D17).
     fn is_empty_conversation(&self, id: &str) -> bool {
-        self.store
+        self.metas
             .meta(id)
             .and_then(|m| m.display_title())
             .is_none()
@@ -849,6 +944,50 @@ impl App {
         }
     }
 
+    /// `s`: open the provider-switch overlay.
+    fn open_provider_picker(&mut self) {
+        self.provider_picker = Some(ProviderPicker {
+            input: String::new(),
+            selected: 0,
+        });
+    }
+
+    /// Keys while the provider picker is open: type to filter, arrows to move,
+    /// Enter to make the highlighted provider active for new conversations,
+    /// Esc to cancel.
+    fn handle_provider_key(&mut self, code: KeyCode) {
+        let Some(p) = &mut self.provider_picker else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.provider_picker = None,
+            KeyCode::Enter => {
+                let filtered = p.filtered();
+                let choice = filtered
+                    .get(p.selected.min(filtered.len().saturating_sub(1)))
+                    .map(|prov| prov.id());
+                if let Some(id) = choice {
+                    self.state.active_provider = id.to_string();
+                    self.provider_picker = None;
+                    self.status_msg = self.state.save().err().map(|e| e.to_string());
+                }
+            }
+            KeyCode::Backspace => {
+                p.input.pop();
+                p.selected = 0;
+            }
+            KeyCode::Down => {
+                p.selected = (p.selected + 1).min(p.filtered().len().saturating_sub(1));
+            }
+            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+            KeyCode::Char(c) => {
+                p.input.push(c);
+                p.selected = 0;
+            }
+            _ => {}
+        }
+    }
+
     /// `n`: spawn a fresh conversation in the same directory as the selected
     /// conversation — "new here", no picker. A no-op when nothing is selected.
     fn new_conversation_here(&mut self) {
@@ -930,12 +1069,15 @@ impl App {
         }
     }
 
-    /// Spawn a fresh conversation in `dir` and swap it in immediately (D14).
+    /// Spawn a fresh conversation in `dir` with the active provider and swap
+    /// it in immediately (D14).
     fn new_conversation_in(&mut self, dir: PathBuf) {
         let result = (|| -> Result<()> {
-            let id = state::new_uuid()?;
-            let pane_id = tmux::spawn_conversation(&dir, &id, false)?;
-            self.state.add_conversation(id.clone(), dir, pane_id);
+            let prov = provider::by_id(&self.state.active_provider);
+            let id = prov.new_session_id(&dir)?;
+            let pane_id = tmux::spawn_conversation(&dir, prov, &id, false)?;
+            self.state
+                .add_conversation(id.clone(), dir, pane_id, prov.id().to_string());
             self.state.save()?;
             self.refresh();
             // Move the highlight onto the freshly created row so it looks
@@ -1031,6 +1173,46 @@ impl App {
         self.draw_footer(f, outer[1]);
         self.draw_picker(f);
         self.draw_path_prompt(f);
+        self.draw_provider_picker(f);
+    }
+
+    /// The `s` overlay: an input line plus the matching providers, the active
+    /// one marked. Enter switches which provider new conversations use.
+    fn draw_provider_picker(&mut self, f: &mut Frame) {
+        let Some(p) = &mut self.provider_picker else {
+            return;
+        };
+        let filtered = p.filtered();
+        p.selected = p.selected.min(filtered.len().saturating_sub(1));
+        let active = self.state.active_provider.clone();
+
+        let area = f.area();
+        let rect = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: (filtered.len() as u16 + 3).clamp(4, area.height.saturating_sub(2).max(4)),
+        };
+        f.render_widget(Clear, rect);
+        let block = Block::bordered().title(" switch provider ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner);
+        f.render_widget(Paragraph::new(format!("▸ {}▏", p.input)), rows[0]);
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|prov| {
+                let marker = if prov.id() == active { "● " } else { "  " };
+                ListItem::new(format!("{marker}{}", prov.display_name()))
+            })
+            .collect();
+        let mut list_state = ListState::default().with_selected(Some(p.selected));
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+        f.render_stateful_widget(list, rows[1], &mut list_state);
     }
 
     /// The `p` overlay: an input line prefilled with `$HOME/`, plus the
@@ -1137,7 +1319,7 @@ impl App {
             Status::Idle => ("●", Color::Gray),
             Status::Dead => ("○", Color::Gray),
         };
-        let meta = self.store.meta(&conv.id);
+        let meta = self.metas.meta(&conv.id);
         let title = meta
             .and_then(|m| m.display_title())
             .unwrap_or("(untitled)")
@@ -1212,6 +1394,14 @@ impl App {
             );
             return;
         }
+        if self.provider_picker.is_some() {
+            let text = "type to filter · enter switch · esc cancel";
+            f.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::Gray)),
+                area,
+            );
+            return;
+        }
         let text = if self.filter_input {
             format!("/{}▏  (enter: keep, esc: clear)", self.filter)
         } else if let Some(msg) = &self.status_msg {
@@ -1229,7 +1419,7 @@ impl App {
             } else {
                 String::new()
             };
-            format!("{filter}{hidden}enter view · n/N new · p add · x kill")
+            format!("{filter}{hidden}n/N new · s switch · x kill")
         };
         let style = if self.status_msg.is_some() && !self.filter_input {
             Style::default().fg(Color::Red)

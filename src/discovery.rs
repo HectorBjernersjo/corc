@@ -49,6 +49,25 @@ impl Meta {
     }
 }
 
+/// A per-provider source of conversation metadata (title, turn state, activity
+/// time). Each provider ships its own implementation — Claude parses jsonl
+/// transcripts (`Store`), Cursor reads its SQLite chat stores — so adding a
+/// provider never touches the sidebar. `refresh` is handed only the (id, cwd)
+/// pairs belonging to that provider.
+pub trait MetaSource: Send {
+    fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()>;
+    fn meta(&self, id: &str) -> Option<&Meta>;
+}
+
+impl MetaSource for Store {
+    fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()> {
+        Store::refresh(self, known)
+    }
+    fn meta(&self, id: &str) -> Option<&Meta> {
+        Store::meta(self, id)
+    }
+}
+
 impl Default for Meta {
     fn default() -> Self {
         Self {
