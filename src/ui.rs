@@ -121,6 +121,10 @@ pub fn run() -> Result<()> {
     let sidebar_pane =
         std::env::var("TMUX_PANE").map_err(|_| anyhow::anyhow!("corc must run inside tmux"))?;
 
+    // Resolve claude's absolute path once now, so the login-shell lookup cost
+    // lands at startup rather than on the first conversation spawn.
+    let _ = tmux::claude_command();
+
     let mut state = State::load()?;
     reconcile(&mut state)?;
     state.save()?;
@@ -934,6 +938,13 @@ impl App {
             self.state.add_conversation(id.clone(), dir, pane_id);
             self.state.save()?;
             self.refresh();
+            // Move the highlight onto the freshly created row so it looks
+            // "hovered" immediately, rather than leaving it on the old row.
+            if let Some(pos) = self.items.iter().position(
+                |it| matches!(it, Item::Conv(idx) if self.state.conversations[*idx].id == id),
+            ) {
+                self.selected = pos;
+            }
             self.view(&id)
         })();
         self.status_msg = result.err().map(|e| e.to_string());

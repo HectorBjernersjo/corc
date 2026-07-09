@@ -6,8 +6,9 @@
 //! back. Nothing is ever destroyed by a view/park.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// Base name for everything the program creates in tmux — change this one
 /// macro to rename the app. (A macro because `concat!` below only takes
@@ -109,6 +110,46 @@ fn kill_stub() {
     ]);
 }
 
+/// Absolute path to the `claude` binary, resolved once per process.
+///
+/// corc runs `claude` directly as a pane command (no wrapping shell, D12), so
+/// tmux resolves it against the *tmux server's* environment — whose `PATH` is
+/// often the stripped default it was started with and omits `~/.local/bin`
+/// etc., leaving bare `claude` unspawnable. We resolve an absolute path once,
+/// preferring the login shell's `PATH` (arbitrary install locations), then the
+/// installer's known locations, and cache it. Moving `claude` after corc has
+/// started needs a corc restart to pick up (rare; accepted tradeoff).
+pub fn claude_command() -> &'static str {
+    static CLAUDE: OnceLock<String> = OnceLock::new();
+    CLAUDE.get_or_init(resolve_claude)
+}
+
+fn resolve_claude() -> String {
+    // 1. The login shell's PATH — covers wherever the user installed it.
+    if let Ok(shell) = std::env::var("SHELL")
+        && let Ok(out) = Command::new(&shell)
+            .args(["-lc", "command -v claude"])
+            .output()
+        && out.status.success()
+    {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path.is_empty() && Path::new(&path).exists() {
+            return path;
+        }
+    }
+    // 2. The installer's known locations.
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [".local/bin/claude", ".cargo/bin/claude", ".npm-global/bin/claude"] {
+            let cand = PathBuf::from(&home).join(rel);
+            if cand.exists() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // 3. Give up and let tmux try its own PATH (original behavior).
+    "claude".to_string()
+}
+
 /// Spawn a conversation in a new hidden window named by its uuid, running
 /// claude directly as the pane command (no wrapping shell, D12) so the
 /// window dies when Claude exits. Returns the new pane id.
@@ -118,6 +159,7 @@ pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> 
     }
     let dir_str = dir.to_string_lossy();
     let flag = if resume { "--resume" } else { "--session-id" };
+    let claude = claude_command();
     let pane_id;
     if session_exists(HIDDEN_SESSION) {
         // Multiple trailing arguments make tmux exec the command directly.
@@ -133,7 +175,7 @@ pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> 
             "-P",
             "-F",
             "#{pane_id}",
-            "claude",
+            claude,
             flag,
             id,
         ])?;
@@ -151,7 +193,7 @@ pub fn spawn_conversation(dir: &Path, id: &str, resume: bool) -> Result<String> 
             "-P",
             "-F",
             "#{pane_id}",
-            "claude",
+            claude,
             flag,
             id,
         ])?;
