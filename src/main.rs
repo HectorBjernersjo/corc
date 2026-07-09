@@ -21,8 +21,9 @@ fn main() -> Result<()> {
         Some("pick-dir") => pick_dir(&args),
         Some("add-dir") => add_dir(&args),
         Some("jump") => jump(&args),
+        Some("shortcuts") => shortcuts(),
         Some(other) => anyhow::bail!(
-            "unknown command: {other} (expected: open, list, projects, pick-dir, add-dir, jump)"
+            "unknown command: {other} (expected: open, list, projects, pick-dir, add-dir, jump, shortcuts)"
         ),
     }
 }
@@ -66,8 +67,9 @@ fn emit_choice(args: &[String], value: Option<&str>) -> Result<()> {
         .position(|a| a == "--out")
         .and_then(|i| args.get(i + 1));
     match out {
-        Some(path) => std::fs::write(path, value.unwrap_or(""))
-            .with_context(|| format!("writing {path}")),
+        Some(path) => {
+            std::fs::write(path, value.unwrap_or("")).with_context(|| format!("writing {path}"))
+        }
         None => {
             if let Some(v) = value {
                 println!("{v}");
@@ -114,6 +116,61 @@ fn viewed_conversation(state: &state::State) -> Option<&state::Conversation> {
         .or_else(|| state.conversations.iter().max_by_key(|c| c.last_viewed))
 }
 
+/// `corc shortcuts`: print the keyboard cheat-sheet and wait for a key, run
+/// inside a `tmux display-popup` by the sidebar's `?` and its menu button. Any
+/// key (or Esc/q) closes the popup.
+fn shortcuts() -> Result<()> {
+    use ratatui::crossterm::event::{self, Event};
+    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    const BOLD: &str = "\x1b[1m";
+    const DIM: &str = "\x1b[90m";
+    const KEY: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+
+    let section = |title: &str| println!("\r\n{BOLD}{title}{RESET}\r");
+    let row = |key: &str, desc: &str| println!("  {KEY}{key:<12}{RESET} {desc}\r");
+
+    println!("\r\n{BOLD}corc — keyboard shortcuts{RESET}\r");
+
+    section("Navigate");
+    row("j / k  ↑ ↓", "move selection (j continues into the menu)");
+    row("g / G", "jump to top / bottom");
+    row("Ctrl+d / u", "next / previous project");
+    row("1 – 9", "jump to window N of the project's session");
+    row("/", "filter the list");
+
+    section("Conversations");
+    row("Enter · click", "view (resumes it if dead)");
+    row("n", "new conversation in the selected directory");
+    row("N", "new conversation via the directory picker");
+    row("p", "add a directory, then new conversation there");
+    row("s", "switch which agent new conversations use");
+    row("x", "kill a live conversation / remove a dead one");
+
+    section("Layout & misc");
+    row("V, then K/J", "move mode: reorder projects");
+    row("a", "show hidden (week-old dead) conversations");
+    row("r", "refresh now");
+    row("?", "this help");
+    row("Ctrl+C", "quit corc");
+
+    println!("\r\n{DIM}press any key to close{RESET}\r");
+
+    // A single keypress dismisses the popup. Raw mode so it closes on the
+    // first key rather than waiting for Enter.
+    let _ = enable_raw_mode();
+    loop {
+        match event::read() {
+            Ok(Event::Key(_)) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = disable_raw_mode();
+    Ok(())
+}
+
 /// `corc open` (D15): the Ctrl+q toggle. Already in the corc session ⇒ go back
 /// to the session the client came from; anywhere else ⇒ make sure the visible
 /// `corc` session exists with the TUI running and take the client there. Bound
@@ -122,8 +179,7 @@ fn open() -> Result<()> {
     let exe = std::env::current_exe().context("locating the corc binary")?;
     // switch-client only works from inside tmux; that covers both a shell in
     // a pane (TMUX set) and the Ctrl+q run-shell binding (TMUX_PANE set).
-    let in_tmux =
-        std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some();
+    let in_tmux = std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some();
     // Toggle: already viewing corc ⇒ go to the viewed conversation's project
     // session, landing on its last-active window (like Alt+N, but without a
     // fixed window number). Nothing viewed ⇒ fall back to the previous session.
@@ -150,7 +206,13 @@ fn list() -> Result<()> {
     let known: Vec<(String, PathBuf, &'static str)> = state
         .conversations
         .iter()
-        .map(|c| (c.id.clone(), c.cwd.clone(), provider::by_id(&c.provider).id()))
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.cwd.clone(),
+                provider::by_id(&c.provider).id(),
+            )
+        })
         .collect();
     store.refresh(&known)?;
 
@@ -170,15 +232,10 @@ fn list() -> Result<()> {
         }
         println!("\n{}", display_dir(project));
         for conv in convs {
-            let alive = conv
-                .pane_id
-                .as_deref()
-                .is_some_and(tmux::pane_exists);
+            let alive = conv.pane_id.as_deref().is_some_and(tmux::pane_exists);
             let meta = store.meta(&conv.id);
             let s = status::derive(alive, meta, conv.last_viewed, false, now, conv.created_at);
-            let title = meta
-                .and_then(|m| m.display_title())
-                .unwrap_or("(untitled)");
+            let title = meta.and_then(|m| m.display_title()).unwrap_or("(untitled)");
             let pane = conv.pane_id.as_deref().unwrap_or("-");
             println!(
                 "  {} {:7}  {:>6}  {:5}  {}  {}",

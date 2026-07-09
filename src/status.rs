@@ -93,13 +93,28 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
             .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
             .map(|(start, done)| fmt_duration(done.saturating_sub(start)))
             .unwrap_or_default(),
-        Status::Idle => age(now.saturating_sub(last_activity(meta, created_at))),
-        Status::Dead => age(now.saturating_sub(last_activity(meta, created_at))),
+        Status::Idle => age(now.saturating_sub(last_active_ts(meta, created_at))),
+        Status::Dead => age(now.saturating_sub(last_active_ts(meta, created_at))),
     }
 }
 
-/// When the conversation last did anything, in unix seconds: the jsonl mtime
-/// when known, else the spawn time.
+/// When the conversation last genuinely advanced, in unix seconds, for the
+/// Idle/Dead age columns. Prefers the timestamps parsed from the transcript
+/// content — the completed turn, else the turn start — over the jsonl mtime,
+/// because Claude Code keeps rewriting/touching the file in the background
+/// (title, summary, checkpoint writes) long after the last real turn. Using
+/// the mtime made Idle rows report a few minutes for conversations that had
+/// actually been quiet for hours. Falls back to the mtime/spawn time only
+/// when no turn has been recorded yet (a fresh pane).
+fn last_active_ts(meta: Option<&Meta>, created_at: u64) -> u64 {
+    meta.and_then(|m| m.turn_completed_at.or(m.turn_started_at))
+        .unwrap_or_else(|| last_activity(meta, created_at))
+}
+
+/// Coarse "last touched" timestamp from the jsonl mtime (else the spawn
+/// time). Used by `derive` to age out a stalled Mid turn; the Idle/Dead age
+/// columns use `last_active_ts` instead, since the mtime keeps advancing on
+/// background rewrites (see there).
 pub fn last_activity(meta: Option<&Meta>, created_at: u64) -> u64 {
     meta.map(|m| m.mtime)
         .filter(|t| *t != SystemTime::UNIX_EPOCH)
@@ -239,5 +254,33 @@ mod tests {
         );
         // No jsonl yet: age falls back to created_at.
         assert_eq!(time_column(Status::Dead, None, now - 7200, now), "2h");
+    }
+
+    /// Idle/Dead age comes from the completed-turn timestamp, not the mtime:
+    /// Claude Code touches the file in the background after a turn, so the
+    /// mtime is recent while the conversation has really been quiet for hours.
+    #[test]
+    fn idle_age_ignores_background_mtime() {
+        let now = 1_000_000;
+        // Turn finished 5h ago, but the file was touched a minute ago.
+        let quiet = Meta {
+            turn_state: TurnState::Complete,
+            turn_started_at: Some(now - 6 * 3600),
+            turn_completed_at: Some(now - 5 * 3600),
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 60),
+            ..Meta::default()
+        };
+        assert_eq!(time_column(Status::Idle, Some(&quiet), 0, now), "5h");
+        assert_eq!(time_column(Status::Dead, Some(&quiet), 0, now), "5h");
+
+        // A stalled Mid turn (no completion) falls back to the turn start.
+        let stalled = Meta {
+            turn_state: TurnState::Mid,
+            turn_started_at: Some(now - 2 * 3600),
+            turn_completed_at: None,
+            mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now - 60),
+            ..Meta::default()
+        };
+        assert_eq!(time_column(Status::Idle, Some(&stalled), 0, now), "2h");
     }
 }

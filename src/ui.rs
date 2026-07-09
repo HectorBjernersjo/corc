@@ -30,6 +30,24 @@ enum Item {
     Conv(usize),
 }
 
+/// A menu row's on-screen hitbox: (row, column range, action). Screen
+/// coordinates so a mouse click maps straight back to the row.
+type MenuHit = (u16, std::ops::Range<u16>, MenuAction);
+
+/// A row in the bottom menu. Each maps to the same action as its keyboard
+/// shortcut, so the mouse-only path never diverges from the keys.
+#[derive(Clone, Copy)]
+enum MenuAction {
+    /// The `N` directory picker.
+    New,
+    /// The `a` show-hidden toggle.
+    ToggleHidden,
+    /// The `s` provider switch.
+    SwitchProvider,
+    /// The `?` shortcuts cheat-sheet popup.
+    Shortcuts,
+}
+
 /// Dead conversations older than this are hidden unless `a` is on (D12).
 const HIDE_DEAD_AFTER_SECS: u64 = 7 * 24 * 3600;
 /// Grace period before an empty conversation the user left is discarded
@@ -79,6 +97,9 @@ struct App {
     viewed: Option<String>,
     items: Vec<Item>,
     selected: usize,
+    /// When Some, the j/k cursor sits on this bottom-menu row instead of the
+    /// list — reached by pressing j past the last conversation.
+    menu_sel: Option<usize>,
     /// Pending vim-style count prefix: `3j` moves three rows. Digits
     /// accumulate here until a motion consumes them or another key clears it.
     count: Option<usize>,
@@ -108,6 +129,9 @@ struct App {
     list_rows: u16,
     status_msg: Option<String>,
     last_refresh: Instant,
+    /// On-screen hitboxes of the bottom menu buttons, rebuilt every draw so a
+    /// click at `(col, row)` maps back to the button's action.
+    menu_hitboxes: Vec<MenuHit>,
 }
 
 pub fn run() -> Result<()> {
@@ -140,6 +164,7 @@ pub fn run() -> Result<()> {
         viewed: None,
         items: Vec::new(),
         selected: 0,
+        menu_sel: None,
         count: None,
         filter: String::new(),
         filter_input: false,
@@ -153,6 +178,7 @@ pub fn run() -> Result<()> {
         list_rows: 0,
         status_msg: None,
         last_refresh: Instant::now(),
+        menu_hitboxes: Vec::new(),
     };
     app.refresh();
     app.view_last();
@@ -332,12 +358,23 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.select_edge(true),
             KeyCode::Char('G') | KeyCode::End => self.select_edge(false),
-            KeyCode::Char('/') => self.filter_input = true,
+            KeyCode::Char('/') => {
+                self.menu_sel = None;
+                self.filter_input = true;
+            }
+            KeyCode::Esc if self.menu_sel.is_some() => self.menu_sel = None,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.rebuild_items();
             }
-            KeyCode::Enter => self.view_selected(),
+            KeyCode::Enter => match self.menu_sel {
+                Some(i) => {
+                    if let Some((action, ..)) = self.menu_entries().into_iter().nth(i) {
+                        self.activate_menu(action);
+                    }
+                }
+                None => self.view_selected(),
+            },
             KeyCode::Char('n') => self.new_conversation_here(),
             KeyCode::Char('N') => self.open_picker(),
             KeyCode::Char('p') => self.open_path_prompt(),
@@ -346,9 +383,10 @@ impl App {
             KeyCode::Char('V') => self.move_mode = true,
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
-                self.rebuild_items();
+                self.rebuild_keeping_selection();
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('?') => self.show_shortcuts(),
             _ => {}
         }
         // Any non-digit key ends a dangling count prefix.
@@ -389,6 +427,12 @@ impl App {
             MouseEventKind::ScrollDown => self.select_next(1),
             MouseEventKind::ScrollUp => self.select_next(-1),
             MouseEventKind::Down(MouseButton::Left) => {
+                // A click on a bottom-menu button fires its action; the menu
+                // sits below the list, so this is checked before the row math.
+                if let Some(action) = self.menu_hit(mouse.column, mouse.row) {
+                    self.activate_menu(action);
+                    return;
+                }
                 // Rows map to items through the list's persistent scroll
                 // offset.
                 if mouse.row >= self.list_rows {
@@ -397,6 +441,7 @@ impl App {
                 if let Some(idx) = self.item_at_row(mouse.row)
                     && matches!(self.items.get(idx), Some(Item::Conv(_)))
                 {
+                    self.menu_sel = None;
                     self.selected = idx;
                     self.view_selected();
                 }
@@ -410,7 +455,13 @@ impl App {
         self.state
             .conversations
             .iter()
-            .map(|c| (c.id.clone(), c.cwd.clone(), provider::by_id(&c.provider).id()))
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.cwd.clone(),
+                    provider::by_id(&c.provider).id(),
+                )
+            })
             .collect()
     }
 
@@ -621,13 +672,45 @@ impl App {
         self.count.take().unwrap_or(1).max(1)
     }
 
-    /// Move the selection `count` conversation rows in `dir` (±1), stopping at
-    /// the list edge. The count is clamped to the list length so a stray large
-    /// prefix (`999j`) can't spin.
+    /// Move the j/k cursor `count` steps in `dir` (±1) over the combined
+    /// space: conversation rows first, then the bottom-menu rows. The count is
+    /// clamped so a stray large prefix (`999j`) can't spin.
     fn move_selection(&mut self, dir: i64, count: usize) {
-        for _ in 0..count.min(self.items.len().max(1)) {
-            self.select_next(dir);
+        let span = self.items.len() + self.menu_entries().len();
+        for _ in 0..count.min(span.max(1)) {
+            self.nav(dir);
         }
+    }
+
+    /// One j/k step. Moving down past the last conversation crosses into the
+    /// bottom menu; moving up from its top row crosses back out.
+    fn nav(&mut self, dir: i64) {
+        let menu_last = self.menu_entries().len() as i64 - 1;
+        match self.menu_sel {
+            Some(i) => {
+                let next = i as i64 + dir;
+                if next < 0 {
+                    // Back into the list — unless it has no conversation rows
+                    // to land on (the cursor would vanish).
+                    if self.items.iter().any(|it| matches!(it, Item::Conv(_))) {
+                        self.menu_sel = None;
+                    }
+                } else {
+                    self.menu_sel = Some(next.min(menu_last) as usize);
+                }
+            }
+            None if dir > 0 && self.at_last_conv() => self.menu_sel = Some(0),
+            None => self.select_next(dir),
+        }
+    }
+
+    /// Whether the cursor sits on the last conversation row (or the list has
+    /// none) — the point where j crosses into the bottom menu.
+    fn at_last_conv(&self) -> bool {
+        self.items
+            .iter()
+            .rposition(|i| matches!(i, Item::Conv(_)))
+            .is_none_or(|p| p == self.selected)
     }
 
     /// The item index of the first conversation in each project group, in
@@ -651,6 +734,7 @@ impl App {
     /// Ctrl+d/u: move the selection to the first conversation of the next or
     /// previous project group, clamping at the ends.
     fn jump_project(&mut self, dir: i64) {
+        self.menu_sel = None;
         let starts = self.project_starts();
         if starts.is_empty() {
             return;
@@ -664,6 +748,7 @@ impl App {
     }
 
     fn select_edge(&mut self, top: bool) {
+        self.menu_sel = None;
         let pos = if top {
             self.items.iter().position(|i| matches!(i, Item::Conv(_)))
         } else {
@@ -676,7 +761,12 @@ impl App {
 
     fn selected_conv_id(&self) -> Option<String> {
         match self.items.get(self.selected)? {
-            Item::Conv(i) => Some(self.state.conversations[*i].id.clone()),
+            // `.get`, not `[*i]`: right after a conversation is removed from
+            // state the item list is briefly stale (rebuild_keeping_selection
+            // reads the old selection before rebuilding), so a stale index can
+            // outrun the shrunk Vec — indexing it would panic and take the TUI
+            // down. A miss just means "nothing to keep".
+            Item::Conv(i) => Some(self.state.conversations.get(*i)?.id.clone()),
             Item::Header(_) => None,
         }
     }
@@ -705,9 +795,11 @@ impl App {
         else {
             return;
         };
-        if let Some(pos) = self.items.iter().position(
-            |i| matches!(i, Item::Conv(idx) if self.state.conversations[*idx].id == id),
-        ) {
+        if let Some(pos) = self
+            .items
+            .iter()
+            .position(|i| matches!(i, Item::Conv(idx) if self.state.conversations[*idx].id == id))
+        {
             self.selected = pos;
         }
         self.status_msg = self.view(&id).err().map(|e| e.to_string());
@@ -1083,22 +1175,144 @@ impl App {
         let keep = self.selected_conv_id();
         self.rebuild_items();
         if let Some(id) = keep
-            && let Some(pos) = self.items.iter().position(
-                |i| matches!(i, Item::Conv(c) if self.state.conversations[*c].id == id),
-            )
+            && let Some(pos) = self
+                .items
+                .iter()
+                .position(|i| matches!(i, Item::Conv(c) if self.state.conversations[*c].id == id))
         {
             self.selected = pos;
         }
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // One row per menu entry plus the rule above them.
+        let menu_h = self.menu_entries().len() as u16 + 1;
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(menu_h),
+            ])
             .split(f.area());
         self.draw_list(f, outer[0]);
         self.draw_footer(f, outer[1]);
+        self.draw_menu(f, outer[2]);
         self.draw_provider_picker(f);
+    }
+
+    /// The bottom-menu rows, top to bottom: (action, marker, label, key hint).
+    /// The count of week-old dead rows currently folded away lives on the
+    /// Hidden row; the provider row always names the active agent.
+    fn menu_entries(&self) -> Vec<(MenuAction, &'static str, String, &'static str)> {
+        let provider = provider::by_id(&self.state.active_provider).display_name();
+        let hidden = if self.hidden > 0 {
+            format!("Hidden ({})", self.hidden)
+        } else {
+            "Hidden".to_string()
+        };
+        vec![
+            (MenuAction::New, "+", "New conversation".to_string(), "N"),
+            (
+                MenuAction::ToggleHidden,
+                if self.show_all { "●" } else { "○" },
+                hidden,
+                "a",
+            ),
+            (MenuAction::SwitchProvider, "⇄", provider.to_string(), "s"),
+            (MenuAction::Shortcuts, "?", "Shortcuts".to_string(), "?"),
+        ]
+    }
+
+    /// The bottom menu: a dim rule, then one quiet row per action — marker and
+    /// label left, key hint right-aligned — echoing the conversation rows
+    /// instead of shouting like a button bar. j past the last conversation
+    /// walks the cursor in; the cursor row carries the same gray highlight as
+    /// the list. The provider row is tinted with the active agent's accent and
+    /// the Hidden marker fills in while its `a` toggle is on.
+    fn draw_menu(&mut self, f: &mut Frame, area: Rect) {
+        let width = area.width as usize;
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines = vec![Line::from(Span::styled("─".repeat(width), dim))];
+        self.menu_hitboxes.clear();
+        for (i, (action, marker, label, hint)) in self.menu_entries().into_iter().enumerate() {
+            let selected = self.menu_sel == Some(i);
+            let fg = match action {
+                MenuAction::SwitchProvider => provider::accent(&self.state.active_provider),
+                MenuAction::ToggleHidden if self.show_all => Color::Rgb(122, 162, 247),
+                _ => Color::Rgb(206, 211, 221),
+            };
+            let mut row = Style::default().fg(fg);
+            let mut hint_style = dim;
+            if selected {
+                row = row.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+                hint_style = Style::default().fg(Color::Gray).bg(Color::DarkGray);
+            }
+            let text = format!(" {marker} {label}");
+            let pad = width.saturating_sub(text.chars().count() + hint.chars().count() + 1);
+            lines.push(Line::from(vec![
+                Span::styled(text, row),
+                Span::styled(" ".repeat(pad), row),
+                Span::styled(format!("{hint} "), hint_style),
+            ]));
+            let hit_row = area.y + 1 + i as u16;
+            self.menu_hitboxes
+                .push((hit_row, area.x..area.x + area.width, action));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// The menu button under `(col, row)`, if any.
+    fn menu_hit(&self, col: u16, row: u16) -> Option<MenuAction> {
+        self.menu_hitboxes
+            .iter()
+            .find(|(r, range, _)| *r == row && range.contains(&col))
+            .map(|(_, _, a)| *a)
+    }
+
+    /// Run a menu button's action — the same entry points its keyboard
+    /// shortcut uses.
+    fn activate_menu(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::New => self.open_picker(),
+            MenuAction::ToggleHidden => {
+                self.show_all = !self.show_all;
+                self.rebuild_items();
+            }
+            MenuAction::SwitchProvider => self.open_provider_picker(),
+            MenuAction::Shortcuts => self.show_shortcuts(),
+        }
+    }
+
+    /// Show the keyboard cheat-sheet in a centered `tmux display-popup`,
+    /// reachable by `?` or the menu's `?` button. Blocks until the popup is
+    /// dismissed, like the directory picker (D22); a missing/old tmux just
+    /// surfaces an error in the footer.
+    fn show_shortcuts(&mut self) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_msg = Some(e.to_string());
+                return;
+            }
+        };
+        let cmd = format!("'{}' shortcuts", exe.display());
+        let status = std::process::Command::new("tmux")
+            .args([
+                "display-popup",
+                "-E",
+                "-T",
+                " corc shortcuts ",
+                "-w",
+                "64",
+                "-h",
+                "80%",
+                &cmd,
+            ])
+            .status();
+        if let Err(e) = status {
+            self.status_msg = Some(format!("popup failed: {e}"));
+        }
     }
 
     /// The `s` overlay: an input line plus the matching providers, the active
@@ -1151,7 +1365,9 @@ impl App {
                 Span::styled("─ ", dim),
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {fill}"), dim),
             ]),
@@ -1251,7 +1467,12 @@ impl App {
             .collect();
 
         self.list_rows = area.height;
-        self.list_state.select(Some(self.selected));
+        // While the cursor is down in the bottom menu the list drops its
+        // highlight, so exactly one row on screen ever reads as selected.
+        self.list_state.select(match self.menu_sel {
+            Some(_) => None,
+            None => Some(self.selected),
+        });
         let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
@@ -1282,24 +1503,20 @@ impl App {
         } else if let Some(msg) = &self.status_msg {
             format!("error: {msg}")
         } else {
+            // The key hints now live on the menu buttons (and the `?` popup),
+            // and the hidden count sits on the Hidden button — so the idle
+            // footer only echoes an active filter and a pending vim count
+            // prefix (`3j`), often nothing at all.
             let filter = if self.filter.is_empty() {
                 String::new()
             } else {
                 format!("filter: {}  ", self.filter)
             };
-            let hidden = if self.hidden > 0 {
-                format!("{} hidden (a)  ", self.hidden)
-            } else if self.show_all {
-                "all (a)  ".to_string()
-            } else {
-                String::new()
-            };
-            // Echo a pending vim count prefix (`3j`) like vim's corner.
             let count = match self.count {
                 Some(n) => format!("{n}  "),
                 None => String::new(),
             };
-            format!("{count}{filter}{hidden}n/N new · s switch · x kill")
+            format!("{count}{filter}")
         };
         let style = if self.status_msg.is_some() && !self.filter_input {
             Style::default().fg(Color::Red)
@@ -1335,7 +1552,12 @@ fn worktree_repo(dir: &Path) -> Option<String> {
     let content = std::fs::read_to_string(&gitfile).ok()?;
     let gitdir = content.strip_prefix("gitdir:")?.trim();
     let (repo_path, _) = gitdir.split_once("/.git/worktrees/")?;
-    Some(Path::new(repo_path).file_name()?.to_string_lossy().into_owned())
+    Some(
+        Path::new(repo_path)
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 #[cfg(test)]
