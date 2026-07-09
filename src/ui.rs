@@ -6,7 +6,7 @@
 use crate::provider::{self, MetaStore};
 use crate::state::{self, State};
 use crate::status::{self, Status};
-use crate::{display_dir, picker, tmux, truncate};
+use crate::{picker, tmux, truncate};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -41,41 +41,11 @@ const DISCARD_GRACE: Duration = Duration::from_secs(5);
 /// (D13) — the `a` toggle reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
 
-/// Foreground commands that count as an idle shell prompt for the digit
-/// jump's window-1 nvim rule (D13); anything else is busy and never touched.
-const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"];
-
-/// The `n` directory-picker overlay (D14): directories.txt expanded with git
-/// worktrees, filtered with the same word-substring matching as `/`.
-struct Picker {
-    dirs: Vec<std::path::PathBuf>,
-    input: String,
-    /// Index into the *filtered* list.
-    selected: usize,
-}
-
-/// The `p` overlay: type a filesystem path (prefilled with `$HOME`), Tab/▼▲
-/// to complete against real subdirectories. Enter appends the directory to
-/// directories.txt and spawns a fresh conversation there.
-struct PathPrompt {
-    input: String,
-    /// Subdirectories completing the current input, sorted.
-    completions: Vec<PathBuf>,
-    /// Index into `completions`.
-    selected: usize,
-}
-
-impl Picker {
-    /// Indices into `dirs` that match the current input, in source order.
-    fn filtered(&self) -> Vec<usize> {
-        self.dirs
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| picker::matches_words(&self.input, &display_dir(&d.to_string_lossy())))
-            .map(|(i, _)| i)
-            .collect()
-    }
-}
+/// Background tint marking the conversation currently in the content pane — a
+/// muted blue, distinct from the gray hover highlight so the active row reads
+/// apart from the merely-selected one. Frees its dot to show real status (D6)
+/// instead of a green "you are here" marker.
+const VIEWED_BG: Color = Color::Rgb(38, 50, 71);
 
 /// The `s` provider-switch overlay: a fuzzy picker over the registered
 /// providers. Enter sets the provider for conversations spawned from now on.
@@ -107,12 +77,6 @@ struct App {
     placeholder_pane: String,
     /// Conversation currently swapped into the content slot.
     viewed: Option<String>,
-    /// Within-project display order (conversation ids): live above dead,
-    /// most recently active first. Recomputed only on a state change, so
-    /// rows never re-sort under the user's cursor (D9).
-    row_order: Vec<String>,
-    /// (id, status) snapshot the current `row_order` was computed from.
-    sort_signature: Vec<(String, Status)>,
     items: Vec<Item>,
     selected: usize,
     filter: String,
@@ -124,11 +88,9 @@ struct App {
     show_all: bool,
     /// How many week-old Dead conversations the current list is hiding.
     hidden: usize,
-    /// The `N` directory-picker overlay, when open (D14).
-    picker: Option<Picker>,
-    /// The `p` add-directory path prompt, when open.
-    path_prompt: Option<PathPrompt>,
-    /// The `s` provider-switch overlay, when open.
+    /// The `s` provider-switch overlay, when open. The `N` directory picker
+    /// and `p` add-directory prompt are no longer inline overlays — they run
+    /// as centered `tmux display-popup` processes (D22).
     provider_picker: Option<ProviderPicker>,
     /// Move mode (D9): `K`/`J` reorder the selected row's project.
     move_mode: bool,
@@ -157,6 +119,13 @@ pub fn run() -> Result<()> {
     reconcile(&mut state)?;
     state.save()?;
 
+    // Install the M-1..M-9 digit-jump bindings at runtime (D13) so 1-9 work
+    // from inside the Claude pane too, without ever editing the user's tmux
+    // config. Best-effort: a missing exe path just leaves the sidebar's keys.
+    if let Ok(exe) = std::env::current_exe() {
+        tmux::install_jump_bindings(&exe.to_string_lossy());
+    }
+
     let placeholder_pane = tmux::split_content_pane(&sidebar_pane)?;
 
     let mut app = App {
@@ -166,8 +135,6 @@ pub fn run() -> Result<()> {
         sidebar_pane,
         placeholder_pane,
         viewed: None,
-        row_order: Vec::new(),
-        sort_signature: Vec::new(),
         items: Vec::new(),
         selected: 0,
         filter: String::new(),
@@ -175,8 +142,6 @@ pub fn run() -> Result<()> {
         pending_kill: None,
         show_all: false,
         hidden: 0,
-        picker: None,
-        path_prompt: None,
         provider_picker: None,
         move_mode: false,
         pending_discard: Vec::new(),
@@ -204,6 +169,8 @@ pub fn run() -> Result<()> {
     if tmux::pane_exists(&app.placeholder_pane) {
         let _ = tmux::kill_pane(&app.placeholder_pane);
     }
+    // Put the plain Alt+number window switch back, matching the user's config.
+    tmux::restore_window_bindings();
     let _ = app.state.save();
 
     disable_raw_mode()?;
@@ -275,17 +242,7 @@ impl App {
         if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return true;
         }
-        // The directory picker owns the keyboard while open (D14).
-        if self.picker.is_some() {
-            self.handle_picker_key(code);
-            return false;
-        }
-        // The add-directory path prompt likewise owns the keyboard.
-        if self.path_prompt.is_some() {
-            self.handle_path_key(code);
-            return false;
-        }
-        // The provider-switch picker likewise owns the keyboard.
+        // The provider-switch picker owns the keyboard while open.
         if self.provider_picker.is_some() {
             self.handle_provider_key(code);
             return false;
@@ -391,7 +348,7 @@ impl App {
     /// Mouse (D11): click a row = select + view; the wheel moves the
     /// selection. Ignored while the picker overlay is open.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.picker.is_some() || self.provider_picker.is_some() || self.path_prompt.is_some() {
+        if self.provider_picker.is_some() {
             return;
         }
         match mouse.kind {
@@ -501,42 +458,11 @@ impl App {
             })
             .collect();
 
-        // Re-sort rows only when some conversation changed state (or was
-        // added/removed) — never under the user's cursor (D9).
-        let signature: Vec<(String, Status)> = self
-            .state
-            .conversations
-            .iter()
-            .zip(&self.statuses)
-            .map(|(c, s)| (c.id.clone(), *s))
-            .collect();
-        if signature != self.sort_signature {
-            self.sort_signature = signature;
-            self.resort_rows();
-        }
-
         if dirty {
             let _ = self.state.save();
         }
 
         self.rebuild_keeping_selection();
-    }
-
-    /// Recompute the within-project row order (D9): live conversations
-    /// above dead, most recently active first. Called only when the
-    /// (id, status) signature changed, so an unchanged list never shuffles.
-    fn resort_rows(&mut self) {
-        let mut indices: Vec<usize> = (0..self.state.conversations.len()).collect();
-        indices.sort_by_key(|&i| {
-            let conv = &self.state.conversations[i];
-            let dead = self.statuses.get(i) == Some(&Status::Dead);
-            let activity = status::last_activity(self.metas.meta(&conv.id), conv.created_at);
-            (dead, std::cmp::Reverse(activity))
-        });
-        self.row_order = indices
-            .into_iter()
-            .map(|i| self.state.conversations[i].id.clone())
-            .collect();
     }
 
     fn rebuild_items(&mut self) {
@@ -546,22 +472,24 @@ impl App {
         self.hidden = 0;
 
         for project in &self.state.projects {
-            // Conversations of this project, in the cached display order
-            // (plus any not yet ordered, at the bottom, for safety).
-            let ordered = self.row_order.iter().filter_map(|id| {
-                self.state.conversations.iter().position(|c| c.id == *id)
-            });
-            let unordered = self
+            // Conversations of this project in a fixed order: newest created
+            // at the top, never re-sorted (D9). `created_at` is immutable, so
+            // a row never moves once placed — status flips and fresh activity
+            // leave the order untouched, letting the user keep their bearings.
+            let mut indices: Vec<usize> = self
                 .state
                 .conversations
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| !self.row_order.contains(&c.id))
-                .map(|(i, _)| i);
-            let indices: Vec<usize> = ordered
-                .chain(unordered)
-                .filter(|&i| self.state.conversations[i].cwd.display().to_string() == *project)
+                .filter(|(_, c)| c.cwd.display().to_string() == *project)
+                .map(|(i, _)| i)
                 .collect();
+            indices.sort_by(|&a, &b| {
+                let (ca, cb) = (&self.state.conversations[a], &self.state.conversations[b]);
+                cb.created_at
+                    .cmp(&ca.created_at)
+                    .then_with(|| ca.id.cmp(&cb.id))
+            });
 
             let name = project_display(project);
             let mut kept = Vec::new();
@@ -592,13 +520,24 @@ impl App {
                 }
                 kept.push(i);
             }
-            // Cap each project to its most-recent conversations (D13). `kept`
-            // is already in the sticky recency order, so truncating drops the
-            // ones with the oldest history without reshuffling the rest. The
-            // `a` toggle and an active filter both bypass the cap.
+            // Cap each project to its most-recently-active conversations
+            // (D13). Membership follows activity, but the survivors stay in
+            // the fixed creation order for display: rank a copy by activity,
+            // keep the top `MAX_PER_PROJECT`, then drop the rest from `kept`
+            // without disturbing its order. The `a` toggle and an active
+            // filter both bypass the cap.
             if !self.show_all && filter.is_empty() && kept.len() > MAX_PER_PROJECT {
+                let mut ranked = kept.clone();
+                ranked.sort_by(|&a, &b| {
+                    let act = |i: usize| {
+                        let c = &self.state.conversations[i];
+                        status::last_activity(self.metas.meta(&c.id), c.created_at)
+                    };
+                    act(b).cmp(&act(a))
+                });
+                ranked.truncate(MAX_PER_PROJECT);
                 self.hidden += kept.len() - MAX_PER_PROJECT;
-                kept.truncate(MAX_PER_PROJECT);
+                kept.retain(|i| ranked.contains(i));
             }
             if kept.is_empty() {
                 continue;
@@ -896,52 +835,47 @@ impl App {
         self.refresh();
     }
 
-    /// `N`: open the directory-picker overlay (D14).
+    /// `N`: pick a project directory in a centered popup and spawn there
+    /// (D14, D22). The popup (`corc pick-dir`) only returns the chosen
+    /// directory; the spawn and the state write happen here, so the TUI stays
+    /// the sole writer of state.json.
     fn open_picker(&mut self) {
-        match picker::list_directories() {
-            Ok(dirs) => {
-                self.picker = Some(Picker {
-                    dirs,
-                    input: String::new(),
-                    selected: 0,
-                });
-            }
-            Err(e) => self.status_msg = Some(e.to_string()),
+        if let Some(dir) = self.popup_choice("pick-dir") {
+            self.new_conversation_in(dir);
         }
     }
 
-    /// Keys while the picker overlay is open: type to filter, arrows to
-    /// move, Enter to spawn a fresh Claude there, Esc to cancel (D14).
-    fn handle_picker_key(&mut self, code: KeyCode) {
-        let Some(p) = &mut self.picker else {
-            return;
+    /// Run a picker subcommand (`pick-dir`, `add-dir`) in a centered
+    /// `tmux display-popup`, blocking until it closes, and return the chosen
+    /// path. The subcommand writes its choice to a temp file we then read —
+    /// `display-popup -E` can't hand stdout back to the caller (D22). None on
+    /// cancel, on a missing/old tmux, or when nothing was chosen.
+    fn popup_choice(&mut self, subcmd: &str) -> Option<PathBuf> {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_msg = Some(e.to_string());
+                return None;
+            }
         };
-        match code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Enter => {
-                let filtered = p.filtered();
-                let choice = filtered
-                    .get(p.selected.min(filtered.len().saturating_sub(1)))
-                    .map(|&i| p.dirs[i].clone());
-                if let Some(dir) = choice {
-                    self.picker = None;
-                    self.new_conversation_in(dir);
-                }
+        let out = std::env::temp_dir().join(format!("corc-pick-{}", state::new_uuid().ok()?));
+        let cmd = format!("'{}' {subcmd} --out '{}'", exe.display(), out.display());
+        let status = std::process::Command::new("tmux")
+            .args(["display-popup", "-E", "-B", "-w", "50%", "-h", "40%", &cmd])
+            .status();
+        let choice = std::fs::read_to_string(&out)
+            .ok()
+            .map(|s| s.trim().to_string());
+        let _ = std::fs::remove_file(&out);
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => return None,
+            Err(e) => {
+                self.status_msg = Some(format!("popup failed: {e}"));
+                return None;
             }
-            KeyCode::Backspace => {
-                p.input.pop();
-                p.selected = 0;
-            }
-            KeyCode::Down => {
-                p.selected = (p.selected + 1).min(p.filtered().len().saturating_sub(1));
-            }
-            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
-            KeyCode::Char(c) => {
-                p.input.push(c);
-                p.selected = 0;
-            }
-            _ => {}
         }
+        choice.filter(|s| !s.is_empty()).map(PathBuf::from)
     }
 
     /// `s`: open the provider-switch overlay.
@@ -1000,72 +934,15 @@ impl App {
         self.new_conversation_in(dir);
     }
 
-    /// `p`: open the add-directory path prompt, prefilled with `$HOME/`.
+    /// `p`: type a new project directory in a centered popup, record it in the
+    /// machine-local list (D20), and spawn there (D22). Like `N`, the popup
+    /// (`corc add-dir`) only returns the path — corc does the state write.
     fn open_path_prompt(&mut self) {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let input = if home.is_empty() {
-            String::new()
-        } else {
-            format!("{home}/")
-        };
-        let completions = picker::complete_dirs(&input);
-        self.path_prompt = Some(PathPrompt {
-            input,
-            completions,
-            selected: 0,
-        });
-    }
-
-    /// Keys while the path prompt is open: type/Backspace to edit, Tab to
-    /// descend into the highlighted match, ▲/▼ to move, Enter to add the
-    /// directory to directories.txt and spawn there, Esc to cancel.
-    fn handle_path_key(&mut self, code: KeyCode) {
-        let Some(p) = &mut self.path_prompt else {
-            return;
-        };
-        match code {
-            KeyCode::Esc => self.path_prompt = None,
-            KeyCode::Down => {
-                if !p.completions.is_empty() {
-                    p.selected = (p.selected + 1).min(p.completions.len() - 1);
-                }
+        if let Some(dir) = self.popup_choice("add-dir") {
+            if self.state.add_directory(&dir) {
+                self.status_msg = self.state.save().err().map(|e| e.to_string());
             }
-            KeyCode::Up => p.selected = p.selected.saturating_sub(1),
-            KeyCode::Tab => {
-                if let Some(dir) = p.completions.get(p.selected) {
-                    p.input = format!("{}/", dir.to_string_lossy());
-                    p.completions = picker::complete_dirs(&p.input);
-                    p.selected = 0;
-                }
-            }
-            KeyCode::Backspace => {
-                p.input.pop();
-                p.completions = picker::complete_dirs(&p.input);
-                p.selected = 0;
-            }
-            KeyCode::Char(c) => {
-                p.input.push(c);
-                p.completions = picker::complete_dirs(&p.input);
-                p.selected = 0;
-            }
-            KeyCode::Enter => {
-                // Prefer the exact typed path if it is a directory; otherwise
-                // take the highlighted completion.
-                let typed = PathBuf::from(picker::expand_tilde(&p.input));
-                let chosen = if typed.is_dir() {
-                    Some(typed)
-                } else {
-                    p.completions.get(p.selected).cloned()
-                };
-                if let Some(dir) = chosen {
-                    self.path_prompt = None;
-                    match picker::add_directory(&dir) {
-                        Ok(_) => self.new_conversation_in(dir),
-                        Err(e) => self.status_msg = Some(e.to_string()),
-                    }
-                }
-            }
-            _ => {}
+            self.new_conversation_in(dir);
         }
     }
 
@@ -1093,10 +970,9 @@ impl App {
     }
 
     /// Digit jump (D13): take the client to window N of the selected row's
-    /// project's real session, creating session (with its .tmux.sh hook) and
-    /// window as needed. Window 1 is the editor window: created running
-    /// nvim, and an idle shell there gets `nvim` typed into it — but a busy
-    /// foreground process is never disturbed, just focused.
+    /// project's real session. The hop itself lives in `tmux::jump_to_window`
+    /// so the headless `corc jump N` (a tmux binding, run from inside the
+    /// Claude pane) shares the exact same behavior.
     fn digit_jump(&mut self, n: u8) {
         let Some(id) = self.selected_conv_id() else {
             return;
@@ -1104,25 +980,7 @@ impl App {
         let Some(dir) = self.state.conversation(&id).map(|c| c.cwd.clone()) else {
             return;
         };
-        let result = (|| -> Result<()> {
-            let session = tmux::session_name_for(&dir);
-            if !tmux::session_exists(&session) {
-                tmux::create_session(&session, &dir)?;
-            }
-            if !tmux::window_exists(&session, n) {
-                let cmd = (n == 1).then_some("nvim");
-                tmux::create_window_at(&session, n, &dir, cmd)?;
-            } else if n == 1 {
-                let cmd = tmux::window_current_command(&session, 1)?;
-                if SHELLS.contains(&cmd.as_str()) {
-                    tmux::send_line(&session, 1, "nvim")?;
-                }
-            }
-            tmux::select_window(&session, n)?;
-            // corc keeps running in its own session.
-            tmux::switch_client(&session)
-        })();
-        self.status_msg = result.err().map(|e| e.to_string());
+        self.status_msg = tmux::jump_to_window(&dir, n).err().map(|e| e.to_string());
     }
 
     /// Move mode `K`/`J` (D9): shift the selected row's project one step in
@@ -1171,8 +1029,6 @@ impl App {
             .split(f.area());
         self.draw_list(f, outer[0]);
         self.draw_footer(f, outer[1]);
-        self.draw_picker(f);
-        self.draw_path_prompt(f);
         self.draw_provider_picker(f);
     }
 
@@ -1215,80 +1071,6 @@ impl App {
         f.render_stateful_widget(list, rows[1], &mut list_state);
     }
 
-    /// The `p` overlay: an input line prefilled with `$HOME/`, plus the
-    /// matching subdirectories to Tab through.
-    fn draw_path_prompt(&mut self, f: &mut Frame) {
-        let Some(p) = &mut self.path_prompt else {
-            return;
-        };
-        if !p.completions.is_empty() {
-            p.selected = p.selected.min(p.completions.len() - 1);
-        }
-
-        let area = f.area();
-        let rect = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: (p.completions.len() as u16 + 3).clamp(4, area.height.saturating_sub(2).max(4)),
-        };
-        f.render_widget(Clear, rect);
-        let block = Block::bordered().title(" add directory ");
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
-        f.render_widget(Paragraph::new(format!("▸ {}▏", display_dir(&p.input))), rows[0]);
-
-        let width = inner.width as usize;
-        let items: Vec<ListItem> = p
-            .completions
-            .iter()
-            .map(|d| ListItem::new(truncate(&display_dir(&d.to_string_lossy()), width)))
-            .collect();
-        let mut list_state = ListState::default().with_selected(Some(p.selected));
-        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
-        f.render_stateful_widget(list, rows[1], &mut list_state);
-    }
-
-    /// The `n` overlay (D14): an input line plus the matching directories.
-    fn draw_picker(&mut self, f: &mut Frame) {
-        let Some(p) = &mut self.picker else {
-            return;
-        };
-        let filtered = p.filtered();
-        p.selected = p.selected.min(filtered.len().saturating_sub(1));
-
-        let area = f.area();
-        let rect = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: (filtered.len() as u16 + 3)
-                .clamp(4, area.height.saturating_sub(2).max(4)),
-        };
-        f.render_widget(Clear, rect);
-        let block = Block::bordered().title(" new conversation ");
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
-        f.render_widget(Paragraph::new(format!("▸ {}▏", p.input)), rows[0]);
-
-        let width = inner.width as usize;
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .map(|&i| ListItem::new(truncate(&display_dir(&p.dirs[i].to_string_lossy()), width)))
-            .collect();
-        let mut list_state = ListState::default().with_selected(Some(p.selected));
-        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
-        f.render_stateful_widget(list, rows[1], &mut list_state);
-    }
-
     /// A project header: a blank spacer line, then `─ name ────` filled to
     /// the full width (`item_height` agrees on the two rows).
     fn render_header(&self, name: &str, width: usize) -> ListItem<'static> {
@@ -1309,7 +1091,9 @@ impl App {
 
     /// A conversation row: `● title………time`, the time right-aligned and
     /// dim. Status colors per D6: Running yellow ●, Unseen blue ●, Idle
-    /// gray ●, Dead hollow ○; the viewed conversation's ● is green.
+    /// gray ●, Dead hollow ○. The viewed conversation carries a blue row
+    /// background (`VIEWED_BG`) rather than a recolored dot, so its dot keeps
+    /// showing status like any other row.
     fn render_conv(&self, idx: usize, i: usize, width: usize, now: u64) -> ListItem<'static> {
         let conv = &self.state.conversations[i];
         let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
@@ -1326,7 +1110,6 @@ impl App {
             .to_string();
         let time = status::time_column(status, meta, conv.created_at, now);
         let viewed = self.viewed.as_deref() == Some(conv.id.as_str());
-        let color = if viewed { Color::Green } else { color };
         let title_style = if idx == self.selected {
             Style::default().add_modifier(Modifier::BOLD)
         } else if status == Status::Dead {
@@ -1339,14 +1122,22 @@ impl App {
         let gap = if time_w > 0 { 1 } else { 0 };
         let t = truncate(&title, width.saturating_sub(3 + time_w + gap));
         let pad = width.saturating_sub(3 + t.chars().count() + time_w);
-        ListItem::new(Line::from(vec![
+        let item = ListItem::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(dot, Style::default().fg(color)),
             Span::raw(" "),
             Span::styled(t, title_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(time, dim),
-        ]))
+        ]));
+        // The row background marks the active conversation. When it is also
+        // the selected row the list's gray hover highlight patches over this,
+        // which is fine — the cursor's position wins while it sits here.
+        if viewed {
+            item.style(Style::default().bg(VIEWED_BG))
+        } else {
+            item
+        }
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1376,22 +1167,6 @@ impl App {
             let text = "MOVE — K/J reorder project · esc done";
             let style = Style::default().fg(Color::Yellow);
             f.render_widget(Paragraph::new(text).style(style), area);
-            return;
-        }
-        if self.picker.is_some() {
-            let text = "type to filter · enter spawn · esc cancel";
-            f.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-                area,
-            );
-            return;
-        }
-        if self.path_prompt.is_some() {
-            let text = "type path · tab complete · enter add · esc cancel";
-            f.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-                area,
-            );
             return;
         }
         if self.provider_picker.is_some() {

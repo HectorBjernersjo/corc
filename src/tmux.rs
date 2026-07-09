@@ -48,6 +48,29 @@ pub fn session_exists(name: &str) -> bool {
     tmux(&["has-session", "-t", &format!("={name}")]).is_ok()
 }
 
+/// Visible session names for the `corc projects` sessionizer (D21), most
+/// recently attached first. The `_`-prefixed sessions corc owns (`_corc`,
+/// `_corc-sessions`) are hidden. Any tmux error (no server, no sessions)
+/// yields an empty list rather than failing the picker.
+pub fn list_sessions() -> Vec<String> {
+    let Ok(out) = tmux(&[
+        "list-sessions",
+        "-F",
+        "#{session_last_attached}\t#{session_name}",
+    ]) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(i64, String)> = out
+        .lines()
+        .filter_map(|l| {
+            let (ts, name) = l.split_once('\t')?;
+            (!name.starts_with('_')).then(|| (ts.parse().unwrap_or(0), name.to_string()))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.into_iter().map(|(_, n)| n).collect()
+}
+
 /// Make sure the hidden session exists. A tmux session needs at least one
 /// window, so an empty hidden session gets a stub window that is removed
 /// once a conversation window exists.
@@ -249,6 +272,22 @@ pub fn pane_session(pane_id: &str) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+/// Every pane id currently in `session`. Used to find the conversation
+/// swapped into corc's content slot: its claude pane is the one conversation
+/// pane living in the corc session (all others are parked in the hidden one).
+pub fn session_pane_ids(session: &str) -> Vec<String> {
+    tmux(&[
+        "list-panes",
+        "-s",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        "#{pane_id}",
+    ])
+    .map(|out| out.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
 fn hidden_window_exists(name: &str) -> bool {
     tmux(&[
         "list-windows",
@@ -303,13 +342,23 @@ pub fn session_name_for(dir: &Path) -> String {
         .unwrap_or_else(|| format!("{APP_NAME}-unknown"))
 }
 
-/// Create a detached session, honoring the per-project .tmux.sh hook just
-/// like new.sh does. Never used for the hidden session.
+/// Create a detached session (D13). A per-project `.tmux.sh` hook, if present,
+/// owns the layout — same convention as new.sh. Without a hook corc lays out
+/// its default working session: nvim in window 1, an empty console in window
+/// 2. The console is created with `-d` so window 1 (nvim) stays the active
+/// window — a C-q that just created the session lands on the editor. Never
+/// used for the hidden session.
 pub fn create_session(name: &str, dir: &Path) -> Result<()> {
-    tmux(&["new-session", "-d", "-s", name, "-c", &dir.to_string_lossy()])?;
+    let dir_str = dir.to_string_lossy();
+    tmux(&["new-session", "-d", "-s", name, "-c", &dir_str])?;
     let hook = dir.join(".tmux.sh");
     if is_executable(&hook) {
         let _ = Command::new(&hook).arg(name).arg(dir).status();
+    } else {
+        // Window 1 (created by new-session) holds a shell — start nvim in it,
+        // leaving the shell underneath so `:q` returns to a prompt.
+        let _ = send_line(name, 1, "nvim");
+        let _ = tmux(&["new-window", "-d", "-t", &format!("={name}:"), "-c", &dir_str]);
     }
     Ok(())
 }
@@ -379,6 +428,103 @@ pub fn select_window(session: &str, index: u8) -> Result<()> {
 /// Switch the attached client to a session; corc keeps running in its own.
 pub fn switch_client(session: &str) -> Result<()> {
     tmux(&["switch-client", "-t", &format!("={session}")])?;
+    Ok(())
+}
+
+/// Foreground commands that count as an idle shell prompt for the digit
+/// jump's window-1 nvim rule (D13); anything else is busy and never touched.
+const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "nu"];
+
+/// Install the digit-jump key bindings at runtime so the user's tmux config
+/// file is never touched (D13). `M-1`..`M-9` become session-scoped via
+/// `if-shell -F` (evaluated at key-press, no shell spawned): inside the corc
+/// session they run `corc jump N` — the sidebar's `1`-`9`, now reachable while
+/// focus is in the Claude pane — and in every other session they keep the
+/// conventional Alt+number window switch. Overwriting is idempotent, so
+/// re-launching corc is safe; `restore_window_bindings` undoes it on quit.
+/// `exe` is the absolute corc binary path.
+pub fn install_jump_bindings(exe: &str) {
+    let cond = format!("#{{==:#{{session_name}},{TUI_SESSION}}}");
+    for n in 1..=9u8 {
+        let key = format!("M-{n}");
+        let jump = format!("run-shell \"'{exe}' jump {n}\"");
+        let fallback = format!("select-window -t {n}");
+        let _ = tmux(&[
+            "bind-key", "-n", &key, "if-shell", "-F", &cond, &jump, &fallback,
+        ]);
+    }
+}
+
+/// Undo `install_jump_bindings` on quit: put the plain Alt+number window
+/// switch back, so once corc exits the tmux server matches the user's config
+/// again. A crash that skips this leaves the conditional binding in place —
+/// harmless, since its non-corc branch is the same window switch and `corc
+/// jump` runs headless regardless.
+pub fn restore_window_bindings() {
+    for n in 1..=9u8 {
+        let key = format!("M-{n}");
+        let idx = n.to_string();
+        let _ = tmux(&["bind-key", "-n", &key, "select-window", "-t", &idx]);
+    }
+}
+
+/// Digit jump (D13): take the client to window `n` of `dir`'s real session,
+/// creating the session (with its `.tmux.sh` hook) and window as needed.
+/// Window 1 is the editor window: created running nvim, and an idle shell
+/// there gets `nvim` typed into it — but a busy foreground process is never
+/// disturbed, just focused. Shared by the sidebar's `1`-`9` and the headless
+/// `corc jump N` that a tmux binding runs from inside the Claude pane.
+pub fn jump_to_window(dir: &Path, n: u8) -> Result<()> {
+    let session = session_name_for(dir);
+    let created = !session_exists(&session);
+    if created {
+        create_session(&session, dir)?;
+    }
+    if !window_exists(&session, n) {
+        let cmd = (n == 1).then_some("nvim");
+        create_window_at(&session, n, dir, cmd)?;
+    } else if n == 1 && !created {
+        // An existing idle shell in window 1 gets nvim typed in; a busy
+        // process is left alone. Skipped on a freshly created session, where
+        // create_session already started nvim (avoids typing it twice).
+        let cmd = window_current_command(&session, 1)?;
+        if SHELLS.contains(&cmd.as_str()) {
+            send_line(&session, 1, "nvim")?;
+        }
+    }
+    select_window(&session, n)?;
+    // corc keeps running in its own session.
+    switch_client(&session)
+}
+
+/// Take the client to `dir`'s real session, landing on whatever window was
+/// last active there (its current window). Creates the session — with its
+/// `.tmux.sh` hook, or corc's default nvim+console layout — if missing. The
+/// window-less counterpart to `jump_to_window`: the C-q toggle uses it to
+/// reach the viewed conversation's project without a fixed window number.
+pub fn jump_to_session(dir: &Path) -> Result<()> {
+    let session = session_name_for(dir);
+    if !session_exists(&session) {
+        create_session(&session, dir)?;
+    }
+    switch_client(&session)
+}
+
+/// The session the triggering client is attached to right now. Run from the
+/// `C-q` binding's `run-shell`, this resolves to the client that pressed the
+/// key — the same client `switch_client`/`switch_to_last` act on — so `corc
+/// open` can tell "already in corc" from "elsewhere" and toggle (D15).
+pub fn current_session() -> Result<String> {
+    let out = tmux(&["display-message", "-p", "#{session_name}"])?;
+    Ok(out.trim().to_string())
+}
+
+/// Switch the client back to the session it was on before the current one
+/// (tmux's per-client last session) — the return half of the `C-q` toggle.
+/// Viewing a conversation in corc is a `swap-pane`, not a session switch, so
+/// the last session stays the one the user came from.
+pub fn switch_to_last() -> Result<()> {
+    tmux(&["switch-client", "-l"])?;
     Ok(())
 }
 

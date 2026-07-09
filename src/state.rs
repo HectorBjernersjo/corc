@@ -39,6 +39,11 @@ pub struct State {
     /// switch picker and persisted so the choice survives restarts.
     #[serde(default = "default_provider")]
     pub active_provider: String,
+    /// Machine-local project directories, added on the fly through the `p`
+    /// overlay (D20). Merged with the hand-curated, dotfile-synced list in
+    /// `~/.config/corc/directories.txt`; this half is never synced.
+    #[serde(default)]
+    pub directories: Vec<String>,
 }
 
 fn default_provider() -> String {
@@ -51,6 +56,7 @@ impl Default for State {
             projects: Vec::new(),
             conversations: Vec::new(),
             active_provider: default_provider(),
+            directories: Vec::new(),
         }
     }
 }
@@ -77,6 +83,18 @@ impl State {
         fs::rename(&tmp, &path)
             .with_context(|| format!("renaming into place {}", path.display()))?;
         Ok(())
+    }
+
+    /// Append a machine-local project directory unless it is already listed
+    /// (D20). Returns whether it was newly added. The hand-curated
+    /// `directories.txt` is never touched — that file is edited by hand.
+    pub fn add_directory(&mut self, dir: &Path) -> bool {
+        let entry = dir.to_string_lossy().to_string();
+        if self.directories.iter().any(|d| d == &entry) {
+            return false;
+        }
+        self.directories.push(entry);
+        true
     }
 
     pub fn conversation(&self, id: &str) -> Option<&Conversation> {

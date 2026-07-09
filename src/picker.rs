@@ -1,18 +1,42 @@
-//! Directory source for the `n` picker overlay (D14): the same source and
-//! expansion as new.sh, ported to Rust — `~/.config/tmux/directories.txt`,
-//! each entry expanded with its repo's `git worktree list --porcelain`,
-//! deduped in order. The picker shows directories only; unlike new.sh no
-//! session filtering happens (multiple conversations per project is normal).
+//! Directory source for the `N` picker and the `corc projects` sessionizer
+//! (D14, D20). Two sources are merged: the hand-curated, dotfile-synced list
+//! in `~/.config/corc/directories.txt`, and the machine-local list kept in
+//! `state.json`. Each entry is expanded with its repo's
+//! `git worktree list --porcelain`, deduped in order. The picker shows
+//! directories only; multiple conversations per project is normal.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Path to the shared directory list (also read by new.sh).
-fn directories_file() -> Result<PathBuf> {
+/// Path to the shared, hand-curated directory list (dotfile-synced, D20).
+fn config_directories_file() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".config/tmux/directories.txt"))
+    Ok(PathBuf::from(home).join(".config/corc/directories.txt"))
+}
+
+/// The lines of the shared directory list. Falls back to the pre-D20 path
+/// (`~/.config/tmux/directories.txt`, shared with the old new.sh) while the
+/// file has not been migrated, so nothing is lost on upgrade. Missing files
+/// are treated as empty rather than an error — the local list may be enough.
+fn config_directories() -> Vec<String> {
+    let read = |p: PathBuf| std::fs::read_to_string(p).ok();
+    let text = config_directories_file()
+        .ok()
+        .and_then(read)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config/tmux/directories.txt"))
+                .and_then(read)
+        })
+        .unwrap_or_default();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Expand a leading `~` to `$HOME`; other paths pass through unchanged.
@@ -67,44 +91,19 @@ fn split_parent_prefix(s: &str) -> (PathBuf, String) {
     (parent, prefix)
 }
 
-/// Append `dir` to directories.txt unless it is already listed. Returns
-/// whether the entry was newly added.
-pub fn add_directory(dir: &Path) -> Result<bool> {
-    let file = directories_file()?;
-    let line = dir.to_string_lossy();
-    let mut content = std::fs::read_to_string(&file).unwrap_or_default();
-    if content.lines().any(|l| l.trim() == line) {
-        return Ok(false);
-    }
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(&line);
-    content.push('\n');
-    std::fs::write(&file, content)
-        .with_context(|| format!("failed to write {}", file.display()))?;
-    Ok(true)
-}
-
-/// The candidate directories, in directories.txt order, each followed by its
-/// git worktrees, deduped, `/.git/` internals dropped, non-directories dropped.
-pub fn list_directories() -> Result<Vec<PathBuf>> {
-    let file = directories_file()?;
-    let text = std::fs::read_to_string(&file)
-        .with_context(|| format!("directory list file not found: {}", file.display()))?;
-
+/// The candidate directories: the shared list (D20) followed by the
+/// machine-local `local` entries, in order, each entry followed by its git
+/// worktrees, deduped, `/.git/` internals dropped, non-directories dropped.
+pub fn list_directories(local: &[String]) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for line in text.lines() {
-        let dir = line.trim();
+    for dir in config_directories().iter().chain(local) {
+        let dir = dir.trim();
         if dir.is_empty() {
             continue;
         }
         let mut candidates = vec![dir.to_string()];
-        if let Some(root) = git_toplevel(dir) {
+        if let Some(root) = repo_root(dir) {
             candidates.extend(worktrees(&root));
         }
         for cand in candidates {
@@ -132,17 +131,28 @@ pub fn matches_words(filter: &str, hay: &str) -> bool {
         .all(|w| hay.contains(w))
 }
 
-/// `git -C dir rev-parse --show-toplevel`, None outside a repo.
-fn git_toplevel(dir: &str) -> Option<String> {
+/// The repo root to expand worktrees from: `rev-parse --show-toplevel` for a
+/// normal checkout, or the directory itself when it is a bare repo — matching
+/// new.sh's worktree handling. None outside a repo.
+fn repo_root(dir: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", dir, "rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    if out.status.success() {
+        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !root.is_empty() {
+            return Some(root);
+        }
     }
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!root.is_empty()).then_some(root)
+    // A bare repo has no working tree, so --show-toplevel fails; expand its
+    // worktrees from the bare directory itself (new.sh rad 21-23).
+    let bare = Command::new("git")
+        .args(["-C", dir, "rev-parse", "--is-bare-repository"])
+        .output()
+        .ok()?;
+    (bare.status.success() && String::from_utf8_lossy(&bare.stdout).trim() == "true")
+        .then(|| dir.to_string())
 }
 
 /// The `worktree <path>` lines of `git worktree list --porcelain`.

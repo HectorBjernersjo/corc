@@ -113,8 +113,11 @@ reorders with **Move mode**: `V` enters, `K`/`J` move the selected project up/
 down, `Esc`/`Enter`/`V` exits. Order persists in the state file and never
 changes on its own.
 
-Within a project: live conversations above dead, most recently active first —
-but rows only re-sort on a state change, never under the user's cursor.
+Within a project the order is fixed: newest created at the top, never
+re-sorted. `created_at` is immutable, so a row never moves once placed —
+status flips and fresh activity leave the order untouched, so the user always
+keeps their bearings. Which conversations show is still capped to the most
+recently active (D13), but membership changes never reshuffle the survivors.
 
 ### D10 — Layout (features 3, 8)
 
@@ -242,7 +245,7 @@ survives corc restart (reconciliation), and quitting restores everything.
 - Sidebar rows: the four looks (yellow/blue/gray/hollow) and the per-state
   time column; `last_viewed` maintained for the viewed conversation and
   persisted on swap/quit.
-- Within-project ordering with re-sort only on state change (D9).
+- Fixed within-project ordering by creation time, newest first (D9).
 
 **Done when:** a finished run turns blue until swapped in, the viewed
 conversation never turns blue, and no seconds appear anywhere.
