@@ -175,7 +175,7 @@ pub fn new_uuid() -> Result<String> {
     ))
 }
 
-fn state_file() -> Result<PathBuf> {
+pub fn state_file() -> Result<PathBuf> {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {

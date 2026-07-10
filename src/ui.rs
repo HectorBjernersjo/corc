@@ -583,7 +583,7 @@ impl App {
                 // the `a` toggle is on (D12) — the list stays short by itself.
                 if !self.show_all && self.statuses.get(i) == Some(&Status::Dead) {
                     let conv = &self.state.conversations[i];
-                    let age = now.saturating_sub(status::last_activity(
+                    let age = now.saturating_sub(status::last_active_ts(
                         self.metas.meta(&conv.id),
                         conv.created_at,
                     ));
@@ -616,7 +616,7 @@ impl App {
                 ranked.sort_by(|&a, &b| {
                     let act = |i: usize| {
                         let c = &self.state.conversations[i];
-                        status::last_activity(self.metas.meta(&c.id), c.created_at)
+                        status::last_active_ts(self.metas.meta(&c.id), c.created_at)
                     };
                     act(b).cmp(&act(a))
                 });

@@ -1,4 +1,5 @@
 mod discovery;
+mod doctor;
 mod picker;
 mod projects;
 mod provider;
@@ -17,13 +18,14 @@ fn main() -> Result<()> {
         None => ui::run(),
         Some("open") => open(),
         Some("list") => list(),
+        Some("doctor") => doctor::run(),
         Some("projects") => projects::run(),
         Some("pick-dir") => pick_dir(&args),
         Some("add-dir") => add_dir(&args),
         Some("jump") => jump(&args),
         Some("shortcuts") => shortcuts(),
         Some(other) => anyhow::bail!(
-            "unknown command: {other} (expected: open, list, projects, pick-dir, add-dir, jump, shortcuts)"
+            "unknown command: {other} (expected: open, list, doctor, projects, pick-dir, add-dir, jump, shortcuts)"
         ),
     }
 }
@@ -137,7 +139,7 @@ fn shortcuts() -> Result<()> {
     row("j / k  ↑ ↓", "move selection (j continues into the menu)");
     row("g / G", "jump to top / bottom");
     row("Ctrl+d / u", "next / previous project");
-    row("1 – 9", "jump to window N of the project's session");
+    row("Alt+1 – 9", "jump to window N of the project's session");
     row("/", "filter the list");
 
     section("Conversations");

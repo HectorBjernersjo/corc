@@ -55,9 +55,10 @@ echo "Installed: $INSTALL_DIR/corc"
 echo ""
 echo "Get started:"
 echo ""
-echo "  corc         # launch the TUI picker"
-echo "  corc open    # open/switch to the corc session"
+echo "  corc open    # create/open the corc tmux session"
+echo "  corc         # run the TUI directly (only from inside tmux)"
 echo "  corc list    # list conversations corc owns"
+echo "  corc doctor  # check tmux, agents, PATH, and state access"
 
 if ! command -v tmux >/dev/null 2>&1; then
     echo ""

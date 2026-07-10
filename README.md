@@ -11,7 +11,8 @@ they exit or you reboot.
 
 ## Requirements
 
-- **tmux** — corc is built on tmux and must run inside it.
+- **tmux 3.3+** — corc is built on tmux, uses popup flags added in 3.3, and
+  must run inside it.
 - **At least one agent CLI** on your `PATH`:
   - **Claude Code** (`claude`) — corc spawns `claude --session-id <uuid>` /
     `claude --resume <uuid>`.
@@ -74,11 +75,14 @@ first use. Reload with `tmux source-file ~/.tmux.conf`.
 ### Optional: the directory picker
 
 The `N` key opens a picker to start a new conversation in a directory. It reads
-`~/.config/tmux/directories.txt` (one directory path per line) and expands each
-git repo's worktrees. Create that file to populate the picker; without it, the
-picker just has nothing to list. The `p` key adds any directory on disk to that
-file (with `Tab` completion, prefilled from `$HOME`) and immediately starts a
-conversation there — so you rarely need to edit the file by hand.
+`~/.config/corc/directories.txt` (one directory path per line), merges it with
+machine-local directories stored in corc's state, and expands each git repo's
+worktrees. For compatibility, the old `~/.config/tmux/directories.txt` path is
+used when the corc-specific file does not exist. The `p` key adds a directory
+to the machine-local list in `~/.local/state/corc/state.json` (with `Tab`
+completion, prefilled from `$HOME`) and immediately starts a conversation
+there. Use `directories.txt` for a hand-curated list you want to sync between
+machines, and `p` for local additions.
 
 ## Usage
 
@@ -90,11 +94,11 @@ Launch with `corc open` (or `Ctrl+q` if you bound it). Inside the TUI:
 | `Enter` / click | view the conversation (resumes it if dead) |
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
-| `p` | add a directory to `directories.txt` (Tab-complete) → new conversation there |
+| `p` | add a machine-local directory (Tab-complete) → new conversation there |
 | `s` | switch which agent (Claude / Cursor) new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
-| `1`–`9` | jump to window N of the project's normal tmux session |
+| `Alt+1`–`Alt+9` | jump to window N of the project's normal tmux session |
 | `a` | also show dead conversations older than a week |
 | `/` | filter the list |
 
@@ -103,7 +107,8 @@ one with the same CLI. The `s` picker only changes the agent used for
 conversations you start afterwards; it's persisted, so the choice survives
 restarts. Cursor conversations show their chat title in the sidebar once the
 first message has been sent (read from Cursor's local chat store); before that,
-and if the title can't be read, they show `(untitled)`.
+and if the title can't be read, they show `(untitled)`. Cursor's local message
+store also drives the same Running, Unseen, Idle, and Dead states as Claude.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`
@@ -114,6 +119,8 @@ still exits if you need a hard escape hatch.
 - `corc` — the TUI (must be run inside tmux; normally launched via `corc open`).
 - `corc open` — create/enter the corc session (bind this to a key).
 - `corc list` — print every conversation corc owns, grouped by project.
+- `corc doctor` — check tmux compatibility, agent binaries, `PATH`, and state
+  file permissions.
 
 ## How it works
 

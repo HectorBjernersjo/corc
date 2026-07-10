@@ -106,7 +106,7 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
 /// the mtime made Idle rows report a few minutes for conversations that had
 /// actually been quiet for hours. Falls back to the mtime/spawn time only
 /// when no turn has been recorded yet (a fresh pane).
-fn last_active_ts(meta: Option<&Meta>, created_at: u64) -> u64 {
+pub fn last_active_ts(meta: Option<&Meta>, created_at: u64) -> u64 {
     meta.and_then(|m| m.turn_completed_at.or(m.turn_started_at))
         .unwrap_or_else(|| last_activity(meta, created_at))
 }
