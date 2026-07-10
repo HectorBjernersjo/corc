@@ -331,6 +331,20 @@ pub fn kill_hidden_window(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rename a conversation's hidden window when its id changes (a pending
+/// Codex id resolving to the real session id). Renaming goes by name, so it
+/// works whether the window currently holds the agent pane or — while the
+/// conversation is viewed — the swapped-out placeholder.
+pub fn rename_hidden_window(old: &str, new: &str) -> Result<()> {
+    tmux(&[
+        "rename-window",
+        "-t",
+        &format!("={HIDDEN_SESSION}:={old}"),
+        new,
+    ])?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Real-session helpers, kept for digit jump (step 4).
 // ---------------------------------------------------------------------------

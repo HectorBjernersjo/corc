@@ -4,6 +4,7 @@
 //! file (a unit struct with an `impl Provider`) plus one line in `all()`.
 
 mod claude;
+mod codex;
 mod cursor;
 
 use crate::discovery::{Meta, MetaSource};
@@ -11,6 +12,7 @@ use anyhow::Result;
 use ratatui::style::Color;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Everything corc needs to know about one agent CLI.
 pub trait Provider: Send + Sync {
@@ -33,13 +35,44 @@ pub trait Provider: Send + Sync {
     /// freshly minted one.
     fn spawn_args(&self, id: &str, resume: bool) -> Vec<String>;
 
+    /// Whether `id` is still the provisional id from `new_session_id`,
+    /// awaiting the agent's real one. Always false for agents whose ids are
+    /// final at spawn time (Claude, Cursor).
+    fn is_pending(&self, _id: &str) -> bool {
+        false
+    }
+
+    /// Discover the real id of a spawned conversation, for agents that mint
+    /// their own id and never hand it back (Codex writes it only into its
+    /// rollout file — and writes that file only once the first message is
+    /// sent, so this cannot be answered right after spawn). corc spawns the
+    /// pane under the provisional id from `new_session_id` and retries this
+    /// on every refresh while `is_pending`: find the agent's on-disk session
+    /// created in `dir` at/after `since` and adopt its id (corc then renames
+    /// the hidden window and re-keys state to it). `taken` are ids other
+    /// conversations already claimed — without it, two pending conversations
+    /// in the same directory would both resolve to the same session and one
+    /// could never advance to its own. `Ok(None)` means "not discoverable
+    /// yet" — for Codex, that the user simply hasn't sent a message; until
+    /// they do the conversation reads as empty and is subject to the usual
+    /// empty-discard on leave (D17).
+    fn resolve_spawned_id(
+        &self,
+        _dir: &Path,
+        _since: SystemTime,
+        _taken: &[String],
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// This provider's metadata reader for the sidebar.
     fn meta_source(&self) -> Result<Box<dyn MetaSource>>;
 }
 
 static CLAUDE: claude::Claude = claude::Claude;
+static CODEX: codex::Codex = codex::Codex;
 static CURSOR: cursor::Cursor = cursor::Cursor;
-static ALL: [&dyn Provider; 2] = [&CLAUDE, &CURSOR];
+static ALL: [&dyn Provider; 3] = [&CLAUDE, &CODEX, &CURSOR];
 
 /// The default provider id, used for state files predating multi-provider
 /// support and as the fallback for an unknown id.

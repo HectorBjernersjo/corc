@@ -1,8 +1,14 @@
-//! Metadata for known conversations, read from their jsonl transcripts under
-//! ~/.claude/projects. corc only ever looks up the files of conversations
-//! it spawned (known uuid + cwd) — there is no tree scan and no adoption of
-//! foreign history (PLAN.md D1). The jsonl files are read-only: never
-//! modified, never deleted.
+//! Metadata for known conversations, read from their jsonl transcripts.
+//! corc only ever looks up the files of conversations it spawned (known
+//! uuid + cwd) — there is no tree scan and no adoption of foreign history
+//! (PLAN.md D1). The jsonl files are read-only: never modified, never
+//! deleted.
+//!
+//! `Store` is the incremental machinery — find the file once, re-parse only
+//! bytes that grew, cache per id — parameterized by a locate and a
+//! line-reader function so jsonl-based providers share it: `Store::new()`
+//! reads Claude Code's transcripts under ~/.claude/projects, Codex plugs in
+//! its own pair over ~/.codex/sessions (`Store::with`).
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -102,15 +108,36 @@ struct FileState {
 pub struct Store {
     root: PathBuf,
     files: HashMap<String, FileState>,
+    /// Find the transcript of a conversation: (root, cwd, id) → path.
+    locate: fn(&Path, &Path, &str) -> Option<PathBuf>,
+    /// Fold one parsed jsonl line into the metadata.
+    apply: fn(&mut Meta, &Value),
 }
 
 impl Store {
+    /// Claude Code's transcript store under ~/.claude/projects.
     pub fn new() -> Result<Self> {
         let home = std::env::var("HOME").context("HOME not set")?;
-        Ok(Self {
-            root: PathBuf::from(home).join(".claude/projects"),
+        Ok(Self::with(
+            PathBuf::from(home).join(".claude/projects"),
+            locate_jsonl,
+            apply,
+        ))
+    }
+
+    /// The same incremental machinery over another provider's jsonl tree
+    /// (Codex rollouts).
+    pub fn with(
+        root: PathBuf,
+        locate: fn(&Path, &Path, &str) -> Option<PathBuf>,
+        apply: fn(&mut Meta, &Value),
+    ) -> Self {
+        Self {
+            root,
             files: HashMap::new(),
-        })
+            locate,
+            apply,
+        }
     }
 
     /// Refresh metadata for the given (uuid, cwd) pairs, parsing only new
@@ -119,7 +146,7 @@ impl Store {
         for (id, cwd) in known {
             let path = match self.files.get(id) {
                 Some(state) => state.path.clone(),
-                None => match locate_jsonl(&self.root, cwd, id) {
+                None => match (self.locate)(&self.root, cwd, id) {
                     Some(p) => p,
                     // Freshly spawned conversations have no transcript yet.
                     None => continue,
@@ -133,10 +160,11 @@ impl Store {
             let size = fs_meta.len();
             let mtime = fs_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
+            let apply = self.apply;
             match self.files.get_mut(id) {
                 Some(state) if state.size == size && state.mtime == mtime => {}
                 Some(state) if size >= state.offset => {
-                    state.offset = parse_from(&path, state.offset, &mut state.meta)?;
+                    state.offset = parse_from(&path, state.offset, &mut state.meta, apply)?;
                     state.size = size;
                     state.mtime = mtime;
                     state.meta.mtime = mtime;
@@ -147,7 +175,7 @@ impl Store {
                         mtime,
                         ..Meta::default()
                     };
-                    let offset = parse_from(&path, 0, &mut meta)?;
+                    let offset = parse_from(&path, 0, &mut meta, apply)?;
                     self.files.insert(
                         id.clone(),
                         FileState {
@@ -193,10 +221,15 @@ fn locate_jsonl(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Parse complete lines starting at `offset`; returns the offset just past
-/// the last complete line, so a partially written trailing line is retried
-/// on the next poll.
-fn parse_from(path: &Path, offset: u64, meta: &mut Meta) -> Result<u64> {
+/// Parse complete lines starting at `offset`, folding each into `meta` with
+/// `apply`; returns the offset just past the last complete line, so a
+/// partially written trailing line is retried on the next poll.
+fn parse_from(
+    path: &Path,
+    offset: u64,
+    meta: &mut Meta,
+    apply: fn(&mut Meta, &Value),
+) -> Result<u64> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     reader.seek(SeekFrom::Start(offset))?;
@@ -302,8 +335,7 @@ fn is_tool_result(v: &Value) -> bool {
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
 }
 
-/// The prompt text of a user record, reduced to a one-line title stand-in:
-/// first non-empty line, at most 60 chars.
+/// The prompt text of a user record, reduced to a one-line title stand-in.
 fn prompt_text(v: &Value) -> Option<String> {
     let content = &v["message"]["content"];
     let text = content.as_str().map(str::to_string).or_else(|| {
@@ -311,6 +343,12 @@ fn prompt_text(v: &Value) -> Option<String> {
             (b["type"] == "text").then(|| b["text"].as_str())?.map(str::to_string)
         })
     })?;
+    title_line(&text)
+}
+
+/// Reduce prompt text to a one-line title stand-in: first non-empty line, at
+/// most 60 chars. Shared with providers that never generate a title (Codex).
+pub(crate) fn title_line(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     Some(match line.char_indices().nth(60) {
         Some((i, _)) => format!("{}…", &line[..i]),
@@ -324,7 +362,9 @@ fn record_timestamp(v: &Value) -> Option<u64> {
 
 /// Parse `YYYY-MM-DDTHH:MM:SS(.frac)?(Z|±HH:MM)?` into unix seconds. The
 /// jsonl writes UTC with a `Z` suffix; offsets are handled for insurance.
-fn parse_iso8601(s: &str) -> Option<u64> {
+/// Shared with other providers whose transcripts stamp the same ISO form
+/// (Codex `event_msg` records).
+pub(crate) fn parse_iso8601(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
@@ -367,10 +407,35 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// The inverse: (year, month, day) for days since 1970-01-01 (Hinnant's
+/// `civil_from_days`). Codex prunes its date-named session directories with
+/// it when resolving a pending id.
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn civil_roundtrip() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        for days in [-719468, -1, 0, 20645, 100_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+    }
 
     #[test]
     fn iso8601() {

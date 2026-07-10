@@ -8,14 +8,14 @@ use crate::state::{self, State};
 use crate::status::{self, Status};
 use crate::{picker, tmux, truncate};
 use anyhow::{Context, Result};
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-    disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -254,14 +254,11 @@ impl App {
             // Force a full repaint every frame, not a diff. corc's diff-based
             // draw leaves cells it considers unchanged untouched, so glyphs an
             // adjacent scrolling pane bled into corc's pane (D23) would linger.
-            // `clear()` makes tmux resend every cell; wrapping the clear+draw in
-            // a synchronized update (DEC 2026, honored by tmux 3.4+/wezterm)
-            // presents them as one frame so the blank clear never flashes. On a
-            // terminal that ignores 2026 the sequences are harmless no-ops.
-            execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
-            terminal.clear()?;
+            // Invalidating ratatui's comparison buffer makes it resend every
+            // cell without physically clearing the pane first, so there is no
+            // blank intermediate frame to flash on terminals without Sync.
+            force_full_redraw(terminal);
             terminal.draw(|f| self.draw(f))?;
-            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
 
             if event::poll(REPAINT_INTERVAL)? {
                 match event::read()? {
@@ -516,6 +513,14 @@ impl App {
             if let Ok(pane) = tmux::split_content_pane(&self.sidebar_pane) {
                 self.placeholder_pane = pane;
             }
+        }
+
+        // A pending Codex id that can now be resolved migrates to the real
+        // session id — state row, hidden window and viewed pointer together —
+        // before the metadata refresh, so meta starts flowing under the new
+        // key in the same tick.
+        if self.resolve_pending_ids() {
+            dirty = true;
         }
 
         let known = self.known_conversations();
@@ -919,6 +924,52 @@ impl App {
         if self.is_empty_conversation(&id) {
             self.mark_pending_discard(id);
         }
+    }
+
+    /// Migrate conversations whose provisional id can now be resolved to the
+    /// agent's real session id (Codex: its rollout file appears with the
+    /// first message). Everything keyed by the id moves together — the state
+    /// row, the hidden tmux window's name and the viewed pointer. An entry in
+    /// `pending_discard` intentionally does not: keyed by the old id, it
+    /// cancels itself on the next check, which is exactly right — a resolved
+    /// conversation has a message and must not be discarded. Returns whether
+    /// anything changed (the caller persists).
+    fn resolve_pending_ids(&mut self) -> bool {
+        let mut taken: Vec<String> = self
+            .state
+            .conversations
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        let mut changed = false;
+        for i in 0..self.state.conversations.len() {
+            let (id, cwd, created_at, provider_id) = {
+                let c = &self.state.conversations[i];
+                (c.id.clone(), c.cwd.clone(), c.created_at, c.provider.clone())
+            };
+            let prov = provider::by_id(&provider_id);
+            if !prov.is_pending(&id) {
+                continue;
+            }
+            let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(created_at);
+            let real = match prov.resolve_spawned_id(&cwd, since, &taken) {
+                Ok(Some(real)) => real,
+                Ok(None) => continue,
+                Err(e) => {
+                    self.status_msg = Some(e.to_string());
+                    continue;
+                }
+            };
+            // Best-effort: a Dead conversation has no hidden window to rename.
+            let _ = tmux::rename_hidden_window(&id, &real);
+            if self.viewed.as_deref() == Some(id.as_str()) {
+                self.viewed = Some(real.clone());
+            }
+            self.state.conversations[i].id = real.clone();
+            taken.push(real);
+            changed = true;
+        }
+        changed
     }
 
     /// Queue an empty conversation for discard after `DISCARD_GRACE`, unless
@@ -1542,6 +1593,18 @@ impl App {
     }
 }
 
+/// Make ratatui treat every cell as changed on the next draw without emitting
+/// a terminal clear. The NUL sentinel cannot be produced by ratatui's text
+/// rendering (control characters are filtered), so even intended blank cells
+/// differ and overwrite any glyph that leaked in from an adjacent tmux pane.
+fn force_full_redraw<B: Backend>(terminal: &mut Terminal<B>) {
+    terminal.swap_buffers();
+    for cell in &mut terminal.current_buffer_mut().content {
+        cell.set_symbol("\0");
+    }
+    terminal.swap_buffers();
+}
+
 /// Project group header (D8): directory basename only. A git worktree —
 /// detected by `.git` being a *file* with a `gitdir:` pointer — shows as
 /// `{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
@@ -1577,8 +1640,94 @@ fn worktree_repo(dir: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::project_display;
+    use super::{force_full_redraw, project_display};
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
+    use ratatui::widgets::Paragraph;
     use std::fs;
+    use std::io;
+
+    struct RecordingBackend {
+        inner: TestBackend,
+        draw_counts: Vec<usize>,
+        clear_calls: usize,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: TestBackend::new(width, height),
+                draw_counts: Vec::new(),
+                clear_calls: 0,
+            }
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            let updates: Vec<_> = content.collect();
+            self.draw_counts.push(updates.len());
+            self.inner.draw(updates.into_iter())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.clear_calls += 1;
+            self.inner.clear()
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn full_redraw_updates_every_cell_without_clearing_the_screen() {
+        let mut terminal = Terminal::new(RecordingBackend::new(4, 3)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("same"), frame.area()))
+            .unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("same"), frame.area()))
+            .unwrap();
+        assert_eq!(terminal.backend().draw_counts.last(), Some(&0));
+
+        force_full_redraw(&mut terminal);
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("same"), frame.area()))
+            .unwrap();
+
+        assert_eq!(terminal.backend().draw_counts.last(), Some(&12));
+        assert_eq!(terminal.backend().clear_calls, 0);
+    }
 
     /// D8: basename for plain dirs, `{repo}/{worktree}` for git worktrees.
     #[test]

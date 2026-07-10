@@ -18,6 +18,10 @@ they exit or you reboot.
     `claude --resume <uuid>`.
   - **Cursor CLI** (`cursor-agent`, optional) — corc mints a chat with
     `cursor-agent create-chat` and attaches with `cursor-agent --resume <id>`.
+  - **Codex CLI** (`codex`, optional) — corc spawns plain `codex` and resumes
+    with `codex resume <uuid>`. Codex only reveals its session id once the
+    first message is sent, so a brand-new conversation shows as untitled
+    until then.
   - Switch which one new conversations use with `s` (see below).
 - **git** (optional) — only used to detect git worktrees for the project
   labels and the directory picker.
