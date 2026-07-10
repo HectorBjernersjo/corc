@@ -30,6 +30,10 @@ pub struct Meta {
     pub title: Option<String>,
     /// First real user prompt, kept as a title stand-in until `title` exists.
     pub first_prompt: Option<String>,
+    /// Whether the conversation contains a real user/assistant exchange.
+    /// Deliberately independent of `title`, which providers may generate late
+    /// or fail to generate at all.
+    pub has_content: bool,
     pub turn_state: TurnState,
     /// Unix seconds of the last real (non-sidechain, non-meta, non-tool-
     /// result) user prompt — the start of the current or last turn (D7).
@@ -55,13 +59,17 @@ impl Meta {
 /// provider never touches the sidebar. `refresh` is handed only the (id, cwd)
 /// pairs belonging to that provider.
 pub trait MetaSource: Send {
-    fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()>;
+    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()>;
     fn meta(&self, id: &str) -> Option<&Meta>;
 }
 
 impl MetaSource for Store {
-    fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()> {
-        Store::refresh(self, known)
+    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()> {
+        let conversations: Vec<(String, PathBuf)> = known
+            .iter()
+            .map(|(id, cwd, _)| (id.clone(), cwd.clone()))
+            .collect();
+        Store::refresh(self, &conversations)
     }
     fn meta(&self, id: &str) -> Option<&Meta> {
         Store::meta(self, id)
@@ -73,6 +81,7 @@ impl Default for Meta {
         Self {
             title: None,
             first_prompt: None,
+            has_content: false,
             turn_state: TurnState::Unknown,
             turn_started_at: None,
             turn_completed_at: None,
@@ -211,6 +220,7 @@ fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
+            meta.has_content = true;
             // A Ctrl+C interrupt is written as a user record too, but it ends
             // the turn — it never produces an end_turn / turn_duration record,
             // so if we let it fall through as a prompt the state would stay
@@ -236,6 +246,7 @@ fn apply(meta: &mut Meta, v: &Value) {
             }
         }
         Some("assistant") if !sidechain => {
+            meta.has_content = true;
             match v["message"]["stop_reason"].as_str() {
                 Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
                     meta.turn_state = TurnState::Complete;
@@ -251,11 +262,13 @@ fn apply(meta: &mut Meta, v: &Value) {
             }
         }
         Some("ai-title") => {
+            meta.has_content = true;
             if let Some(title) = v["aiTitle"].as_str() {
                 meta.title = Some(title.to_string());
             }
         }
         Some("summary") => {
+            meta.has_content = true;
             if meta.title.is_none()
                 && let Some(summary) = v["summary"].as_str()
             {
@@ -394,6 +407,7 @@ mod tests {
         );
         assert_eq!(meta.turn_state, TurnState::Unknown);
         assert_eq!(meta.turn_started_at, None);
+        assert!(!meta.has_content);
 
         // A real prompt starts the turn.
         apply(
@@ -405,6 +419,7 @@ mod tests {
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, start);
         assert_eq!(meta.turn_completed_at, None);
+        assert!(meta.has_content);
 
         // Assistant tool_use + tool result stay Mid, start untouched.
         apply_all(

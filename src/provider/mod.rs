@@ -93,14 +93,17 @@ impl MetaStore {
         Ok(Self { sources })
     }
 
-    /// Refresh every source with the subset of `known` (id, cwd, provider-id)
-    /// that belongs to it.
-    pub fn refresh(&mut self, known: &[(String, PathBuf, &'static str)]) -> Result<()> {
+    /// Refresh every source with its subset of known conversations. The final
+    /// field carries a persisted in-flight turn start across corc restarts.
+    pub fn refresh(
+        &mut self,
+        known: &[(String, PathBuf, &'static str, Option<u64>)],
+    ) -> Result<()> {
         for (pid, source) in self.sources.iter_mut() {
-            let subset: Vec<(String, PathBuf)> = known
+            let subset: Vec<(String, PathBuf, Option<u64>)> = known
                 .iter()
-                .filter(|(_, _, p)| p == pid)
-                .map(|(id, cwd, _)| (id.clone(), cwd.clone()))
+                .filter(|(_, _, p, _)| p == pid)
+                .map(|(id, cwd, _, started)| (id.clone(), cwd.clone(), *started))
                 .collect();
             source.refresh(&subset)?;
         }

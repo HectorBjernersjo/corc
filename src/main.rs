@@ -21,20 +21,22 @@ fn main() -> Result<()> {
         Some("doctor") => doctor::run(),
         Some("projects") => projects::run(),
         Some("pick-dir") => pick_dir(&args),
-        Some("add-dir") => add_dir(&args),
         Some("jump") => jump(&args),
         Some("shortcuts") => shortcuts(),
         Some(other) => anyhow::bail!(
-            "unknown command: {other} (expected: open, list, doctor, projects, pick-dir, add-dir, jump, shortcuts)"
+            "unknown command: {other} (expected: open, list, doctor, projects, pick-dir, jump, shortcuts)"
         ),
     }
 }
 
 /// `corc pick-dir [--out FILE]` (D22): a centered picker over the merged
 /// project directories, run inside a `tmux display-popup` by the sidebar's
-/// `N`. The chosen directory is written to FILE (empty file when cancelled)
-/// so the still-running TUI — the sole writer of state.json — can spawn there.
-/// Without `--out` the choice is printed to stdout for manual use.
+/// `N`. The picker carries an always-present "add directory" escape hatch: a
+/// path prompt (Tab-completing real subdirectories) for a directory not yet in
+/// the list. Either way the chosen directory is written to FILE (empty file
+/// when cancelled) so the still-running TUI — the sole writer of state.json —
+/// records it in the machine-local list and spawns there. Without `--out` the
+/// choice is printed to stdout for manual use.
 fn pick_dir(args: &[String]) -> Result<()> {
     let state = state::State::load()?;
     let items = picker::list_directories(&state.directories)?
@@ -44,21 +46,14 @@ fn pick_dir(args: &[String]) -> Result<()> {
             widget::Choice::new(display_dir(&path), path)
         })
         .collect();
-    let choice = match widget::run_filter_picker("new conversation", items, false)? {
+    let choice = match widget::run_filter_picker("new conversation", items, true)? {
         Some(widget::Picked::Value(v)) => Some(v),
-        _ => None,
+        Some(widget::Picked::AddDir) => {
+            widget::run_path_prompt("add directory")?.map(|p| p.to_string_lossy().into_owned())
+        }
+        None => None,
     };
     emit_choice(args, choice.as_deref())
-}
-
-/// `corc add-dir [--out FILE]` (D22): a centered path prompt (Tab-completing
-/// real subdirectories), run inside a `tmux display-popup` by the sidebar's
-/// `p`. The typed directory is written to FILE; the TUI records it in the
-/// machine-local list and spawns there.
-fn add_dir(args: &[String]) -> Result<()> {
-    let choice = widget::run_path_prompt("add directory")?;
-    let value = choice.map(|p| p.to_string_lossy().into_owned());
-    emit_choice(args, value.as_deref())
 }
 
 /// Deliver a popup picker's result: to the `--out` file when given (empty
@@ -145,8 +140,7 @@ fn shortcuts() -> Result<()> {
     section("Conversations");
     row("Enter · click", "view (resumes it if dead)");
     row("n", "new conversation in the selected directory");
-    row("N", "new conversation via the directory picker");
-    row("p", "add a directory, then new conversation there");
+    row("N", "new conversation via the directory picker (add a new one from there)");
     row("s", "switch which agent new conversations use");
     row("x", "kill a live conversation / remove a dead one");
 
@@ -205,7 +199,7 @@ fn open() -> Result<()> {
 fn list() -> Result<()> {
     let state = state::State::load()?;
     let mut store = provider::MetaStore::new()?;
-    let known: Vec<(String, PathBuf, &'static str)> = state
+    let known: Vec<(String, PathBuf, &'static str, Option<u64>)> = state
         .conversations
         .iter()
         .map(|c| {
@@ -213,6 +207,7 @@ fn list() -> Result<()> {
                 c.id.clone(),
                 c.cwd.clone(),
                 provider::by_id(&c.provider).id(),
+                c.turn_started_at,
             )
         })
         .collect();

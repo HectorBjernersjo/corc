@@ -25,6 +25,10 @@ pub struct Conversation {
     /// state files predating multi-provider support, defaulting to Claude.
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Start of an in-flight turn, persisted so provider metadata can recover
+    /// its elapsed time after corc restarts. Cleared when the turn completes.
+    #[serde(default)]
+    pub turn_started_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,8 +100,15 @@ impl State {
     }
 
     /// Atomic write: temp file in the same directory, then rename over.
-    pub fn save(&self) -> Result<()> {
+    ///
+    /// Before writing, fold in any machine-local `directories` a second writer
+    /// (the `corc projects` sessionizer, D22) appended since we loaded. The TUI
+    /// holds state in memory, so without this its next save would clobber that
+    /// addition. `directories` is append-only — there is no removal — so the
+    /// union is lossless and makes the field safe for both writers.
+    pub fn save(&mut self) -> Result<()> {
         let path = state_file()?;
+        self.merge_disk_directories(&path);
         let dir = path.parent().context("state file has no parent dir")?;
         fs::create_dir_all(dir)?;
         let tmp = dir.join("state.json.tmp");
@@ -106,6 +117,28 @@ impl State {
         fs::rename(&tmp, &path)
             .with_context(|| format!("renaming into place {}", path.display()))?;
         Ok(())
+    }
+
+    /// Union the on-disk machine-local `directories` into ours, preserving
+    /// order and appending only entries we don't already have. Best-effort: a
+    /// missing or unparsable file just leaves our list untouched.
+    fn merge_disk_directories(&mut self, path: &Path) {
+        #[derive(Deserialize)]
+        struct DiskDirs {
+            #[serde(default)]
+            directories: Vec<String>,
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(disk) = serde_json::from_str::<DiskDirs>(&text) else {
+            return;
+        };
+        for entry in disk.directories {
+            if !self.directories.contains(&entry) {
+                self.directories.push(entry);
+            }
+        }
     }
 
     /// Append a machine-local project directory unless it is already listed
@@ -143,6 +176,7 @@ impl State {
             last_viewed: now,
             created_at: now,
             provider,
+            turn_started_at: None,
         });
     }
 }
@@ -184,4 +218,25 @@ pub fn state_file() -> Result<PathBuf> {
         }
     };
     Ok(base.join("corc/state.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Conversation;
+
+    #[test]
+    fn old_conversation_state_defaults_missing_turn_start() {
+        let conversation: Conversation = serde_json::from_str(
+            r#"{
+                "id":"chat",
+                "cwd":"/tmp",
+                "pane_id":null,
+                "last_viewed":1,
+                "created_at":1,
+                "provider":"cursor"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(conversation.turn_started_at, None);
+    }
 }

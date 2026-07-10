@@ -8,7 +8,9 @@
 //! read just leaves the row `(untitled)`, never an error. Turn state
 //! comes from the latest message referenced by the store's root blob: user
 //! prompts, tool calls and tool results are Mid; a final assistant text is
-//! Complete once the store has stopped changing briefly.
+//! Complete once the store has stopped changing briefly. The exact turn start
+//! comes from the matching JSONL agent transcript under `~/.cursor/projects`;
+//! corc persists it while running and falls back to the store's activity time.
 
 use super::Provider;
 use crate::discovery::{Meta, MetaSource, TurnState};
@@ -16,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -76,14 +79,28 @@ struct Cached {
     /// Newest mtime across store.db / -wal / meta.json when last read; the
     /// store is re-read only when this advances.
     sig: SystemTime,
+    /// Latest user-prompt timestamp found in Cursor's agent transcript.
+    prompt_started_at: Option<u64>,
     meta: Meta,
 }
 
-/// Reads chat titles and activity times from Cursor's SQLite stores.
+#[derive(Default)]
+struct TranscriptCache {
+    /// Byte offset through the append-only JSONL transcript.
+    offset: u64,
+    /// Most recent user prompt carrying Cursor's injected `<timestamp>`.
+    started_at: Option<u64>,
+}
+
+/// Reads chat titles and activity times from Cursor's local stores.
 pub struct CursorStore {
     chats_root: PathBuf,
+    projects_root: PathBuf,
     /// Located `<id>` directory per conversation, cached across refreshes.
     dirs: HashMap<String, PathBuf>,
+    /// Located agent transcript per conversation, cached across refreshes.
+    transcript_paths: HashMap<String, PathBuf>,
+    transcripts: HashMap<String, TranscriptCache>,
     cache: HashMap<String, Cached>,
 }
 
@@ -91,16 +108,66 @@ impl CursorStore {
     fn new() -> Result<Self> {
         let home = std::env::var("HOME").context("HOME not set")?;
         Ok(Self {
-            chats_root: PathBuf::from(home).join(".cursor/chats"),
+            chats_root: PathBuf::from(&home).join(".cursor/chats"),
+            projects_root: PathBuf::from(&home).join(".cursor/projects"),
             dirs: HashMap::new(),
+            transcript_paths: HashMap::new(),
+            transcripts: HashMap::new(),
             cache: HashMap::new(),
         })
+    }
+
+    /// Incrementally scan Cursor's append-only agent transcript. Unlike the
+    /// SQLite message blobs, each user prompt contains Cursor's injected wall
+    /// clock timestamp, giving an exact turn start that survives corc restarts.
+    fn refresh_transcript(&mut self, id: &str, cwd: &Path) -> Option<u64> {
+        let path = match self.transcript_paths.get(id) {
+            Some(path) if path.is_file() => path.clone(),
+            _ => {
+                let path = locate_transcript(&self.projects_root, cwd, id)?;
+                self.transcript_paths.insert(id.to_string(), path.clone());
+                path
+            }
+        };
+        let len = fs::metadata(&path).ok()?.len();
+        let cached = self.transcripts.entry(id.to_string()).or_default();
+        if len < cached.offset {
+            cached.offset = 0;
+            cached.started_at = None;
+        }
+        if len == cached.offset {
+            return cached.started_at;
+        }
+
+        let mut file = fs::File::open(path).ok()?;
+        file.seek(std::io::SeekFrom::Start(cached.offset)).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).ok()?;
+            if read == 0 {
+                break;
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(&line);
+            if parsed.is_err() && !line.ends_with('\n') {
+                // Cursor may be between writes; retry this partial line later.
+                break;
+            }
+            cached.offset = cached.offset.saturating_add(read as u64);
+            if let Ok(value) = parsed
+                && let Some(started) = user_prompt_timestamp(&value)
+            {
+                cached.started_at = Some(started);
+            }
+        }
+        cached.started_at
     }
 }
 
 impl MetaSource for CursorStore {
-    fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()> {
-        for (id, _cwd) in known {
+    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()> {
+        for (id, cwd, persisted_start) in known {
             let dir = match self.dirs.get(id) {
                 Some(d) if d.is_dir() => d.clone(),
                 _ => match locate(&self.chats_root, id) {
@@ -115,8 +182,13 @@ impl MetaSource for CursorStore {
             };
             let db = dir.join("store.db");
             let meta_json = dir.join("meta.json");
+            let prompt_started_at = self.refresh_transcript(id, cwd).or(*persisted_start);
             let sig = latest_mtime(&[db.clone(), dir.join("store.db-wal"), meta_json.clone()]);
-            if self.cache.get(id).is_some_and(|c| c.sig == sig) {
+            if self
+                .cache
+                .get(id)
+                .is_some_and(|c| c.sig == sig && c.prompt_started_at == prompt_started_at)
+            {
                 // A final assistant message is kept Mid for COMPLETE_SETTLE.
                 // Re-evaluate unchanged candidates so they eventually become
                 // Complete without requiring another filesystem write.
@@ -150,7 +222,8 @@ impl MetaSource for CursorStore {
             // it discards it, exactly like an untouched Claude conversation
             // (D17). Cursor may stamp a placeholder name before the first
             // message, so `hasConversation` is the signal, not the name.
-            if info.has_conversation {
+            meta.has_content = info.has_conversation || store.has_content;
+            if meta.has_content {
                 meta.title = store.title.or(info.title);
             }
             let updated = info
@@ -159,12 +232,31 @@ impl MetaSource for CursorStore {
                 .and_then(system_time_secs);
             let stable = sig != SystemTime::UNIX_EPOCH
                 && SystemTime::now().duration_since(sig).unwrap_or_default() >= COMPLETE_SETTLE;
-            apply_turn_observation(&mut meta, store.turn, stable, updated, previous.as_ref());
-            self.cache.insert(id.clone(), Cached { sig, meta });
+            apply_turn_observation(
+                &mut meta,
+                store.turn,
+                stable,
+                updated,
+                prompt_started_at,
+                previous.as_ref(),
+            );
+            self.cache.insert(
+                id.clone(),
+                Cached {
+                    sig,
+                    prompt_started_at,
+                    meta,
+                },
+            );
         }
         self.cache
-            .retain(|id, _| known.iter().any(|(k, _)| k == id));
-        self.dirs.retain(|id, _| known.iter().any(|(k, _)| k == id));
+            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+        self.dirs
+            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+        self.transcript_paths
+            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+        self.transcripts
+            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
         Ok(())
     }
 
@@ -184,38 +276,46 @@ enum CursorTurn {
 #[derive(Default)]
 struct StoreInfo {
     title: Option<String>,
+    has_content: bool,
     turn: CursorTurn,
 }
 
-/// Carry timing across the store's state transitions. Cursor does not persist
-/// per-message timestamps, so a running turn's start is captured on the first
-/// refresh that observes it. A completed chat discovered on startup still gets
-/// its completion timestamp from `updatedAtMs`, which is enough for Unseen.
+/// Carry timing across the store's state transitions. `start_hint` comes from
+/// the user prompt in Cursor's agent transcript, then from corc's persisted
+/// in-flight start if the transcript is unavailable. `updatedAtMs` remains the
+/// final coarse fallback and supplies completion time.
 fn apply_turn_observation(
     meta: &mut Meta,
     observed: CursorTurn,
     stable: bool,
     updated: Option<u64>,
+    start_hint: Option<u64>,
     previous: Option<&Meta>,
 ) {
     match observed {
         CursorTurn::Mid => {
             meta.turn_state = TurnState::Mid;
-            meta.turn_started_at = previous
-                .filter(|m| m.turn_state == TurnState::Mid)
-                .and_then(|m| m.turn_started_at)
+            meta.turn_started_at = start_hint
+                .or_else(|| {
+                    previous
+                        .filter(|m| m.turn_state == TurnState::Mid)
+                        .and_then(|m| m.turn_started_at)
+                })
                 .or(updated);
         }
         CursorTurn::CompleteCandidate if !stable => {
             meta.turn_state = TurnState::Mid;
-            meta.turn_started_at = previous
-                .filter(|m| m.turn_state == TurnState::Mid)
-                .and_then(|m| m.turn_started_at)
+            meta.turn_started_at = start_hint
+                .or_else(|| {
+                    previous
+                        .filter(|m| m.turn_state == TurnState::Mid)
+                        .and_then(|m| m.turn_started_at)
+                })
                 .or(updated);
         }
         CursorTurn::CompleteCandidate => {
             meta.turn_state = TurnState::Complete;
-            meta.turn_started_at = previous.and_then(|m| m.turn_started_at);
+            meta.turn_started_at = start_hint.or_else(|| previous.and_then(|m| m.turn_started_at));
             meta.turn_completed_at = previous
                 .filter(|m| m.turn_state == TurnState::Complete)
                 .and_then(|m| m.turn_completed_at)
@@ -235,6 +335,160 @@ fn locate(chats_root: &Path, id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Find `~/.cursor/projects/<workspace>/agent-transcripts/<id>/<id>.jsonl`.
+/// Try Cursor's path-derived workspace name first, then scan one level as a
+/// schema-drift fallback. The result is cached by the caller.
+fn locate_transcript(projects_root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    let workspace: String = cwd
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let relative = Path::new("agent-transcripts")
+        .join(id)
+        .join(format!("{id}.jsonl"));
+    let direct = projects_root.join(workspace).join(&relative);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for entry in fs::read_dir(projects_root).ok()?.flatten() {
+        let candidate = entry.path().join(&relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn user_prompt_timestamp(value: &serde_json::Value) -> Option<u64> {
+    if value.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    let content = value.get("message")?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return timestamp_from_text(text);
+    }
+    content.as_array()?.iter().find_map(|part| {
+        (part.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .then(|| part.get("text")?.as_str().and_then(timestamp_from_text))
+            .flatten()
+    })
+}
+
+fn timestamp_from_text(text: &str) -> Option<u64> {
+    let start = text.find("<timestamp>")? + "<timestamp>".len();
+    let end = text.get(start..)?.find("</timestamp>")? + start;
+    parse_cursor_timestamp(text.get(start..end)?)
+}
+
+/// Parse Cursor's prompt context timestamp, for example
+/// `Friday, Jul 10, 2026, 3:24 PM (UTC+2)`, into unix seconds.
+fn parse_cursor_timestamp(value: &str) -> Option<u64> {
+    let (date_time, zone) = value.trim().rsplit_once(" (UTC")?;
+    let zone = zone.strip_suffix(')')?;
+    let mut parts = date_time.split(',').map(str::trim);
+    let _weekday = parts.next()?;
+    let month_day = parts.next()?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let clock = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut month_day = month_day.split_whitespace();
+    let month = match month_day.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: i64 = month_day.next()?.parse().ok()?;
+    if month_day.next().is_some() || !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+
+    let mut clock = clock.split_whitespace();
+    let hms = clock.next()?;
+    let meridiem = clock.next()?;
+    if clock.next().is_some() {
+        return None;
+    }
+    let mut hms = hms.split(':');
+    let hour12: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+    if hms.next().is_some()
+        || !(1..=12).contains(&hour12)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    let hour = match meridiem {
+        "AM" => hour12 % 12,
+        "PM" => hour12 % 12 + 12,
+        _ => return None,
+    };
+    let offset = parse_utc_offset(zone)?;
+    let epoch =
+        days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(epoch).ok()
+}
+
+fn parse_utc_offset(value: &str) -> Option<i64> {
+    if value.is_empty() {
+        return Some(0);
+    }
+    let (sign, value) = match value.as_bytes().first()? {
+        b'+' => (1, &value[1..]),
+        b'-' => (-1, &value[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = match value.split_once(':') {
+        Some((hours, minutes)) => (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?),
+        None => (value.parse::<i64>().ok()?, 0),
+    };
+    if !(0..=23).contains(&hours) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
+/// Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
 }
 
 /// Newest mtime among the paths that exist; `UNIX_EPOCH` if none do.
@@ -264,13 +518,17 @@ fn read_store_info(db: &Path) -> Option<StoreInfo> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let turn = value
+    let message = value
         .get("latestRootBlobId")
         .and_then(|v| v.as_str())
-        .and_then(|root| latest_message(&conn, root))
-        .map(|message| classify_message(&message))
-        .unwrap_or_default();
-    Some(StoreInfo { title, turn })
+        .and_then(|root| latest_message(&conn, root));
+    let has_content = message.as_ref().is_some_and(message_has_content);
+    let turn = message.as_ref().map(classify_message).unwrap_or_default();
+    Some(StoreInfo {
+        title,
+        has_content,
+        turn,
+    })
 }
 
 /// Resolve the last message through Cursor's root blob. The root is protobuf;
@@ -313,6 +571,13 @@ fn classify_message(message: &serde_json::Value) -> CursorTurn {
         }
         _ => CursorTurn::Unknown,
     }
+}
+
+fn message_has_content(message: &serde_json::Value) -> bool {
+    matches!(
+        message.get("role").and_then(|v| v.as_str()),
+        Some("user" | "assistant" | "tool")
+    )
 }
 
 fn last_root_message_id(data: &[u8]) -> Option<String> {
@@ -424,9 +689,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CursorTurn, Meta, TurnState, apply_turn_observation, classify_message, hex_decode,
-        last_root_message_id, read_meta_json,
+        CursorStore, CursorTurn, Meta, TurnState, apply_turn_observation, classify_message,
+        hex_decode, last_root_message_id, message_has_content, parse_cursor_timestamp,
+        read_meta_json, user_prompt_timestamp,
     };
+    use crate::discovery::MetaSource;
+    use rusqlite::{Connection, params};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -478,10 +746,9 @@ mod tests {
 
     #[test]
     fn message_turn_state() {
-        assert_eq!(
-            classify_message(&json!({"role":"user","content":[{"type":"text"}]})),
-            CursorTurn::Mid
-        );
+        let user = json!({"role":"user","content":[{"type":"text"}]});
+        assert!(message_has_content(&user));
+        assert_eq!(classify_message(&user), CursorTurn::Mid);
         assert_eq!(
             classify_message(&json!({"role":"tool","content":[{"type":"tool-result"}]})),
             CursorTurn::Mid
@@ -498,6 +765,7 @@ mod tests {
             ),
             CursorTurn::CompleteCandidate
         );
+        assert!(!message_has_content(&json!({"role":"system","content":[]})));
     }
 
     #[test]
@@ -516,7 +784,14 @@ mod tests {
     #[test]
     fn turn_transitions_preserve_timing() {
         let mut running = Meta::default();
-        apply_turn_observation(&mut running, CursorTurn::Mid, false, Some(100), None);
+        apply_turn_observation(
+            &mut running,
+            CursorTurn::Mid,
+            false,
+            Some(110),
+            Some(100),
+            None,
+        );
         assert_eq!(running.turn_state, TurnState::Mid);
         assert_eq!(running.turn_started_at, Some(100));
 
@@ -526,6 +801,7 @@ mod tests {
             CursorTurn::CompleteCandidate,
             false,
             Some(110),
+            None,
             Some(&running),
         );
         assert_eq!(streaming.turn_state, TurnState::Mid);
@@ -537,10 +813,159 @@ mod tests {
             CursorTurn::CompleteCandidate,
             true,
             Some(120),
+            None,
             Some(&streaming),
         );
         assert_eq!(complete.turn_state, TurnState::Complete);
         assert_eq!(complete.turn_started_at, Some(100));
         assert_eq!(complete.turn_completed_at, Some(120));
+    }
+
+    #[test]
+    fn cursor_prompt_timestamp() {
+        assert_eq!(
+            parse_cursor_timestamp("Friday, Jul 10, 2026, 3:24 PM (UTC+2)"),
+            Some(1783689840)
+        );
+        assert_eq!(
+            parse_cursor_timestamp("Thursday, Jan 1, 2026, 12:00 AM (UTC)"),
+            Some(1767225600)
+        );
+        assert!(parse_cursor_timestamp("Friday, Feb 30, 2026, 3:24 PM (UTC+2)").is_none());
+
+        let prompt = json!({
+            "role": "user",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": "<timestamp>Friday, Jul 10, 2026, 3:24 PM (UTC+2)</timestamp>\n<user_query>hello</user_query>"
+                }]
+            }
+        });
+        assert_eq!(user_prompt_timestamp(&prompt), Some(1783689840));
+        assert_eq!(
+            user_prompt_timestamp(&json!({
+                "role": "assistant",
+                "message": {"content": "<timestamp>Friday, Jul 10, 2026, 3:24 PM (UTC+2)</timestamp>"}
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn transcript_scan_is_incremental() {
+        let base = std::env::temp_dir().join(format!(
+            "corc-cursor-transcript-test-{}",
+            std::process::id()
+        ));
+        let id = "chat-id";
+        let cwd = PathBuf::from("/tmp/example");
+        let transcript = base
+            .join("projects/tmp-example/agent-transcripts")
+            .join(id)
+            .join(format!("{id}.jsonl"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":",
+                "\"<timestamp>Friday, Jul 10, 2026, 3:24 PM (UTC+2)</timestamp>\"}]}}\n",
+                "{\"role\":\"assistant\",\"message\":{\"content\":[]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut store = CursorStore {
+            chats_root: base.join("chats"),
+            projects_root: base.join("projects"),
+            dirs: Default::default(),
+            transcript_paths: Default::default(),
+            transcripts: Default::default(),
+            cache: Default::default(),
+        };
+        assert_eq!(store.refresh_transcript(id, &cwd), Some(1783689840));
+        let first_offset = store.transcripts[id].offset;
+
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap(),
+            "{}",
+            json!({
+                "role": "user",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "<timestamp>Friday, Jul 10, 2026, 4:00 PM (UTC+2)</timestamp>"
+                }]}
+            })
+        )
+        .unwrap();
+        assert_eq!(store.refresh_transcript(id, &cwd), Some(1783692000));
+        assert!(store.transcripts[id].offset > first_offset);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn conversation_content_does_not_require_a_title() {
+        let base =
+            std::env::temp_dir().join(format!("corc-cursor-content-test-{}", std::process::id()));
+        let id = "chat-without-title";
+        let chat = base.join("workspace").join(id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&chat).unwrap();
+
+        let db = Connection::open(chat.join("store.db")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        let message_id = "22".repeat(32);
+        let mut root: Vec<u8> = vec![0x0a, 32];
+        root.extend([0x22u8; 32]);
+        db.execute(
+            "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+            params!["root", root],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+            params![
+                message_id,
+                br#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#
+            ],
+        )
+        .unwrap();
+        let store_meta = br#"{"latestRootBlobId":"root"}"#;
+        let encoded: String = store_meta.iter().map(|b| format!("{b:02x}")).collect();
+        db.execute("INSERT INTO meta (key, value) VALUES ('0', ?1)", [encoded])
+            .unwrap();
+        drop(db);
+        std::fs::write(
+            chat.join("meta.json"),
+            r#"{"hasConversation":true,"updatedAtMs":1000}"#,
+        )
+        .unwrap();
+
+        let mut store = CursorStore {
+            chats_root: base.clone(),
+            projects_root: base.join("projects"),
+            dirs: Default::default(),
+            transcript_paths: Default::default(),
+            transcripts: Default::default(),
+            cache: Default::default(),
+        };
+        store
+            .refresh(&[(id.to_string(), PathBuf::from("/tmp"), None)])
+            .unwrap();
+        let meta = store.meta(id).unwrap();
+        assert!(meta.has_content);
+        assert_eq!(meta.display_title(), None);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

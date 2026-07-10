@@ -3,7 +3,8 @@
 //! and returns the user's choice — it never touches corc's state. The running
 //! TUI reads the returned value and acts on it, staying the sole writer of
 //! `state.json`. The same code renders the sessionizer (`corc projects`) and
-//! the directory pickers (`corc pick-dir`, `corc add-dir`).
+//! the directory picker (`corc pick-dir`), including its "add directory"
+//! escape hatch.
 
 use crate::display_dir;
 use crate::picker::{complete_dirs, expand_tilde, fuzzy_match};

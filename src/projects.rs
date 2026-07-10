@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub fn run() -> Result<()> {
-    let state = State::load()?;
+    let mut state = State::load()?;
     let sessions = tmux::list_sessions();
     let session_set: HashSet<&str> = sessions.iter().map(String::as_str).collect();
 
@@ -34,11 +34,17 @@ pub fn run() -> Result<()> {
         None => return Ok(()),
         Some(widget::Picked::Value(v)) => v,
         // No listed session or directory fit — let the user type a new one and
-        // open a session there directly. This never records the directory in
-        // corc's state (the TUI is the sole writer, D22); the created session
-        // itself is what makes it show up in the picker from now on.
+        // open a session there directly. Record it in the machine-local list so
+        // it shows up in the `N` picker from now on too, the same as the TUI's
+        // `p` overlay. `save` unions with disk, so this is safe even while the
+        // TUI runs (D22); it still never touches corc's conversation state.
         Some(widget::Picked::AddDir) => match widget::run_path_prompt("add directory")? {
-            Some(dir) => dir.to_string_lossy().into_owned(),
+            Some(dir) => {
+                if state.add_directory(&dir) {
+                    let _ = state.save();
+                }
+                dir.to_string_lossy().into_owned()
+            }
             None => return Ok(()),
         },
     };

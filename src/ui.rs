@@ -14,7 +14,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -54,10 +55,15 @@ const HIDE_DEAD_AFTER_SECS: u64 = 7 * 24 * 3600;
 /// (D17). A message sent an instant before leaving can still be flushing to
 /// disk — Cursor lags noticeably — so we wait and re-check emptiness rather
 /// than discarding on the spot.
-const DISCARD_GRACE: Duration = Duration::from_secs(5);
+const DISCARD_GRACE: Duration = Duration::from_secs(30);
 /// Most recent conversations shown per project before the rest are hidden
 /// (D13) — the `a` toggle reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
+/// How often corc force-repaints its whole pane, and the input poll timeout.
+/// corc gets no event when an *adjacent* pane scrolls — which is exactly what
+/// makes tmux/wezterm leave stale glyphs in corc's pane (D23) — so the only
+/// fix is a timed full repaint. 10 Hz on a 40-column pane is a few KB/s.
+const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Background tint marking the conversation currently in the content pane — a
 /// muted blue, distinct from the gray hover highlight so the active row reads
@@ -113,8 +119,8 @@ struct App {
     /// How many week-old Dead conversations the current list is hiding.
     hidden: usize,
     /// The `s` provider-switch overlay, when open. The `N` directory picker
-    /// and `p` add-directory prompt are no longer inline overlays — they run
-    /// as centered `tmux display-popup` processes (D22).
+    /// (which now folds in the add-directory prompt) is no longer an inline
+    /// overlay — it runs as a centered `tmux display-popup` process (D22).
     provider_picker: Option<ProviderPicker>,
     /// Move mode (D9): `K`/`J` reorder the selected row's project.
     move_mode: bool,
@@ -192,10 +198,10 @@ pub fn run() -> Result<()> {
 
     // Swap the viewed pane home and remove the content pane we created (D10).
     app.park();
-    // On quit there is no next tick to run the grace re-check, so discard any
-    // still-empty conversations now rather than letting them persist as
-    // (untitled) rows across restarts (D17).
-    app.flush_pending_discards();
+    // Respect the normal grace period on shutdown too. A message sent just
+    // before Ctrl+C may still be flushing, especially for Cursor; keeping a
+    // genuinely empty row is safer than deleting a real conversation.
+    app.process_pending_discards();
     if tmux::pane_exists(&app.placeholder_pane) {
         let _ = tmux::kill_pane(&app.placeholder_pane);
     }
@@ -245,9 +251,19 @@ impl App {
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         loop {
+            // Force a full repaint every frame, not a diff. corc's diff-based
+            // draw leaves cells it considers unchanged untouched, so glyphs an
+            // adjacent scrolling pane bled into corc's pane (D23) would linger.
+            // `clear()` makes tmux resend every cell; wrapping the clear+draw in
+            // a synchronized update (DEC 2026, honored by tmux 3.4+/wezterm)
+            // presents them as one frame so the blank clear never flashes. On a
+            // terminal that ignores 2026 the sequences are harmless no-ops.
+            execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            terminal.clear()?;
             terminal.draw(|f| self.draw(f))?;
+            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
 
-            if event::poll(Duration::from_millis(200))? {
+            if event::poll(REPAINT_INTERVAL)? {
                 match event::read()? {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -377,7 +393,6 @@ impl App {
             },
             KeyCode::Char('n') => self.new_conversation_here(),
             KeyCode::Char('N') => self.open_picker(),
-            KeyCode::Char('p') => self.open_path_prompt(),
             KeyCode::Char('s') => self.open_provider_picker(),
             KeyCode::Char('x') => self.kill_or_remove(),
             KeyCode::Char('V') => self.move_mode = true,
@@ -450,8 +465,9 @@ impl App {
         }
     }
 
-    /// The (id, cwd, provider-id) triples the metadata store fans out over.
-    fn known_conversations(&self) -> Vec<(String, PathBuf, &'static str)> {
+    /// Conversations and their persisted in-flight starts, fanned out to the
+    /// matching provider metadata source.
+    fn known_conversations(&self) -> Vec<(String, PathBuf, &'static str, Option<u64>)> {
         self.state
             .conversations
             .iter()
@@ -460,6 +476,7 @@ impl App {
                     c.id.clone(),
                     c.cwd.clone(),
                     provider::by_id(&c.provider).id(),
+                    c.turn_started_at,
                 )
             })
             .collect()
@@ -504,6 +521,22 @@ impl App {
         let known = self.known_conversations();
         if let Err(e) = self.metas.refresh(&known) {
             self.status_msg = Some(e.to_string());
+        }
+
+        // Keep only an in-flight turn start in state.json. Cursor's local
+        // transcript normally supplies the exact prompt time; persisting it
+        // here preserves the elapsed clock if corc restarts before completion.
+        for conv in &mut self.state.conversations {
+            let Some(meta) = self.metas.meta(&conv.id) else {
+                continue;
+            };
+            let started = (meta.turn_state == crate::discovery::TurnState::Mid)
+                .then_some(meta.turn_started_at)
+                .flatten();
+            if conv.turn_started_at != started {
+                conv.turn_started_at = started;
+                dirty = true;
+            }
         }
 
         // A conversation whose agent exited before a single message was ever
@@ -896,20 +929,6 @@ impl App {
         }
     }
 
-    /// Discard every still-empty queued conversation without waiting out the
-    /// grace — used at shutdown, where no further tick will run the re-check.
-    fn flush_pending_discards(&mut self) {
-        let ids: Vec<String> = std::mem::take(&mut self.pending_discard)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        for id in ids {
-            if self.state.conversation(&id).is_some() && self.is_empty_conversation(&id) {
-                self.discard_conversation(&id);
-            }
-        }
-    }
-
     /// Discard queued conversations whose grace period has elapsed and that
     /// are still empty. A conversation cancels its own discard by gaining a
     /// message (no longer empty), being viewed again, or already being gone.
@@ -937,14 +956,12 @@ impl App {
         }
     }
 
-    /// True for a conversation with no generated title and no first user
-    /// prompt — one the user opened but never sent a message in. The jsonl
-    /// (if Claude even wrote one) has no real prompt to lose (D17).
+    /// Whether provider metadata positively says the conversation contains no
+    /// real exchange. Titles are presentation only and may arrive much later.
     fn is_empty_conversation(&self, id: &str) -> bool {
         self.metas
             .meta(id)
-            .and_then(|m| m.display_title())
-            .is_none()
+            .is_none_or(|meta| !meta.has_content)
     }
 
     /// Forget an empty conversation: kill its Claude pane and hidden window
@@ -1011,16 +1028,19 @@ impl App {
     }
 
     /// `N`: pick a project directory in a centered popup and spawn there
-    /// (D14, D22). The popup (`corc pick-dir`) only returns the chosen
-    /// directory; the spawn and the state write happen here, so the TUI stays
-    /// the sole writer of state.json.
+    /// (D14, D22). The popup (`corc pick-dir`) returns the chosen directory —
+    /// either one already in the list or a new one typed into its "add
+    /// directory" escape hatch. The spawn and the state write happen here, so
+    /// the TUI stays the sole writer of state.json; recording is idempotent, so
+    /// an already-listed directory is a no-op and a new one is added (D20).
     fn open_picker(&mut self) {
         if let Some(dir) = self.popup_choice("pick-dir") {
+            self.state.add_directory(&dir);
             self.new_conversation_in(dir);
         }
     }
 
-    /// Run a picker subcommand (`pick-dir`, `add-dir`) in a centered
+    /// Run a picker subcommand (`pick-dir`) in a centered
     /// `tmux display-popup`, blocking until it closes, and return the chosen
     /// path. The subcommand writes its choice to a temp file we then read —
     /// `display-popup -E` can't hand stdout back to the caller (D22). None on
@@ -1107,18 +1127,6 @@ impl App {
             return;
         };
         self.new_conversation_in(dir);
-    }
-
-    /// `p`: type a new project directory in a centered popup, record it in the
-    /// machine-local list (D20), and spawn there (D22). Like `N`, the popup
-    /// (`corc add-dir`) only returns the path — corc does the state write.
-    fn open_path_prompt(&mut self) {
-        if let Some(dir) = self.popup_choice("add-dir") {
-            if self.state.add_directory(&dir) {
-                self.status_msg = self.state.save().err().map(|e| e.to_string());
-            }
-            self.new_conversation_in(dir);
-        }
     }
 
     /// Spawn a fresh conversation in `dir` with the active provider and swap
@@ -1419,6 +1427,13 @@ impl App {
             base
         };
         let dim = Style::default().fg(Color::DarkGray);
+        // The selected row uses DarkGray as its hover background, so the
+        // normally dim time needs a lighter foreground to stay readable.
+        let time_style = if self.menu_sel.is_none() && idx == self.selected {
+            Style::default().fg(Color::Gray)
+        } else {
+            dim
+        };
         let time_w = time.chars().count();
         let gap = if time_w > 0 { 1 } else { 0 };
         let t = truncate(&title, width.saturating_sub(3 + time_w + gap));
@@ -1429,7 +1444,7 @@ impl App {
             Span::raw(" "),
             Span::styled(t, title_style),
             Span::raw(" ".repeat(pad)),
-            Span::styled(time, dim),
+            Span::styled(time, time_style),
         ]));
         // The row background marks the active conversation. When it is also
         // the selected row the list's gray hover highlight patches over this,
