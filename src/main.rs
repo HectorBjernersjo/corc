@@ -11,6 +11,24 @@ mod widget;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Absolute path to this corc binary, captured once and cached. On Linux
+/// `/proc/self/exe` grows a ` (deleted)` suffix as soon as the file is
+/// replaced (a `cargo install` while corc is running), which would make every
+/// later popup and key binding point at a nonexistent path — so the suffix is
+/// stripped, landing back on the replacement binary at the same path.
+pub fn self_exe() -> PathBuf {
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    EXE.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(tmux::APP_NAME));
+        match exe.to_string_lossy().strip_suffix(" (deleted)") {
+            Some(stripped) => PathBuf::from(stripped),
+            None => exe,
+        }
+    })
+    .clone()
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,7 +51,8 @@ fn main() -> Result<()> {
 /// project directories, run inside a `tmux display-popup` by the sidebar's
 /// `N`. The picker carries an always-present "add directory" escape hatch: a
 /// path prompt (Tab-completing real subdirectories) for a directory not yet in
-/// the list. Either way the chosen directory is written to FILE (empty file
+/// the list — including one that doesn't exist yet, created via an explicit
+/// `+ create` row. Either way the chosen directory is written to FILE (empty file
 /// when cancelled) so the still-running TUI — the sole writer of state.json —
 /// records it in the machine-local list and spawns there. Without `--out` the
 /// choice is printed to stdout for manual use.
@@ -140,7 +159,7 @@ fn shortcuts() -> Result<()> {
     section("Conversations");
     row("Enter · click", "view (resumes it if dead)");
     row("n", "new conversation in the selected directory");
-    row("N", "new conversation via the directory picker (add a new one from there)");
+    row("N", "new conversation via the directory picker (add or create one from there)");
     row("s", "switch which agent new conversations use");
     row("x", "kill a live conversation / remove a dead one");
 
@@ -172,7 +191,7 @@ fn shortcuts() -> Result<()> {
 /// `corc` session exists with the TUI running and take the client there. Bound
 /// to Ctrl+q in tmux.conf via run-shell.
 fn open() -> Result<()> {
-    let exe = std::env::current_exe().context("locating the corc binary")?;
+    let exe = self_exe();
     // switch-client only works from inside tmux; that covers both a shell in
     // a pane (TMUX set) and the Ctrl+q run-shell binding (TMUX_PANE set).
     let in_tmux = std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some();

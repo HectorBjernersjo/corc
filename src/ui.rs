@@ -154,10 +154,8 @@ pub fn run() -> Result<()> {
 
     // Install the M-1..M-9 digit-jump bindings at runtime (D13) so 1-9 work
     // from inside the Claude pane too, without ever editing the user's tmux
-    // config. Best-effort: a missing exe path just leaves the sidebar's keys.
-    if let Ok(exe) = std::env::current_exe() {
-        tmux::install_jump_bindings(&exe.to_string_lossy());
-    }
+    // config.
+    tmux::install_jump_bindings(&crate::self_exe().to_string_lossy());
 
     let placeholder_pane = tmux::split_content_pane(&sidebar_pane)?;
 
@@ -1097,13 +1095,7 @@ impl App {
     /// `display-popup -E` can't hand stdout back to the caller (D22). None on
     /// cancel, on a missing/old tmux, or when nothing was chosen.
     fn popup_choice(&mut self, subcmd: &str) -> Option<PathBuf> {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_msg = Some(e.to_string());
-                return None;
-            }
-        };
+        let exe = crate::self_exe();
         let out = std::env::temp_dir().join(format!("corc-pick-{}", state::new_uuid().ok()?));
         let cmd = format!("'{}' {subcmd} --out '{}'", exe.display(), out.display());
         let status = std::process::Command::new("tmux")
@@ -1115,7 +1107,12 @@ impl App {
         let _ = std::fs::remove_file(&out);
         match status {
             Ok(s) if s.success() => {}
-            Ok(_) => return None,
+            // Cancelling exits 0 (an empty --out file), so a nonzero exit is a
+            // real failure — say so instead of N silently doing nothing.
+            Ok(s) => {
+                self.status_msg = Some(format!("popup failed: {s}"));
+                return None;
+            }
             Err(e) => {
                 self.status_msg = Some(format!("popup failed: {e}"));
                 return None;
@@ -1348,13 +1345,7 @@ impl App {
     /// dismissed, like the directory picker (D22); a missing/old tmux just
     /// surfaces an error in the footer.
     fn show_shortcuts(&mut self) {
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_msg = Some(e.to_string());
-                return;
-            }
-        };
+        let exe = crate::self_exe();
         let cmd = format!("'{}' shortcuts", exe.display());
         let status = std::process::Command::new("tmux")
             .args([

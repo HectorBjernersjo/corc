@@ -251,10 +251,23 @@ fn filter_loop(
 }
 
 /// A centered path prompt: type a filesystem path (prefilled with `$HOME/`),
-/// Tab/▲▼ to complete against real subdirectories. Returns the chosen
+/// Tab/▲▼ to complete against real subdirectories. A path that doesn't exist
+/// yet gets an explicit `+ create <path>` row (same idiom as the picker's
+/// "add directory" row): out of the way while completions match, the sole,
+/// auto-selected option when nothing does — so creating is always a visible,
+/// deliberate choice, never a silent side effect of Enter. Returns the chosen
 /// directory, or None on Esc. Mirrors the old inline `p` overlay (D14).
 pub fn run_path_prompt(title: &str) -> Result<Option<PathBuf>> {
     with_terminal(|term| path_loop(term, title))
+}
+
+/// The typed path as a create target: expanded, absolute, and not already
+/// existing (an existing file must not be offered — create_dir_all would
+/// fail). None means the create row is not shown.
+fn create_target(input: &str) -> Option<PathBuf> {
+    let expanded = expand_tilde(input.trim_end());
+    let path = PathBuf::from(&expanded);
+    (expanded.starts_with('/') && !path.exists()).then_some(path)
 }
 
 fn path_loop(term: &mut Term, title: &str) -> Result<Option<PathBuf>> {
@@ -266,14 +279,28 @@ fn path_loop(term: &mut Term, title: &str) -> Result<Option<PathBuf>> {
     };
     let mut completions = complete_dirs(&input);
     let mut selected = 0usize;
+    let mut error: Option<String> = None;
     loop {
-        if !completions.is_empty() {
-            selected = selected.min(completions.len() - 1);
-        }
-        let rows: Vec<Row> = completions
+        // Selectable rows: the completions, plus the create row when the
+        // typed path doesn't exist yet (ranked last, like "add directory").
+        let target = create_target(&input);
+        let selectable = completions.len() + target.is_some() as usize;
+        selected = selected.min(selectable.saturating_sub(1));
+        let mut rows: Vec<Row> = completions
             .iter()
             .map(|d| Row::plain(display_dir(&d.to_string_lossy())))
             .collect();
+        if let Some(t) = &target {
+            rows.push(Row::plain(format!(
+                "+ create {}",
+                display_dir(&t.to_string_lossy())
+            )));
+        }
+        // Display-only, above the create row in the reversed layout; the
+        // selection is clamped to `selectable`, so it can never land here.
+        if let Some(e) = &error {
+            rows.push(Row::plain(format!("error: {e}")));
+        }
         term.draw(|f| draw(f, title, &display_dir(&input), &rows, selected))?;
 
         let Event::Key(key) = event::read()? else {
@@ -285,40 +312,44 @@ fn path_loop(term: &mut Term, title: &str) -> Result<Option<PathBuf>> {
         match key.code {
             KeyCode::Esc => return Ok(None),
             // Reversed layout: best completion sits at the bottom (see `draw`).
-            KeyCode::Up => {
-                if !completions.is_empty() {
-                    selected = (selected + 1).min(completions.len() - 1);
-                }
-            }
+            KeyCode::Up => selected = (selected + 1).min(selectable.saturating_sub(1)),
             KeyCode::Down => selected = selected.saturating_sub(1),
             KeyCode::Tab => {
                 if let Some(dir) = completions.get(selected) {
                     input = format!("{}/", dir.to_string_lossy());
                     completions = complete_dirs(&input);
                     selected = 0;
+                    error = None;
                 }
             }
             KeyCode::Backspace => {
                 input.pop();
                 completions = complete_dirs(&input);
                 selected = 0;
+                error = None;
             }
             KeyCode::Char(c) => {
                 input.push(c);
                 completions = complete_dirs(&input);
                 selected = 0;
+                error = None;
             }
             KeyCode::Enter => {
-                // Prefer the exact typed path if it is a directory; otherwise
-                // take the highlighted completion.
+                // An exact existing directory wins; otherwise the highlighted
+                // row decides — a completion, or the create row (which makes
+                // the directory on the spot).
                 let typed = PathBuf::from(expand_tilde(&input));
-                let chosen = if typed.is_dir() {
-                    Some(typed)
-                } else {
-                    completions.get(selected).cloned()
-                };
-                if chosen.is_some() {
-                    return Ok(chosen);
+                if typed.is_dir() {
+                    return Ok(Some(typed));
+                }
+                if let Some(dir) = completions.get(selected) {
+                    return Ok(Some(dir.clone()));
+                }
+                if let Some(t) = target {
+                    match std::fs::create_dir_all(&t) {
+                        Ok(()) => return Ok(Some(t)),
+                        Err(e) => error = Some(e.to_string()),
+                    }
                 }
             }
             _ => {}
