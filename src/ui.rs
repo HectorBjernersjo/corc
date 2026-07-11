@@ -6,7 +6,7 @@
 use crate::provider::{self, MetaStore};
 use crate::state::{self, State};
 use crate::status::{self, Status};
-use crate::{picker, tmux, truncate};
+use crate::{picker, tmux, truncate, usage};
 use anyhow::{Context, Result};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -138,6 +138,9 @@ struct App {
     /// On-screen hitboxes of the bottom menu buttons, rebuilt every draw so a
     /// click at `(col, row)` maps back to the button's action.
     menu_hitboxes: Vec<MenuHit>,
+    /// Background fetch of Claude plan usage (5h / weekly / model-scoped),
+    /// shown as a dim readout under the provider-switch menu row.
+    usage: usage::Fetcher,
 }
 
 pub fn run() -> Result<()> {
@@ -183,6 +186,7 @@ pub fn run() -> Result<()> {
         status_msg: None,
         last_refresh: Instant::now(),
         menu_hitboxes: Vec::new(),
+        usage: usage::Fetcher::spawn(),
     };
     app.refresh();
     app.view_last();
@@ -1241,8 +1245,13 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        // One row per menu entry plus the rule above them.
-        let menu_h = self.menu_entries().len() as u16 + 1;
+        // One row per menu entry plus the rule above them, plus the usage
+        // readout row when the active provider has a snapshot.
+        let usage = self
+            .usage
+            .entries(&self.state.active_provider)
+            .filter(|e| !e.is_empty());
+        let menu_h = self.menu_entries().len() as u16 + 1 + usage.is_some() as u16;
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1253,7 +1262,7 @@ impl App {
             .split(f.area());
         self.draw_list(f, outer[0]);
         self.draw_footer(f, outer[1]);
-        self.draw_menu(f, outer[2]);
+        self.draw_menu(f, outer[2], usage.as_deref());
         self.draw_provider_picker(f);
     }
 
@@ -1267,6 +1276,8 @@ impl App {
         } else {
             "Hidden".to_string()
         };
+        // The provider row sits last so it lands right above the usage
+        // readout at the sidebar's bottom edge — agent and its gauge together.
         vec![
             (MenuAction::New, "+", "New conversation".to_string(), "N"),
             (
@@ -1275,8 +1286,8 @@ impl App {
                 hidden,
                 "a",
             ),
-            (MenuAction::SwitchProvider, "⇄", provider.to_string(), "s"),
             (MenuAction::Shortcuts, "?", "Shortcuts".to_string(), "?"),
+            (MenuAction::SwitchProvider, "⇄", provider.to_string(), "s"),
         ]
     }
 
@@ -1286,7 +1297,7 @@ impl App {
     /// walks the cursor in; the cursor row carries the same gray highlight as
     /// the list. The provider row is tinted with the active agent's accent and
     /// the Hidden marker fills in while its `a` toggle is on.
-    fn draw_menu(&mut self, f: &mut Frame, area: Rect) {
+    fn draw_menu(&mut self, f: &mut Frame, area: Rect, usage: Option<&[usage::Entry]>) {
         let width = area.width as usize;
         let dim = Style::default().fg(Color::DarkGray);
         let mut lines = vec![Line::from(Span::styled("─".repeat(width), dim))];
@@ -1306,14 +1317,21 @@ impl App {
             }
             let text = format!(" {marker} {label}");
             let pad = width.saturating_sub(text.chars().count() + hint.chars().count() + 1);
+            let hit_row = area.y + lines.len() as u16;
             lines.push(Line::from(vec![
                 Span::styled(text, row),
                 Span::styled(" ".repeat(pad), row),
                 Span::styled(format!("{hint} "), hint_style),
             ]));
-            let hit_row = area.y + 1 + i as u16;
             self.menu_hitboxes
                 .push((hit_row, area.x..area.x + area.width, action));
+        }
+        // The plan-usage readout closes the sidebar as its very last row,
+        // in the active provider's accent so it reads as that agent's gauge.
+        // Display only — no hitbox, no cursor stop.
+        if let Some(entries) = usage {
+            let accent = Style::default().fg(provider::accent(&self.state.active_provider));
+            lines.push(usage_line(entries, accent));
         }
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -1582,6 +1600,27 @@ impl App {
         };
         f.render_widget(Paragraph::new(text).style(style), area);
     }
+}
+
+/// The plan-usage readout: `5h 21% · wk 24% · fable 41%`, one line uniformly
+/// in the provider's accent — a single tone, since mixing dim labels with
+/// brighter percents made the numbers jump out as clutter. Only a limit about
+/// to bite gets a different color: its whole `label percent%` segment turns
+/// yellow from 70% and red from 90%.
+fn usage_line(entries: &[usage::Entry], base: Style) -> Line<'static> {
+    let mut spans = vec![Span::styled(" ", base)];
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", base));
+        }
+        let style = match e.percent {
+            90.. => Style::default().fg(Color::Red),
+            70.. => Style::default().fg(Color::Yellow),
+            _ => base,
+        };
+        spans.push(Span::styled(format!("{} {}%", e.label, e.percent), style));
+    }
+    Line::from(spans)
 }
 
 /// Make ratatui treat every cell as changed on the next draw without emitting

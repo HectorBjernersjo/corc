@@ -16,8 +16,9 @@
 
 use super::Provider;
 use crate::discovery::{self, Meta, MetaSource, Store, TurnState};
-use crate::state;
+use crate::{state, usage};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -85,6 +86,77 @@ impl Provider for Codex {
             locate_rollout,
             apply,
         )))
+    }
+
+    /// Plan usage from the ChatGPT backend's usage endpoint, with the OAuth
+    /// token Codex keeps in `~/.codex/auth.json`. corc only reads the token;
+    /// refresh is Codex's job — an expired one just makes the fetch 401 and
+    /// the menu keeps the previous snapshot. Codex exposes two windows: a
+    /// primary short one (5h) and a secondary weekly one.
+    fn fetch_usage(&self) -> Option<Vec<usage::Entry>> {
+        let (token, account_id) = codex_tokens()?;
+        let body = usage::curl_get(
+            USAGE_URL,
+            &[
+                format!("Authorization: Bearer {token}"),
+                format!("chatgpt-account-id: {account_id}"),
+            ],
+        )?;
+        let resp: UsageResponse = serde_json::from_slice(&body).ok()?;
+        let rl = resp.rate_limit?;
+        let entries: Vec<usage::Entry> = [rl.primary_window, rl.secondary_window]
+            .into_iter()
+            .flatten()
+            .map(window_entry)
+            .collect();
+        (!entries.is_empty()).then_some(entries)
+    }
+}
+
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
+#[derive(Deserialize)]
+struct UsageResponse {
+    rate_limit: Option<RateLimit>,
+}
+
+#[derive(Deserialize)]
+struct RateLimit {
+    primary_window: Option<Window>,
+    secondary_window: Option<Window>,
+}
+
+#[derive(Deserialize)]
+struct Window {
+    used_percent: f64,
+    limit_window_seconds: Option<u64>,
+}
+
+/// The OAuth access token and account id Codex maintains.
+fn codex_tokens() -> Option<(String, String)> {
+    let home = std::env::var("HOME").ok()?;
+    let raw = std::fs::read_to_string(format!("{home}/.codex/auth.json")).ok()?;
+    let auth: Value = serde_json::from_str(&raw).ok()?;
+    let tokens = auth.get("tokens")?;
+    Some((
+        tokens.get("access_token")?.as_str()?.to_string(),
+        tokens.get("account_id")?.as_str()?.to_string(),
+    ))
+}
+
+/// Label a rate-limit window by its span — `5h` for sub-day windows, `wk`
+/// for the seven-day one, `Nd` for anything else — mirroring the labels the
+/// Claude readout uses so the two providers' rows read the same.
+fn window_entry(w: Window) -> usage::Entry {
+    let label = match w.limit_window_seconds {
+        Some(s) if s < 24 * 3600 => format!("{}h", s.div_ceil(3600)),
+        Some(s) if s == 7 * 24 * 3600 => "wk".to_string(),
+        Some(s) => format!("{}d", s.div_ceil(24 * 3600)),
+        None => "?".to_string(),
+    };
+    usage::Entry {
+        label,
+        percent: w.used_percent.clamp(0.0, 100.0).round() as u8,
     }
 }
 
@@ -275,6 +347,26 @@ fn session_meta(path: &Path) -> Option<(PathBuf, u64)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The two ChatGPT rate-limit windows map to `5h` and `wk` entries,
+    /// matching the Claude readout's labels.
+    #[test]
+    fn parses_usage_windows() {
+        let json = r#"{"plan_type":"team","rate_limit":{
+            "allowed":true,"limit_reached":false,
+            "primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":1,"reset_at":1},
+            "secondary_window":{"used_percent":12.6,"limit_window_seconds":604800,"reset_after_seconds":1,"reset_at":1}
+        }}"#;
+        let resp: UsageResponse = serde_json::from_str(json).unwrap();
+        let rl = resp.rate_limit.unwrap();
+        let shown: Vec<(String, u8)> = [rl.primary_window, rl.secondary_window]
+            .into_iter()
+            .flatten()
+            .map(window_entry)
+            .map(|e| (e.label, e.percent))
+            .collect();
+        assert_eq!(shown, vec![("5h".to_string(), 1), ("wk".to_string(), 13)]);
+    }
 
     /// task_started/task_complete bound the turn in unix seconds; the first
     /// user_message is the title stand-in; turn_aborted (Esc) ends the turn

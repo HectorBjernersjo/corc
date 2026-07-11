@@ -67,6 +67,15 @@ pub trait Provider: Send + Sync {
 
     /// This provider's metadata reader for the sidebar.
     fn meta_source(&self) -> Result<Box<dyn MetaSource>>;
+
+    /// The provider's plan-usage limits as percent used (Claude: 5h session,
+    /// weekly, model-scoped weekly), for the readout under the menu's switch
+    /// row. Blocking — called from the usage thread, never the draw loop.
+    /// None (the default) when the provider has no usage source, or the
+    /// fetch failed and the previous snapshot should stand.
+    fn fetch_usage(&self) -> Option<Vec<crate::usage::Entry>> {
+        None
+    }
 }
 
 static CLAUDE: claude::Claude = claude::Claude;

@@ -7,6 +7,7 @@ mod state;
 mod status;
 mod tmux;
 mod ui;
+mod usage;
 mod widget;
 
 use anyhow::{Context, Result};
