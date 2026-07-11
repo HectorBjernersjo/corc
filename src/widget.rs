@@ -3,8 +3,8 @@
 //! and returns the user's choice — it never touches corc's state. The running
 //! TUI reads the returned value and acts on it, staying the sole writer of
 //! `state.json`. The same code renders the sessionizer (`corc projects`) and
-//! the directory picker (`corc pick-dir`), including its "add directory"
-//! escape hatch.
+//! the directory picker (`corc pick-dir`); both share one picker that also
+//! completes — and creates — filesystem paths (see `run_filter_picker`).
 
 use crate::display_dir;
 use crate::picker::{complete_dirs, expand_tilde, fuzzy_match};
@@ -155,152 +155,116 @@ fn draw(f: &mut Frame, title: &str, input: &str, rows: &[Row], selected: usize) 
     f.render_widget(Paragraph::new(format!("▸ {input}▏")), split[1]);
 }
 
-/// What a filter picker returned: the chosen item's value, or the always-present
-/// "add directory" action (only offered when the picker is run with `add_dir`).
-pub enum Picked {
-    Value(String),
-    /// The user chose the "add directory" row — the caller should follow up
-    /// with a path prompt.
+/// What choosing a picker row does — the selectable rows, in display order.
+/// The error row is display-only: the selection is clamped to this list's
+/// length, so it can never land there.
+enum Action {
+    /// A listed item: return its value.
+    Item(usize),
+    /// The "+ add directory…" escape hatch: prefill `~/`, switching the same
+    /// picker into path mode.
     AddDir,
+    /// A filesystem completion: return it.
+    Completion(PathBuf),
+    /// The "+ create" row: make the directory, then return it.
+    Create(PathBuf),
 }
 
-/// Sentinel `filtered` index standing in for the synthetic "add directory"
-/// row, which has no backing `Choice`.
-const ADD_DIR: usize = usize::MAX;
-
-/// A centered fuzzy picker over `items` with the same word-substring matching
-/// as the sidebar `/` filter. Returns the chosen item, or None on Esc / empty.
-/// When `add_dir` is set, an always-present "add directory" row is appended,
-/// ranked last so it only takes focus once the filter excludes everything else
-/// (see `filter_loop`); choosing it returns `Picked::AddDir`.
-pub fn run_filter_picker(
-    title: &str,
-    items: Vec<Choice>,
-    add_dir: bool,
-) -> Result<Option<Picked>> {
-    with_terminal(|term| filter_loop(term, title, &items, add_dir))
-}
-
-fn filter_loop(
-    term: &mut Term,
-    title: &str,
-    items: &[Choice],
-    add_dir: bool,
-) -> Result<Option<Picked>> {
-    let mut input = String::new();
-    let mut selected = 0usize;
-    loop {
-        // Fuzzy subsequence match, best score first (so it lands at the bottom
-        // of the reversed list). sort_by is stable, so equal scores — and the
-        // empty-query case — keep source order. Each hit carries the matched
-        // char positions so the row can highlight them.
-        let mut scored: Vec<(usize, Vec<usize>, i32)> = items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| fuzzy_match(&input, &c.label).map(|m| (i, m.indices, m.score)))
-            .collect();
-        scored.sort_by(|a, b| b.2.cmp(&a.2));
-        let mut filtered: Vec<usize> = scored.iter().map(|(i, ..)| *i).collect();
-        let mut rows: Vec<Row> = scored
-            .into_iter()
-            .map(|(i, matched, _)| Row {
-                text: items[i].label.clone(),
-                matched,
-            })
-            .collect();
-        // The "add directory" row is always present and always ranked last
-        // (pushed after every real match). In the reversed layout that puts it
-        // at the top — out of the way while matches exist, and the sole,
-        // auto-selected option the moment the filter excludes everything else.
-        if add_dir {
-            filtered.push(ADD_DIR);
-            rows.push(Row::plain("+ add directory…".to_string()));
-        }
-        selected = selected.min(filtered.len().saturating_sub(1));
-        term.draw(|f| draw(f, title, &input, &rows, selected))?;
-
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Enter => {
-                return Ok(filtered.get(selected).map(|&i| match i {
-                    ADD_DIR => Picked::AddDir,
-                    i => Picked::Value(items[i].value.clone()),
-                }));
-            }
-            KeyCode::Backspace => {
-                input.pop();
-                selected = 0;
-            }
-            // Reversed layout: the best match is at the bottom, so Up walks up
-            // through the results (higher index) and Down walks back toward it.
-            KeyCode::Up => selected = (selected + 1).min(filtered.len().saturating_sub(1)),
-            KeyCode::Down => selected = selected.saturating_sub(1),
-            KeyCode::Char(c) => {
-                input.push(c);
-                selected = 0;
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A centered path prompt: type a filesystem path (prefilled with `$HOME/`),
-/// Tab/▲▼ to complete against real subdirectories. A path that doesn't exist
-/// yet gets an explicit `+ create <path>` row (same idiom as the picker's
-/// "add directory" row): out of the way while completions match, the sole,
-/// auto-selected option when nothing does — so creating is always a visible,
-/// deliberate choice, never a silent side effect of Enter. Returns the chosen
-/// directory, or None on Esc. Mirrors the old inline `p` overlay (D14).
-pub fn run_path_prompt(title: &str) -> Result<Option<PathBuf>> {
-    with_terminal(|term| path_loop(term, title))
-}
+/// Label of the "add directory" row — a searchable candidate in the fuzzy
+/// ranking, so it can be found by typing (e.g. "add") like any other row.
+const ADD_DIR_LABEL: &str = "+ add directory…";
 
 /// The typed path as a create target: expanded, absolute, and not already
 /// existing (an existing file must not be offered — create_dir_all would
 /// fail). None means the create row is not shown.
 fn create_target(input: &str) -> Option<PathBuf> {
     let expanded = expand_tilde(input.trim_end());
-    let path = PathBuf::from(&expanded);
+    // components() drops a trailing `/`, so the recorded path matches how the
+    // directory lists spell it.
+    let path = PathBuf::from(&expanded).components().as_path().to_path_buf();
     (expanded.starts_with('/') && !path.exists()).then_some(path)
 }
 
-fn path_loop(term: &mut Term, title: &str) -> Result<Option<PathBuf>> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut input = if home.is_empty() {
-        String::new()
-    } else {
-        format!("{home}/")
-    };
-    let mut completions = complete_dirs(&input);
+/// A centered picker over `items` with two modes, decided by the input's
+/// shape. Plain text fuzzy-filters the items (same word-substring matching as
+/// the sidebar `/` filter). Input starting with `~` or `/` is a filesystem
+/// path instead: the rows become real-directory completions (Tab drills in),
+/// plus an explicit `+ create <path>` row when the path doesn't exist yet —
+/// ranked last, so creating is always a visible, deliberate choice, never a
+/// silent side effect of Enter. The "+ add directory…" row bridges the modes
+/// for discoverability: choosing it just prefills `~/` in place (no second
+/// screen). It joins the fuzzy ranking as a regular candidate — searchable by
+/// typing ("add"), ranked by score, last on an empty query, and filtered out
+/// like any row when the query excludes it (path mode covers the dead-end
+/// case). Tab on an item whose value is a path drills into it the same way.
+/// Returns the chosen value/path, or None on Esc.
+pub fn run_filter_picker(title: &str, items: Vec<Choice>) -> Result<Option<String>> {
+    with_terminal(|term| picker_loop(term, title, &items))
+}
+
+fn picker_loop(term: &mut Term, title: &str, items: &[Choice]) -> Result<Option<String>> {
+    let mut input = String::new();
     let mut selected = 0usize;
     let mut error: Option<String> = None;
     loop {
-        // Selectable rows: the completions, plus the create row when the
-        // typed path doesn't exist yet (ranked last, like "add directory").
-        let target = create_target(&input);
-        let selectable = completions.len() + target.is_some() as usize;
-        selected = selected.min(selectable.saturating_sub(1));
-        let mut rows: Vec<Row> = completions
-            .iter()
-            .map(|d| Row::plain(display_dir(&d.to_string_lossy())))
-            .collect();
-        if let Some(t) = &target {
-            rows.push(Row::plain(format!(
-                "+ create {}",
-                display_dir(&t.to_string_lossy())
-            )));
+        let path_mode = input.starts_with('~') || input.starts_with('/');
+        let mut rows: Vec<Row> = Vec::new();
+        let mut actions: Vec<Action> = Vec::new();
+        if path_mode {
+            for dir in complete_dirs(&input) {
+                rows.push(Row::plain(display_dir(&dir.to_string_lossy())));
+                actions.push(Action::Completion(dir));
+            }
+            if let Some(target) = create_target(&input) {
+                rows.push(Row::plain(format!(
+                    "+ create {}",
+                    display_dir(&target.to_string_lossy())
+                )));
+                actions.push(Action::Create(target));
+            }
+        } else {
+            // Fuzzy subsequence match, best score first (so it lands at the
+            // bottom of the reversed list). sort_by is stable, so equal scores
+            // — and the empty-query case — keep source order. Each hit carries
+            // the matched char positions so the row can highlight them. The
+            // "add directory" row is a regular, searchable candidate (`None`),
+            // ranked by its score like any item and filtered out when the
+            // query excludes it; appended last, so an empty query keeps it at
+            // the bottom of the ranking.
+            let mut scored: Vec<(Option<usize>, Vec<usize>, i32)> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    fuzzy_match(&input, &c.label).map(|m| (Some(i), m.indices, m.score))
+                })
+                .collect();
+            if let Some(m) = fuzzy_match(&input, ADD_DIR_LABEL) {
+                scored.push((None, m.indices, m.score));
+            }
+            scored.sort_by(|a, b| b.2.cmp(&a.2));
+            for (item, matched, _) in scored {
+                match item {
+                    Some(i) => {
+                        rows.push(Row {
+                            text: items[i].label.clone(),
+                            matched,
+                        });
+                        actions.push(Action::Item(i));
+                    }
+                    None => {
+                        rows.push(Row {
+                            text: ADD_DIR_LABEL.to_string(),
+                            matched,
+                        });
+                        actions.push(Action::AddDir);
+                    }
+                }
+            }
         }
-        // Display-only, above the create row in the reversed layout; the
-        // selection is clamped to `selectable`, so it can never land here.
         if let Some(e) = &error {
             rows.push(Row::plain(format!("error: {e}")));
         }
+        selected = selected.min(actions.len().saturating_sub(1));
         term.draw(|f| draw(f, title, &display_dir(&input), &rows, selected))?;
 
         let Event::Key(key) = event::read()? else {
@@ -311,45 +275,64 @@ fn path_loop(term: &mut Term, title: &str) -> Result<Option<PathBuf>> {
         }
         match key.code {
             KeyCode::Esc => return Ok(None),
-            // Reversed layout: best completion sits at the bottom (see `draw`).
-            KeyCode::Up => selected = (selected + 1).min(selectable.saturating_sub(1)),
+            // Reversed layout: the best match is at the bottom, so Up walks up
+            // through the results (higher index) and Down walks back toward it.
+            KeyCode::Up => selected = (selected + 1).min(actions.len().saturating_sub(1)),
             KeyCode::Down => selected = selected.saturating_sub(1),
+            // Tab drills into the selected directory — a completion, or a
+            // listed item whose value is a path (projects; session rows are
+            // bare names and stay put).
             KeyCode::Tab => {
-                if let Some(dir) = completions.get(selected) {
-                    input = format!("{}/", dir.to_string_lossy());
-                    completions = complete_dirs(&input);
+                let dest = match actions.get(selected) {
+                    Some(Action::Completion(dir)) => Some(dir.to_string_lossy().into_owned()),
+                    Some(&Action::Item(i)) if items[i].value.starts_with('/') => {
+                        Some(items[i].value.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(dest) = dest {
+                    input = format!("{}/", display_dir(&dest));
                     selected = 0;
                     error = None;
                 }
             }
             KeyCode::Backspace => {
                 input.pop();
-                completions = complete_dirs(&input);
                 selected = 0;
                 error = None;
             }
             KeyCode::Char(c) => {
                 input.push(c);
-                completions = complete_dirs(&input);
                 selected = 0;
                 error = None;
             }
             KeyCode::Enter => {
-                // An exact existing directory wins; otherwise the highlighted
-                // row decides — a completion, or the create row (which makes
-                // the directory on the spot).
-                let typed = PathBuf::from(expand_tilde(&input));
-                if typed.is_dir() {
-                    return Ok(Some(typed));
-                }
-                if let Some(dir) = completions.get(selected) {
-                    return Ok(Some(dir.clone()));
-                }
-                if let Some(t) = target {
-                    match std::fs::create_dir_all(&t) {
-                        Ok(()) => return Ok(Some(t)),
-                        Err(e) => error = Some(e.to_string()),
+                // In path mode an exact existing directory wins; otherwise the
+                // highlighted row decides.
+                if path_mode {
+                    // components() drops a trailing `/` (see create_target).
+                    let typed = PathBuf::from(expand_tilde(&input))
+                        .components()
+                        .as_path()
+                        .to_path_buf();
+                    if typed.is_dir() {
+                        return Ok(Some(typed.to_string_lossy().into_owned()));
                     }
+                }
+                match actions.get(selected) {
+                    Some(&Action::Item(i)) => return Ok(Some(items[i].value.clone())),
+                    Some(Action::AddDir) => {
+                        input = "~/".to_string();
+                        selected = 0;
+                    }
+                    Some(Action::Completion(dir)) => {
+                        return Ok(Some(dir.to_string_lossy().into_owned()));
+                    }
+                    Some(Action::Create(target)) => match std::fs::create_dir_all(target) {
+                        Ok(()) => return Ok(Some(target.to_string_lossy().into_owned())),
+                        Err(e) => error = Some(e.to_string()),
+                    },
+                    None => {}
                 }
             }
             _ => {}

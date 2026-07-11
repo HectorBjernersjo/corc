@@ -28,31 +28,24 @@ pub fn run() -> Result<()> {
         items.push(Choice::new(display_dir(&path), path));
     }
 
-    // `add_dir` appends an always-present, ranked-last "add directory" row, so
-    // an empty filter result becomes an escape hatch rather than a dead end.
-    let choice = match widget::run_filter_picker("switch project", items, true)? {
-        None => return Ok(()),
-        Some(widget::Picked::Value(v)) => v,
-        // No listed session or directory fit — let the user type a new one and
-        // open a session there directly. Record it in the machine-local list so
-        // it shows up in the `N` picker from now on too, the same as the TUI's
-        // `p` overlay. `save` unions with disk, so this is safe even while the
-        // TUI runs (D22); it still never touches corc's conversation state.
-        Some(widget::Picked::AddDir) => match widget::run_path_prompt("add directory")? {
-            Some(dir) => {
-                if state.add_directory(&dir) {
-                    let _ = state.save();
-                }
-                dir.to_string_lossy().into_owned()
-            }
-            None => return Ok(()),
-        },
+    // The picker's path mode (input starting with `~` or `/`) lets the user
+    // type — or create — a directory that isn't listed, in the same screen.
+    let known: HashSet<String> = items.iter().map(|c| c.value.clone()).collect();
+    let Some(choice) = widget::run_filter_picker("switch project", items)? else {
+        return Ok(());
     };
 
     if session_set.contains(choice.as_str()) {
         return tmux::switch_client(&choice);
     }
     let dir = PathBuf::from(&choice);
+    // A directory that wasn't in the list came from path mode — record it in
+    // the machine-local list so it shows up in the `N` picker from now on too,
+    // the same as the TUI's picker. `save` unions with disk, so this is safe
+    // even while the TUI runs (D22); it never touches conversation state.
+    if !known.contains(&choice) && state.add_directory(&dir) {
+        let _ = state.save();
+    }
     let name = tmux::session_name_for(&dir);
     if !tmux::session_exists(&name) {
         tmux::create_session(&name, &dir)?;

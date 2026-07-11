@@ -49,10 +49,11 @@ fn main() -> Result<()> {
 
 /// `corc pick-dir [--out FILE]` (D22): a centered picker over the merged
 /// project directories, run inside a `tmux display-popup` by the sidebar's
-/// `N`. The picker carries an always-present "add directory" escape hatch: a
-/// path prompt (Tab-completing real subdirectories) for a directory not yet in
-/// the list — including one that doesn't exist yet, created via an explicit
-/// `+ create` row. Either way the chosen directory is written to FILE (empty file
+/// `N`. One screen does everything: plain text fuzzy-filters the list, while
+/// input starting with `~` or `/` switches the same picker into filesystem
+/// completion — for a directory not yet in the list, including one that
+/// doesn't exist yet, created via an explicit `+ create` row (see
+/// `run_filter_picker`). The chosen directory is written to FILE (empty file
 /// when cancelled) so the still-running TUI — the sole writer of state.json —
 /// records it in the machine-local list and spawns there. Without `--out` the
 /// choice is printed to stdout for manual use.
@@ -65,13 +66,7 @@ fn pick_dir(args: &[String]) -> Result<()> {
             widget::Choice::new(display_dir(&path), path)
         })
         .collect();
-    let choice = match widget::run_filter_picker("new conversation", items, true)? {
-        Some(widget::Picked::Value(v)) => Some(v),
-        Some(widget::Picked::AddDir) => {
-            widget::run_path_prompt("add directory")?.map(|p| p.to_string_lossy().into_owned())
-        }
-        None => None,
-    };
+    let choice = widget::run_filter_picker("new conversation", items)?;
     emit_choice(args, choice.as_deref())
 }
 
