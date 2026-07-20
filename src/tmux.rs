@@ -7,7 +7,7 @@
 
 use crate::provider::Provider;
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -138,13 +138,11 @@ fn kill_stub() {
 /// Absolute path to an agent binary (`claude`, `cursor-agent`), resolved once
 /// per name and cached.
 ///
-/// corc runs the agent directly as a pane command (no wrapping shell, D12), so
-/// tmux resolves it against the *tmux server's* environment — whose `PATH` is
-/// often the stripped default it was started with and omits `~/.local/bin`
-/// etc., leaving a bare name unspawnable. We resolve an absolute path once,
-/// preferring the login shell's `PATH` (arbitrary install locations), then the
-/// installer's known locations, and cache it. Moving the binary after corc has
-/// started needs a corc restart to pick up (rare; accepted tradeoff).
+/// Agent startup goes through the user's shell, but an absolute path still
+/// avoids depending on the tmux server's often-stripped `PATH`. Resolve it
+/// from the login shell first, then the installers' known locations, and
+/// cache it. Moving the binary after corc has started needs a corc restart to
+/// pick up (rare; accepted tradeoff).
 pub fn resolve_binary(name: &str) -> String {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -185,9 +183,41 @@ fn resolve_binary_uncached(name: &str) -> String {
     name.to_string()
 }
 
+/// Run an agent from an initialized user shell in its project directory.
+///
+/// `tmux -c` sets the process cwd but does not run shell directory-change
+/// hooks. In particular, Bash's direnv hook normally runs while drawing a
+/// prompt, which never happens for a direct pane command. The explicit `cd`
+/// gives interactive shells a real directory transition and `direnv exec`
+/// guarantees an allowed `.envrc` is applied even when the hook is
+/// prompt-based. `exec` then replaces both wrappers with the agent, preserving
+/// the D12 rule that the pane dies when the agent exits.
+const AGENT_SHELL_COMMAND: &str = concat!(
+    "cd -- \"$1\" && shift && ",
+    "if command -v direnv >/dev/null 2>&1; then ",
+    "exec direnv exec . \"$@\"; ",
+    "else exec \"$@\"; fi",
+);
+
+fn agent_shell_invocation(dir: &Path, bin: &str, extra: &[String]) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut command = vec![
+        shell,
+        "-lic".to_string(),
+        AGENT_SHELL_COMMAND.to_string(),
+        "corc-agent".to_string(),
+        dir.to_string_lossy().into_owned(),
+        bin.to_string(),
+    ];
+    command.extend_from_slice(extra);
+    command
+}
+
 /// Spawn a conversation in a new hidden window named by its id, running the
-/// provider's agent directly as the pane command (no wrapping shell, D12) so
-/// the window dies when the agent exits. Returns the new pane id.
+/// provider's agent through an initialized user shell. The shell loads project
+/// environment, changes directory, applies direnv when available, and then
+/// execs the agent so the window still dies when the agent exits (D12).
+/// Returns the new pane id.
 pub fn spawn_conversation(
     dir: &Path,
     provider: &dyn Provider,
@@ -200,21 +230,54 @@ pub fn spawn_conversation(
     let dir_str = dir.to_string_lossy();
     let bin = resolve_binary(provider.binary());
     let extra = provider.spawn_args(id, resume);
+    let command = agent_shell_invocation(dir, &bin, &extra);
     let hidden_target = format!("={HIDDEN_SESSION}:");
-    // Multiple trailing arguments make tmux exec the command directly.
+    // Multiple trailing arguments make tmux exec the shell directly; the
+    // shell in turn replaces itself with the agent after initialization.
     let base: Vec<&str> = if session_exists(HIDDEN_SESSION) {
         vec!["new-window", "-d", "-t", &hidden_target]
     } else {
         vec!["new-session", "-d", "-s", HIDDEN_SESSION]
     };
     let mut args = base;
-    args.extend(["-n", id, "-c", &dir_str, "-P", "-F", "#{pane_id}", &bin]);
-    args.extend(extra.iter().map(String::as_str));
+    args.extend(["-n", id, "-c", &dir_str, "-P", "-F", "#{pane_id}"]);
+    args.extend(command.iter().map(String::as_str));
     let pane_id = tmux(&args)?;
     if args[0] == "new-window" {
         kill_stub();
     }
     Ok(pane_id.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_shell_invocation_passes_paths_and_arguments_positionally() {
+        let args = vec!["--resume".to_string(), "id with spaces".to_string()];
+        // Avoid mutating SHELL in a parallel test: only assert the stable tail.
+        let invocation = agent_shell_invocation(
+            Path::new("/tmp/project with spaces; untouched"),
+            "/tmp/bin with spaces/codex",
+            &args,
+        );
+
+        assert_eq!(
+            &invocation[1..4],
+            &["-lic", AGENT_SHELL_COMMAND, "corc-agent"]
+        );
+        assert_eq!(invocation[4], "/tmp/project with spaces; untouched");
+        assert_eq!(invocation[5], "/tmp/bin with spaces/codex");
+        assert_eq!(&invocation[6..], &["--resume", "id with spaces"]);
+    }
+
+    #[test]
+    fn agent_shell_command_changes_directory_and_applies_direnv() {
+        assert!(AGENT_SHELL_COMMAND.starts_with("cd -- \"$1\" && shift"));
+        assert!(AGENT_SHELL_COMMAND.contains("exec direnv exec . \"$@\""));
+        assert!(AGENT_SHELL_COMMAND.contains("else exec \"$@\""));
+    }
 }
 
 /// Split corc's own window: sidebar (this pane) fixed at 40 columns on the
@@ -264,6 +327,16 @@ pub fn pane_exists(pane_id: &str) -> bool {
     tmux(&["list-panes", "-a", "-F", "#{pane_id}"])
         .map(|out| out.lines().any(|l| l == pane_id))
         .unwrap_or(false)
+}
+
+/// Snapshot every pane currently known to tmux. Callers checking several
+/// panes should use this once and perform membership tests in memory instead
+/// of spawning one `tmux list-panes` process per pane.
+pub fn all_pane_ids() -> Result<HashSet<String>> {
+    Ok(tmux(&["list-panes", "-a", "-F", "#{pane_id}"])?
+        .lines()
+        .map(str::to_string)
+        .collect())
 }
 
 /// Which session a pane currently lives in.
@@ -372,7 +445,14 @@ pub fn create_session(name: &str, dir: &Path) -> Result<()> {
         // Window 1 (created by new-session) holds a shell — start nvim in it,
         // leaving the shell underneath so `:q` returns to a prompt.
         let _ = send_line(name, 1, "nvim");
-        let _ = tmux(&["new-window", "-d", "-t", &format!("={name}:"), "-c", &dir_str]);
+        let _ = tmux(&[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("={name}:"),
+            "-c",
+            &dir_str,
+        ]);
     }
     Ok(())
 }

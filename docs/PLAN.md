@@ -133,8 +133,9 @@ selection.
 
 ### D12 — Lifecycle
 
-- Windows in `_corc-sessions` run `claude` as the pane command (no wrapping shell), so
-  the window dies when Claude exits. A vanished uuid-window ⇒ conversation
+- Windows in `_corc-sessions` initialize the user's shell in the project directory,
+  apply direnv when available, then `exec` the selected agent CLI as the pane command,
+  so the window dies when the agent exits. A vanished uuid-window ⇒ conversation
   becomes **Dead** in state (still listed, hollow, resumable). If it dies
   while swapped in, corc recreates the placeholder content pane on the next
   refresh tick.
@@ -219,7 +220,8 @@ The load-bearing rewrite; unblocks everything else.
   conversations and project order.
 - `tmux.rs` rewritten around the new topology:
   - `ensure_hidden_session()`, `spawn_conversation(dir, resume: Option<Uuid>)`
-    → new window in `_corc-sessions` named by uuid, running claude directly (D12).
+    → new window in `_corc-sessions` named by uuid, initializing the project
+      environment and then execing the selected agent CLI (D12).
   - `view(conv)` / `park()` via `swap-pane` (D4).
   - startup reconciliation (D16); self-split layout with placeholder (D10).
   - kept as-is: `session_name_for`, `create_session` + `.tmux.sh` hook,

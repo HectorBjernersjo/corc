@@ -148,7 +148,7 @@ fn shortcuts() -> Result<()> {
     section("Navigate");
     row("j / k  ↑ ↓", "move selection (j continues into the menu)");
     row("g / G", "jump to top / bottom");
-    row("Ctrl+d / u", "next / previous project");
+    row("} / {  Ctrl+d / u", "next / previous project");
     row("Alt+1 – 9", "jump to window N of the project's session");
     row("/", "filter the list");
 

@@ -31,6 +31,38 @@ enum Item {
     Conv(usize),
 }
 
+/// When the cursor lands on a project's first conversation, keep that
+/// project's complete two-line header (spacer + name) immediately above it.
+/// Ratatui normally considers only the selected item mandatory and can leave
+/// the offset on the conversation itself, stripping away its group context.
+fn keep_first_conversation_context_visible(
+    items: &[Item],
+    selected: usize,
+    viewport_height: u16,
+    state: &mut ListState,
+) {
+    let Some(header) = selected.checked_sub(1) else {
+        return;
+    };
+    if viewport_height >= 3
+        && state.selected() == Some(selected)
+        && matches!(items.get(header), Some(Item::Header(_)))
+        && state.offset() > header
+    {
+        *state.offset_mut() = header;
+    }
+}
+
+/// Update the list highlight without throwing away its viewport. Ratatui's
+/// `ListState::select(None)` also resets `offset` to zero, which makes the
+/// conversation list jump to the top as soon as focus enters the menu.
+fn set_list_highlight(state: &mut ListState, selected: Option<usize>) {
+    match selected {
+        Some(index) => state.select(Some(index)),
+        None => *state.selected_mut() = None,
+    }
+}
+
 /// A menu row's on-screen hitbox: (row, column range, action). Screen
 /// coordinates so a mouse click maps straight back to the row.
 type MenuHit = (u16, std::ops::Range<u16>, MenuAction);
@@ -64,6 +96,81 @@ const MAX_PER_PROJECT: usize = 7;
 /// makes tmux/wezterm leave stale glyphs in corc's pane (D23) — so the only
 /// fix is a timed full repaint. 10 Hz on a 40-column pane is a few KB/s.
 const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Caps repair frames independently of input activity. `event::poll` returns
+/// immediately while events are queued, so using its timeout as the repaint
+/// clock lets mouse/key bursts accelerate the full redraw loop. A monotonic
+/// deadline keeps damage repair at the intended rate and skips missed slots
+/// instead of emitting catch-up frames.
+struct RepaintSchedule {
+    next: Instant,
+    interval: Duration,
+}
+
+impl RepaintSchedule {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            next: now,
+            interval,
+        }
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + self.interval;
+        true
+    }
+
+    fn wait(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RenderKind {
+    /// A small ratatui diff after sidebar input or a state refresh.
+    Diff,
+    /// A complete sidebar repair for damage caused by the adjacent pane.
+    Full,
+}
+
+/// Keeps interactive rendering responsive while independently rate-limiting
+/// expensive full-pane repairs. Key repeat may request many diff frames, but
+/// it can never advance the full-repair clock.
+struct RenderSchedule {
+    repair: RepaintSchedule,
+    dirty: bool,
+}
+
+impl RenderSchedule {
+    fn new(now: Instant, repair_interval: Duration) -> Self {
+        Self {
+            repair: RepaintSchedule::new(now, repair_interval),
+            dirty: true,
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn take(&mut self, now: Instant) -> Option<RenderKind> {
+        if self.repair.take_due(now) {
+            self.dirty = false;
+            return Some(RenderKind::Full);
+        }
+        if std::mem::take(&mut self.dirty) {
+            return Some(RenderKind::Diff);
+        }
+        None
+    }
+
+    fn wait(&self, now: Instant) -> Duration {
+        self.repair.wait(now)
+    }
+}
 
 /// Background tint marking the conversation currently in the content pane — a
 /// muted blue, distinct from the gray hover highlight so the active row reads
@@ -252,17 +359,25 @@ impl App {
         &mut self,
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        let mut render = RenderSchedule::new(Instant::now(), REPAINT_INTERVAL);
         loop {
-            // Force a full repaint every frame, not a diff. corc's diff-based
-            // draw leaves cells it considers unchanged untouched, so glyphs an
-            // adjacent scrolling pane bled into corc's pane (D23) would linger.
-            // Invalidating ratatui's comparison buffer makes it resend every
-            // cell without physically clearing the pane first, so there is no
-            // blank intermediate frame to flash on terminals without Sync.
-            force_full_redraw(terminal);
-            terminal.draw(|f| self.draw(f))?;
+            match render.take(Instant::now()) {
+                Some(RenderKind::Full) => {
+                    // corc gets no event when the adjacent content pane
+                    // scrolls, and those updates can leave stale glyphs in
+                    // the sidebar (D23). Full repair stays capped at 10 Hz.
+                    force_full_redraw(terminal);
+                    terminal.draw(|f| self.draw(f))?;
+                }
+                Some(RenderKind::Diff) => {
+                    // Input-driven frames use ratatui's normal cell diff, so
+                    // held j/k remains responsive without another full burst.
+                    terminal.draw(|f| self.draw(f))?;
+                }
+                None => {}
+            }
 
-            if event::poll(REPAINT_INTERVAL)? {
+            if event::poll(render.wait(Instant::now()))? {
                 match event::read()? {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -270,16 +385,22 @@ impl App {
                         if self.handle_key(key.code, key.modifiers) {
                             return Ok(());
                         }
+                        render.mark_dirty();
                     }
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
+                        render.mark_dirty();
+                    }
                     Event::Resize(_, _) => {
                         let _ = tmux::enforce_sidebar_width(&self.sidebar_pane);
+                        render.mark_dirty();
                     }
                     _ => {}
                 }
             }
             if self.last_refresh.elapsed() >= Duration::from_secs(1) {
                 self.refresh();
+                render.mark_dirty();
             }
         }
     }
@@ -363,6 +484,8 @@ impl App {
             return false;
         }
         match code {
+            KeyCode::Char('}') => self.jump_project(1),
+            KeyCode::Char('{') => self.jump_project(-1),
             KeyCode::Char('j') | KeyCode::Down => {
                 let n = self.take_count();
                 self.move_selection(1, n);
@@ -485,16 +608,31 @@ impl App {
         self.last_refresh = Instant::now();
         let mut dirty = false;
 
-        // Notice vanished panes: the conversation is Dead (D12).
+        // Take one tmux snapshot for every liveness check in this refresh.
+        // Spawning `tmux list-panes` once per live conversation blocked input
+        // for a noticeable fraction of a second on larger lists.
+        let panes = match tmux::all_pane_ids() {
+            Ok(panes) => Some(panes),
+            Err(e) => {
+                self.status_msg = Some(e.to_string());
+                None
+            }
+        };
+
+        // Notice vanished panes: the conversation is Dead (D12). If tmux
+        // itself could not be queried, preserve the last-known state instead
+        // of falsely declaring every conversation dead.
         let mut viewed_died = false;
-        for conv in &mut self.state.conversations {
-            if let Some(pane_id) = &conv.pane_id
-                && !tmux::pane_exists(pane_id)
-            {
-                conv.pane_id = None;
-                dirty = true;
-                if self.viewed.as_deref() == Some(conv.id.as_str()) {
-                    viewed_died = true;
+        if let Some(panes) = &panes {
+            for conv in &mut self.state.conversations {
+                if let Some(pane_id) = &conv.pane_id
+                    && !panes.contains(pane_id)
+                {
+                    conv.pane_id = None;
+                    dirty = true;
+                    if self.viewed.as_deref() == Some(conv.id.as_str()) {
+                        viewed_died = true;
+                    }
                 }
             }
         }
@@ -510,7 +648,11 @@ impl App {
                 Err(e) => self.status_msg = Some(e.to_string()),
             }
             died_id = Some(id);
-        } else if self.viewed.is_none() && !tmux::pane_exists(&self.placeholder_pane) {
+        } else if self.viewed.is_none()
+            && panes
+                .as_ref()
+                .is_some_and(|panes| !panes.contains(&self.placeholder_pane))
+        {
             // Someone closed the placeholder shell; put it back.
             if let Ok(pane) = tmux::split_content_pane(&self.sidebar_pane) {
                 self.placeholder_pane = pane;
@@ -754,7 +896,7 @@ impl App {
     }
 
     /// The item index of the first conversation in each project group, in
-    /// screen order — the landing spots for the Ctrl+d/u folder hop.
+    /// screen order — the landing spots for the Ctrl+d/u and }/{ folder hop.
     fn project_starts(&self) -> Vec<usize> {
         let mut starts = Vec::new();
         let mut expect_first = false;
@@ -771,8 +913,8 @@ impl App {
         starts
     }
 
-    /// Ctrl+d/u: move the selection to the first conversation of the next or
-    /// previous project group, clamping at the ends.
+    /// Ctrl+d/u or }/{: move the selection to the first conversation of the
+    /// next or previous project group, clamping at the ends.
     fn jump_project(&mut self, dir: i64) {
         self.menu_sel = None;
         let starts = self.project_starts();
@@ -1246,12 +1388,23 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         // One row per menu entry plus the rule above them, plus the usage
-        // readout row when the active provider has a snapshot.
-        let usage = self
-            .usage
-            .entries(&self.state.active_provider)
-            .filter(|e| !e.is_empty());
-        let menu_h = self.menu_entries().len() as u16 + 1 + usage.is_some() as u16;
+        // readout (its own divider + row) when there is anything to show.
+        // The readout follows the *selected conversation*: its provider's
+        // plan usage, accent and context size — not the active provider's —
+        // so cursoring across a mixed list swaps the whole gauge with it.
+        // With nothing selected it falls back to the active provider.
+        let pid = self
+            .selected_conv_id()
+            .and_then(|id| self.state.conversations.iter().find(|c| c.id == id))
+            .map(|c| c.provider.clone())
+            .unwrap_or_else(|| self.state.active_provider.clone());
+        let usage = self.usage.entries(&pid).filter(|e| !e.is_empty());
+        let ctx = self
+            .selected_conv_id()
+            .and_then(|id| self.metas.meta(&id))
+            .and_then(|m| m.context_tokens);
+        let readout = (usage.is_some() || ctx.is_some()).then_some(provider::accent(&pid));
+        let menu_h = self.menu_entries().len() as u16 + 1 + 2 * readout.is_some() as u16;
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1262,7 +1415,7 @@ impl App {
             .split(f.area());
         self.draw_list(f, outer[0]);
         self.draw_footer(f, outer[1]);
-        self.draw_menu(f, outer[2], usage.as_deref());
+        self.draw_menu(f, outer[2], usage.as_deref(), ctx, readout);
         self.draw_provider_picker(f);
     }
 
@@ -1297,7 +1450,14 @@ impl App {
     /// walks the cursor in; the cursor row carries the same gray highlight as
     /// the list. The provider row is tinted with the active agent's accent and
     /// the Hidden marker fills in while its `a` toggle is on.
-    fn draw_menu(&mut self, f: &mut Frame, area: Rect, usage: Option<&[usage::Entry]>) {
+    fn draw_menu(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        usage: Option<&[usage::Entry]>,
+        ctx: Option<u64>,
+        readout: Option<Color>,
+    ) {
         let width = area.width as usize;
         let dim = Style::default().fg(Color::DarkGray);
         let mut lines = vec![Line::from(Span::styled("─".repeat(width), dim))];
@@ -1326,12 +1486,17 @@ impl App {
             self.menu_hitboxes
                 .push((hit_row, area.x..area.x + area.width, action));
         }
-        // The plan-usage readout closes the sidebar as its very last row,
-        // in the active provider's accent so it reads as that agent's gauge.
+        // The readout closes the sidebar as its very last row, set off from
+        // the buttons by its own rule and tinted with the selected
+        // conversation's provider accent so it reads as *that* agent's gauge.
         // Display only — no hitbox, no cursor stop.
-        if let Some(entries) = usage {
-            let accent = Style::default().fg(provider::accent(&self.state.active_provider));
-            lines.push(usage_line(entries, accent));
+        if let Some(accent) = readout {
+            lines.push(Line::from(Span::styled("─".repeat(width), dim)));
+            lines.push(usage_line(
+                ctx,
+                usage.unwrap_or_default(),
+                Style::default().fg(accent),
+            ));
         }
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -1544,10 +1709,16 @@ impl App {
         self.list_rows = area.height;
         // While the cursor is down in the bottom menu the list drops its
         // highlight, so exactly one row on screen ever reads as selected.
-        self.list_state.select(match self.menu_sel {
+        set_list_highlight(&mut self.list_state, match self.menu_sel {
             Some(_) => None,
             None => Some(self.selected),
         });
+        keep_first_conversation_context_visible(
+            &self.items,
+            self.selected,
+            area.height,
+            &mut self.list_state,
+        );
         let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, area, &mut self.list_state);
     }
@@ -1602,15 +1773,19 @@ impl App {
     }
 }
 
-/// The plan-usage readout: `5h 21% · wk 24% · fable 41%`, one line uniformly
-/// in the provider's accent — a single tone, since mixing dim labels with
-/// brighter percents made the numbers jump out as clutter. Only a limit about
-/// to bite gets a different color: its whole `label percent%` segment turns
-/// yellow from 70% and red from 90%.
-fn usage_line(entries: &[usage::Entry], base: Style) -> Line<'static> {
+/// The plan-usage readout: `ctx 97k · 5h 21% · wk 24% · fable 41%`, one line
+/// uniformly in the provider's accent — a single tone, since mixing dim labels
+/// with brighter percents made the numbers jump out as clutter. Only a limit
+/// about to bite gets a different color: its whole `label percent%` segment
+/// turns yellow from 70% and red from 90%. The leading `ctx` segment is the
+/// selected conversation's current context size, read from its transcript.
+fn usage_line(ctx: Option<u64>, entries: &[usage::Entry], base: Style) -> Line<'static> {
     let mut spans = vec![Span::styled(" ", base)];
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
+    if let Some(tokens) = ctx {
+        spans.push(Span::styled(format!("ctx {}", fmt_tokens(tokens)), base));
+    }
+    for e in entries {
+        if spans.len() > 1 {
             spans.push(Span::styled(" · ", base));
         }
         let style = match e.percent {
@@ -1621,6 +1796,16 @@ fn usage_line(entries: &[usage::Entry], base: Style) -> Line<'static> {
         spans.push(Span::styled(format!("{} {}%", e.label, e.percent), style));
     }
     Line::from(spans)
+}
+
+/// Token counts at readout scale: `412`, `97k`, `133k` — one significant
+/// rounding, no decimals, matching the row's terse `label value` grammar.
+fn fmt_tokens(tokens: u64) -> String {
+    if tokens < 1000 {
+        tokens.to_string()
+    } else {
+        format!("{}k", (tokens + 500) / 1000)
+    }
 }
 
 /// Make ratatui treat every cell as changed on the next draw without emitting
@@ -1670,14 +1855,55 @@ fn worktree_repo(dir: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{force_full_redraw, project_display};
+    use super::{
+        Item, RenderKind, RenderSchedule, RepaintSchedule, force_full_redraw,
+        keep_first_conversation_context_visible, project_display, set_list_highlight,
+    };
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
     use ratatui::layout::{Position, Size};
-    use ratatui::widgets::Paragraph;
+    use ratatui::text::Line;
+    use ratatui::widgets::{List, ListItem, ListState, Paragraph};
     use std::fs;
     use std::io;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn repaint_schedule_cannot_be_accelerated_by_events() {
+        let start = Instant::now();
+        let mut schedule = RepaintSchedule::new(start, Duration::from_millis(100));
+
+        assert!(schedule.take_due(start));
+        for millis in 1..100 {
+            assert!(!schedule.take_due(start + Duration::from_millis(millis)));
+        }
+        assert!(schedule.take_due(start + Duration::from_millis(100)));
+        assert!(!schedule.take_due(start + Duration::from_millis(101)));
+    }
+
+    #[test]
+    fn input_changes_draw_immediately_without_accelerating_full_repair() {
+        let start = Instant::now();
+        let mut schedule = RenderSchedule::new(start, Duration::from_millis(100));
+
+        assert_eq!(schedule.take(start), Some(RenderKind::Full));
+        schedule.mark_dirty();
+        assert_eq!(
+            schedule.take(start + Duration::from_millis(1)),
+            Some(RenderKind::Diff)
+        );
+        schedule.mark_dirty();
+        assert_eq!(
+            schedule.take(start + Duration::from_millis(2)),
+            Some(RenderKind::Diff)
+        );
+        assert_eq!(schedule.take(start + Duration::from_millis(3)), None);
+        assert_eq!(
+            schedule.take(start + Duration::from_millis(100)),
+            Some(RenderKind::Full)
+        );
+    }
 
     struct RecordingBackend {
         inner: TestBackend,
@@ -1757,6 +1983,54 @@ mod tests {
 
         assert_eq!(terminal.backend().draw_counts.last(), Some(&12));
         assert_eq!(terminal.backend().clear_calls, 0);
+    }
+
+    #[test]
+    fn first_conversation_keeps_project_header_and_spacer_visible() {
+        let items = vec![
+            Item::Header("one".into()),
+            Item::Conv(0),
+            Item::Conv(1),
+            Item::Header("two".into()),
+            Item::Conv(2),
+        ];
+        // Reproduce a list that previously scrolled with the selected first
+        // conversation as its first visible item, clipping both header rows.
+        let mut state = ListState::default().with_offset(4).with_selected(Some(4));
+
+        keep_first_conversation_context_visible(&items, 4, 3, &mut state);
+
+        let rendered = vec![
+            ListItem::new(vec![Line::raw(""), Line::raw("one")]),
+            ListItem::new("conversation 0"),
+            ListItem::new("conversation 1"),
+            ListItem::new(vec![Line::raw(""), Line::raw("two")]),
+            ListItem::new("conversation 2"),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_stateful_widget(List::new(rendered), frame.area(), &mut state)
+            })
+            .unwrap();
+
+        assert_eq!(state.offset(), 3);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 1)].symbol(), "t");
+        assert_eq!(buffer[(0, 2)].symbol(), "c");
+    }
+
+    #[test]
+    fn entering_menu_hides_list_highlight_without_resetting_scroll() {
+        let mut state = ListState::default()
+            .with_offset(8)
+            .with_selected(Some(10));
+
+        set_list_highlight(&mut state, None);
+
+        assert_eq!(state.selected(), None);
+        assert_eq!(state.offset(), 8);
     }
 
     /// D8: basename for plain dirs, `{repo}/{worktree}` for git worktrees.

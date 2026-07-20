@@ -95,6 +95,7 @@ Launch with `corc open` (or `Ctrl+q` if you bound it). Inside the TUI:
 | Key | Action |
 |---|---|
 | `j`/`k`, arrows, `g`/`G` | move selection |
+| `}`/`{`, `Ctrl+d`/`Ctrl+u` | next / previous project |
 | `Enter` / click | view the conversation (resumes it if dead) |
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
