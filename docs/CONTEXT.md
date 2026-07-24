@@ -1,21 +1,30 @@
 # corc
 
-A tmux-native hub for Claude Code: one TUI that owns, monitors and switches
-between all Claude Code conversations, so the user never interacts with
-Claude Code outside of it.
+A tmux-native hub for agent CLIs: one TUI that owns, monitors and switches
+between conversations created with Claude Code, Codex, Cursor CLI, and
+OpenCode.
 
 ## Language
 
 **Conversation**:
-A Claude Code session — its jsonl transcript plus, when live, its process and pane.
+A provider-owned agent session — its persisted history plus, when live, its
+process and pane. Every conversation remembers which provider created it.
 _Avoid_: chat, task
 
 **Hidden session** (`_corc-sessions`):
-The single global tmux session where corc keeps every Claude pane it owns; filtered out of the user's session picker (`new.sh`).
+The single global tmux session where corc keeps every agent pane it owns;
+filtered out of the user's session picker (`new.sh`).
 _Avoid_: background session, corc server
 
 **Sidebar**:
 The pane running the corc TUI — a narrow, fixed-width list of conversations grouped by project.
+
+**Status panel**:
+The status-driven panel at the top of the Sidebar containing every **Running**
+and **Unseen** conversation. It duplicates those rows without changing the
+project-grouped conversation list; activating one moves the selection to its
+canonical Sidebar row and views it. `j`/`k` cross panel boundaries and
+`Ctrl+j`/`Ctrl+k` jump directly between panels.
 
 **Project**:
 A directory a conversation runs in, shown by basename only (or `{repo}/{worktree}` for git worktrees, detected via the `.git` file's `gitdir:` pointer).
@@ -28,7 +37,10 @@ Sidebar mode (entered with `V`) where `K`/`J` move the selected project up/down;
 Pressing `1`–`9` switches the client to window N of the selected project's **Real session**, creating the session (with its `.tmux.sh` hook) and the window if missing. Window 1 is the editor window: created running nvim, and an idle shell there gets `nvim` typed into it — but a busy foreground process is never disturbed.
 
 **Directory picker**:
-The `n` overlay: a ratatui-native filter over `directories.txt` expanded with git worktrees (same source and expansion as `new.sh`). Selecting a directory spawns a fresh Claude in a hidden-session window and swaps it in immediately; Esc cancels.
+The `N` overlay: a ratatui-native filter over `directories.txt` expanded with
+git worktrees (same source and expansion as `new.sh`). Selecting a directory
+spawns a fresh conversation with the active provider in a hidden-session
+window and swaps it in immediately; Esc cancels.
 
 **corc session**:
 The visible tmux session named `_corc` where the TUI itself lives (underscore-prefixed so it never clashes with a project session named after a directory). `Ctrl+q` (root-table tmux binding → `corc open`) creates it and starts the TUI if needed, then switches the client there. On quit corc swaps the viewed pane home and removes the content pane it created.
@@ -37,48 +49,72 @@ The visible tmux session named `_corc` where the TUI itself lives (underscore-pr
 The user's normal tmux session for a project (created by `new.sh`, named after the directory) — where nvim etc. live, as opposed to the hidden session.
 
 **Content pane**:
-The pane next to the sidebar where the selected conversation's Claude pane is swapped in (see ADR-0001); holds a placeholder when nothing is selected.
+The pane next to the sidebar where the selected conversation's agent pane is
+swapped in (see ADR-0001); holds a placeholder when nothing is selected.
 
 **State file**:
-corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd) plus per-conversation last-viewed times; what makes dead conversations listable and resumable across tmux/reboots.
+corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, and sticky proof once real content has been observed; what makes dead conversations listable and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
 
 ### Conversation states
 
 **Running** (yellow ●):
-A live pane whose turn is in flight. Shows elapsed time since the turn started (`4m`, `1h12m`).
+A live pane whose agent is working. Claude's animated tmux pane title is the
+live runtime signal; an unrecognized/disabled title falls back to an in-flight
+turn in the provider history. Shows elapsed time since the turn started in one
+largest unit (`4m`, `1h`).
 
 **Unseen** (blue ●):
 A live pane whose turn completed after the user last viewed it. Shows how long the completed turn ran.
 
 **Idle** (gray ●):
-A live pane, turn complete, viewed since completion. The conversation in the content pane counts as continuously viewed — it goes straight to Idle, never Unseen. Shows nothing under 1h, then coarse age (`5h`).
+A live pane whose agent is at its prompt, or whose turn is complete and viewed
+since completion. The conversation in the content pane counts as continuously
+viewed — it goes straight to Idle, never Unseen. Shows coarse age (`<1m`, `5h`).
 
 **Dead** (hollow ○):
-A conversation with no pane; resumable from the state file via `claude --resume <id>`. Shows coarse age (`5h`, `3d`), never finer than hours.
+A conversation with no pane; resumable from the state file via the same
+provider that created it. Shows coarse age (`5h`, `3d`).
 
 Within a project: live conversations above dead ones, most recently active first — but rows only re-sort on a state change, never while the user is looking at an unchanged list. Seconds are never shown anywhere.
 
-_Known limitation_: a Claude blocked on a permission prompt is mid-turn in the jsonl, so it shows as **Running**; distinguishing it needs a Notification hook (deliberately out of scope for now).
+_Known limitation_: a provider blocked on an interactive permission prompt
+can still look mid-turn in its persisted history and therefore show as
+**Running**.
 
 ### Lifecycle
 
-- Claude exits (or crashes) → corc kills the now-shell-only parked window and marks the conversation **Dead** in the state file: still listed, hollow, resumable.
-- `x` on a live conversation kills its Claude and window (`y/n` confirm if **Running**); `x` on a **Dead** one removes it from the state file and the list. The jsonl under `~/.claude` is never touched.
-- **Dead** conversations older than a week are hidden by default; the `a` toggle shows everything.
+- An agent exits (or crashes) → corc kills the now-shell-only parked window
+  and marks the conversation **Dead** in the state file: still listed,
+  hollow, resumable.
+- `x` on a live conversation kills its agent and window (`y/n` confirm if
+  **Running**); `x` on a **Dead** one removes it from the state file and the
+  list. Provider history is never modified or deleted.
+- **Dead** conversations outside the selected history window are hidden. The
+  `a` control cycles through **3h**, **1D**, **3D**, **1W**, and **all time**;
+  **1W** is the default. Live conversations remain visible at every setting.
 
 ## Relationships
 
 - The **Hidden session** holds one tmux window per live **Conversation**.
-- corc spawns every Claude with `claude --session-id <uuid>`, so the pane ↔ conversation mapping is exact bookkeeping, never cwd-based guessing.
+- Pane ↔ conversation mapping is corc bookkeeping. Claude receives a
+  corc-minted id, Cursor pre-creates one, and Codex/OpenCode start with a
+  provisional id that is migrated once the provider persists its real id.
 - A **Project** has at most one **Real session** and any number of **Conversations**.
-- A **Conversation** exists for corc only if corc spawned it. Pre-existing `~/.claude/projects` history and manually started `claude` processes are invisible — there is no process scanning and no adoption.
+- A **Conversation** exists for corc only if corc spawned it. Pre-existing
+  provider history and manually started agent processes are invisible; the
+  narrow pending-id resolution window is only used for a pane corc just
+  spawned.
 - **Projects** keep a fixed, user-managed order: a new project is appended when its first conversation is spawned, and the user rearranges via **Move mode**. The order never changes on its own.
 
 ## Example dialogue
 
-> **Dev:** "The user pressed Enter on a conversation with no live pane — do I search for a matching claude process?"
-> **Domain expert:** "No. If corc didn't spawn it, there is no pane. Spawn `claude --resume <id> --session-id` in a new hidden-session window and record the pane id."
+> **Dev:** "The user pressed Enter on a conversation with no live pane — do I
+> search for a matching agent process?"
+> **Domain expert:** "No. Resume the recorded conversation with its provider
+> in a new hidden-session window and record the new pane id."
 
 ## Flagged ambiguities
 
-- "session" was overloaded (tmux session vs Claude Code session) — resolved: **Conversation** means the Claude Code session; "session" alone always means a tmux session.
+- "session" is overloaded (tmux session vs provider session) — resolved:
+  **Conversation** means the provider-owned agent session; "session" alone
+  always means a tmux session.

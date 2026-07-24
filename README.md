@@ -1,10 +1,9 @@
 # corc
 
-A tmux-native hub for Claude Code: one TUI that owns, monitors, and switches
-between all your Claude Code conversations, so you never have to interact with
-Claude Code outside of it.
+A tmux-native hub for agent CLIs: one TUI that owns, monitors, and switches
+between your Claude Code, Codex, Cursor CLI, and OpenCode conversations.
 
-corc keeps every Claude pane in a single hidden tmux session and shows a
+corc keeps every agent pane in a single hidden tmux session and shows a
 sidebar of conversations grouped by project. Selecting one swaps its live pane
 into view; conversations you've spawned stay listed and resumable even after
 they exit or you reboot.
@@ -22,6 +21,9 @@ they exit or you reboot.
     with `codex resume <uuid>`. Codex only reveals its session id once the
     first message is sent, so a brand-new conversation shows as untitled
     until then.
+  - **OpenCode** (`opencode`, optional) — corc spawns plain `opencode` and
+    resumes with `opencode --session <id>`. OpenCode creates its session when
+    the first prompt is sent, after which corc adopts its `ses_...` id.
   - Switch which one new conversations use with `s` (see below).
 - **git** (optional) — only used to detect git worktrees for the project
   labels and the directory picker.
@@ -95,25 +97,41 @@ Launch with `corc open` (or `Ctrl+q` if you bound it). Inside the TUI:
 | Key | Action |
 |---|---|
 | `j`/`k`, arrows, `g`/`G` | move selection |
+| `Ctrl+j`/`Ctrl+k` | next / previous panel |
 | `}`/`{`, `Ctrl+d`/`Ctrl+u` | next / previous project |
 | `Enter` / click | view the conversation (resumes it if dead) |
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
 | `p` | add a machine-local directory (Tab-complete) → new conversation there |
-| `s` | switch which agent (Claude / Cursor) new conversations use |
+| `s` | switch which agent new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `Alt+1`–`Alt+9` | jump to window N of the project's normal tmux session |
-| `a` | also show dead conversations older than a week |
+| `a` | cycle visible history: `3h` / `1D` / `3D` / `1W` / `all time` |
 | `/` | filter the list |
+
+The history window applies to dead conversations; live conversations always
+remain visible. It starts at `1W` each time corc launches.
+
+Running (yellow) and unseen (blue) conversations are also collected in an
+unlabelled status panel at the top. `j`/`k` cross into adjacent panels at their
+boundaries, while `Ctrl+j`/`Ctrl+k` jump directly between panels. Selecting an
+status row opens it and moves the selection to its normal project-grouped
+row in the sidebar.
+
+On Linux this also works with stock `vim-tmux-navigator` configuration. corc
+identifies its sidebar process as `corc/view`, consumes `Ctrl+j`/`Ctrl+k` while
+there is another internal panel in that direction, and hands `Ctrl+h/j/k/l`
+back to tmux at an outer edge.
 
 Each conversation remembers which agent spawned it, so `Enter` resumes a dead
 one with the same CLI. The `s` picker only changes the agent used for
 conversations you start afterwards; it's persisted, so the choice survives
-restarts. Cursor conversations show their chat title in the sidebar once the
-first message has been sent (read from Cursor's local chat store); before that,
-and if the title can't be read, they show `(untitled)`. Cursor's local message
-store also drives the same Running, Unseen, Idle, and Dead states as Claude.
+restarts. Provider metadata is read from each CLI's local, read-only history:
+Claude and Codex JSONL transcripts, Cursor's chat stores, and OpenCode's SQLite
+database. This drives titles, context size, and the same Running, Unseen, Idle,
+and Dead states across providers. An untouched Codex or OpenCode conversation
+stays `(untitled)` until the CLI creates its real session on the first prompt.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`
@@ -129,7 +147,7 @@ still exits if you need a hard escape hatch.
 
 ## How it works
 
-corc keeps all Claude panes in a hidden tmux session (`_corc-sessions`), one
+corc keeps all agent panes in a hidden tmux session (`_corc-sessions`), one
 window per conversation. The TUI lives in its own visible session (`_corc`) and
 swaps the selected conversation's pane into a content pane next to the sidebar —
 nothing is destroyed when you switch between conversations. State (which

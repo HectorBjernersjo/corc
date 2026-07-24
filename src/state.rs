@@ -29,6 +29,12 @@ pub struct Conversation {
     /// its elapsed time after corc restarts. Cleared when the turn completes.
     #[serde(default)]
     pub turn_started_at: Option<u64>,
+    /// Sticky proof that this conversation has contained a real exchange.
+    /// Provider metadata can temporarily disappear or lose its title; once
+    /// content has been observed, the empty-conversation cleanup must never
+    /// mistake that uncertainty for an untouched conversation.
+    #[serde(default)]
+    pub content_seen: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -177,6 +183,7 @@ impl State {
             created_at: now,
             provider,
             turn_started_at: None,
+            content_seen: false,
         });
     }
 }
@@ -225,7 +232,7 @@ mod tests {
     use super::Conversation;
 
     #[test]
-    fn old_conversation_state_defaults_missing_turn_start() {
+    fn old_conversation_state_defaults_new_persisted_metadata() {
         let conversation: Conversation = serde_json::from_str(
             r#"{
                 "id":"chat",
@@ -238,5 +245,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(conversation.turn_started_at, None);
+        assert!(!conversation.content_seen);
     }
 }

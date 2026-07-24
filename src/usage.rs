@@ -1,7 +1,8 @@
 //! Plan-usage readout for the sidebar menu, shown as a dim row under the
 //! provider-switch button: percent used per limit (e.g. Claude's 5h session,
 //! weekly, and model-scoped weekly limits). Each provider supplies its own
-//! numbers through `Provider::fetch_usage`; only Claude implements it so far.
+//! numbers through `Provider::fetch_usage`; providers without one simply omit
+//! the plan-limit entries.
 //!
 //! Fetches run on their own thread (network must never stall the 10 Hz draw
 //! loop). A failed fetch keeps a provider's last good snapshot rather than

@@ -51,13 +51,19 @@ pub struct Meta {
     /// Unix seconds of the end_turn / turn_duration record that finished
     /// that turn; `None` while the turn is in flight (D7).
     pub turn_completed_at: Option<u64>,
+    /// Unix seconds of the latest record that genuinely advanced the current
+    /// turn: a prompt, assistant response, tool result, or completion. Unlike
+    /// the jsonl mtime this ignores background title/checkpoint writes, so it
+    /// can safely be used to detect an abandoned in-flight turn.
+    pub turn_progress_at: Option<u64>,
     /// Tokens currently in the conversation's context window, from the most
     /// recent API usage the transcript records (Claude: the last assistant
     /// record's `message.usage`; Codex: `token_count` events). Drops after a
     /// compaction just like the real window. None for providers whose
     /// transcripts carry no usage (Cursor).
     pub context_tokens: Option<u64>,
-    /// mtime of the jsonl — coarse "last activity" timestamp.
+    /// mtime of the jsonl — coarse filesystem activity, including background
+    /// writes that do not advance a turn.
     pub mtime: SystemTime,
 }
 
@@ -105,6 +111,7 @@ impl Default for Meta {
             turn_state: TurnState::Unknown,
             turn_started_at: None,
             turn_completed_at: None,
+            turn_progress_at: None,
             context_tokens: None,
             mtime: SystemTime::UNIX_EPOCH,
         }
@@ -269,6 +276,9 @@ fn apply(meta: &mut Meta, v: &Value) {
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
             meta.has_content = true;
+            if let Some(ts) = record_timestamp(v) {
+                meta.turn_progress_at = Some(ts);
+            }
             // A Ctrl+C interrupt is written as a user record too, but it ends
             // the turn — it never produces an end_turn / turn_duration record,
             // so if we let it fall through as a prompt the state would stay
@@ -295,6 +305,9 @@ fn apply(meta: &mut Meta, v: &Value) {
         }
         Some("assistant") if !sidechain => {
             meta.has_content = true;
+            if let Some(ts) = record_timestamp(v) {
+                meta.turn_progress_at = Some(ts);
+            }
             if let Some(tokens) = context_tokens(v) {
                 meta.context_tokens = Some(tokens);
             }
@@ -310,6 +323,7 @@ fn apply(meta: &mut Meta, v: &Value) {
             meta.turn_state = TurnState::Complete;
             if let Some(ts) = record_timestamp(v) {
                 meta.turn_completed_at = Some(ts);
+                meta.turn_progress_at = Some(ts);
             }
         }
         Some("ai-title") => {
@@ -518,6 +532,7 @@ mod tests {
         let start = parse_iso8601("2026-07-08T10:01:00Z");
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, start);
+        assert_eq!(meta.turn_progress_at, start);
         assert_eq!(meta.turn_completed_at, None);
         assert!(meta.has_content);
 
@@ -534,6 +549,10 @@ mod tests {
         );
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, start);
+        assert_eq!(
+            meta.turn_progress_at,
+            parse_iso8601("2026-07-08T10:03:00Z")
+        );
 
         // The turn_duration record completes the turn.
         apply(
@@ -547,6 +566,7 @@ mod tests {
             meta.turn_completed_at,
             parse_iso8601("2026-07-08T10:05:00Z")
         );
+        assert_eq!(meta.turn_progress_at, meta.turn_completed_at);
 
         // Sidechain traffic is invisible to turn state.
         apply(
@@ -555,6 +575,22 @@ mod tests {
                     "timestamp":"2026-07-08T10:06:00Z"}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
+        assert_eq!(
+            meta.turn_progress_at,
+            parse_iso8601("2026-07-08T10:05:00Z")
+        );
+
+        // Claude's background records can touch the jsonl but are not turn
+        // progress and must not extend the Running timeout.
+        apply(
+            &mut meta,
+            &json!({"type":"system","subtype":"away_summary",
+                    "timestamp":"2026-07-08T10:07:00Z"}),
+        );
+        assert_eq!(
+            meta.turn_progress_at,
+            parse_iso8601("2026-07-08T10:05:00Z")
+        );
 
         // The next prompt starts a fresh turn.
         apply(
@@ -565,6 +601,7 @@ mod tests {
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, parse_iso8601("2026-07-08T10:10:00Z"));
         assert_eq!(meta.turn_completed_at, None);
+        assert_eq!(meta.turn_progress_at, meta.turn_started_at);
     }
 
     #[test]

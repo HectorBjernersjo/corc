@@ -6,8 +6,10 @@
 mod claude;
 mod codex;
 mod cursor;
+mod opencode;
 
 use crate::discovery::{Meta, MetaSource};
+use crate::status::RuntimeHint;
 use anyhow::Result;
 use ratatui::style::Color;
 use std::collections::HashMap;
@@ -16,24 +18,30 @@ use std::time::SystemTime;
 
 /// Everything corc needs to know about one agent CLI.
 pub trait Provider: Send + Sync {
-    /// Stable id persisted in `state.json` (`"claude"`, `"cursor"`). Never
+    /// Stable id persisted in `state.json` (`"claude"`, `"opencode"`, ...). Never
     /// change an existing one — old state files resolve by it.
     fn id(&self) -> &'static str;
     /// Human label shown in the switch picker.
     fn display_name(&self) -> &'static str;
-    /// Binary to resolve on the login shell's PATH (`claude`,
-    /// `cursor-agent`).
+    /// Binary to resolve on the login shell's PATH (`claude`, `opencode`, ...).
     fn binary(&self) -> &'static str;
 
-    /// Mint the id for a fresh conversation. Claude generates a uuid corc
-    /// then passes to `--session-id`; Cursor can't be told an id, so this
-    /// runs `create-chat` and returns the id it hands back.
+    /// Mint the id for a fresh conversation. Some providers accept a
+    /// corc-generated id, some return their own, and others start with a
+    /// provisional id that `resolve_spawned_id` later replaces.
     fn new_session_id(&self, dir: &Path) -> Result<String>;
 
     /// Arguments after the resolved binary to run in the conversation's pane.
     /// `resume` distinguishes reviving a Dead conversation from starting the
     /// freshly minted one.
     fn spawn_args(&self, id: &str, resume: bool) -> Vec<String>;
+
+    /// Interpret a live pane title as a high-confidence working/idle signal.
+    /// None means the title is unknown or the provider exposes no stable-enough
+    /// convention, so status falls back to transcript metadata.
+    fn runtime_hint(&self, _pane_title: &str) -> Option<RuntimeHint> {
+        None
+    }
 
     /// Whether `id` is still the provisional id from `new_session_id`,
     /// awaiting the agent's real one. Always false for agents whose ids are
@@ -43,9 +51,8 @@ pub trait Provider: Send + Sync {
     }
 
     /// Discover the real id of a spawned conversation, for agents that mint
-    /// their own id and never hand it back (Codex writes it only into its
-    /// rollout file — and writes that file only once the first message is
-    /// sent, so this cannot be answered right after spawn). corc spawns the
+    /// their own id and never hand it back immediately (Codex/OpenCode only
+    /// persist it once the first message is sent). corc spawns the
     /// pane under the provisional id from `new_session_id` and retries this
     /// on every refresh while `is_pending`: find the agent's on-disk session
     /// created in `dir` at/after `since` and adopt its id (corc then renames
@@ -53,8 +60,8 @@ pub trait Provider: Send + Sync {
     /// conversations already claimed — without it, two pending conversations
     /// in the same directory would both resolve to the same session and one
     /// could never advance to its own. `Ok(None)` means "not discoverable
-    /// yet" — for Codex, that the user simply hasn't sent a message; until
-    /// they do the conversation reads as empty and is subject to the usual
+    /// yet" — usually that the user simply hasn't sent a message; until they
+    /// do the conversation reads as empty and is subject to the usual
     /// empty-discard on leave (D17).
     fn resolve_spawned_id(
         &self,
@@ -81,7 +88,8 @@ pub trait Provider: Send + Sync {
 static CLAUDE: claude::Claude = claude::Claude;
 static CODEX: codex::Codex = codex::Codex;
 static CURSOR: cursor::Cursor = cursor::Cursor;
-static ALL: [&dyn Provider; 3] = [&CLAUDE, &CODEX, &CURSOR];
+static OPENCODE: opencode::OpenCode = opencode::OpenCode;
+static ALL: [&dyn Provider; 4] = [&CLAUDE, &CODEX, &CURSOR, &OPENCODE];
 
 /// The default provider id, used for state files predating multi-provider
 /// support and as the fallback for an unknown id.

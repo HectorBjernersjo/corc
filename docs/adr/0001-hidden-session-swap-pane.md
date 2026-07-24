@@ -1,10 +1,10 @@
-# Claude panes live in one hidden session and are viewed via swap-pane
+# Agent panes live in one hidden session and are viewed via swap-pane
 
-corc owns every Claude Code process it shows. All Claude panes are parked in a
-single hidden tmux session (`_corc-sessions`, one window per conversation, spawned with
-`claude --session-id <uuid>` so pane ↔ conversation mapping is exact
-bookkeeping). Viewing a conversation swaps its pane with the content pane next
-to the sidebar using `swap-pane` — never `join-pane`.
+corc owns every agent CLI process it shows. All agent panes are parked in a
+single hidden tmux session (`_corc-sessions`, one window per conversation).
+The provider-specific id is recorded with the pane, so pane ↔ conversation
+mapping remains exact bookkeeping. Viewing a conversation swaps its pane with
+the content pane next to the sidebar using `swap-pane` — never `join-pane`.
 
 ## Considered Options
 
@@ -23,7 +23,7 @@ to the sidebar using `swap-pane` — never `join-pane`.
 - `swap-pane` never destroys anything — both windows always keep one pane — so
   there is no unembed logic and the sidebar layout is set once and never
   disturbed.
-- If corc crashes mid-view, the Claude pane survives in corc's old window;
-  on startup corc reconciles by swapping stray Claude panes back into
+- If corc crashes mid-view, the agent pane survives in corc's old window;
+  on startup corc reconciles by swapping stray agent panes back into
   `_corc-sessions`.
 - `new.sh` must be patched to filter out the `_corc-sessions` session.

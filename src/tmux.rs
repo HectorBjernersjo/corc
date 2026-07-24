@@ -1,13 +1,13 @@
 //! tmux plumbing for the hidden-session / swap-pane topology (ADR-0001).
 //!
-//! All Claude panes live in the hidden session `_corc-sessions`, one window per
+//! All agent panes live in the hidden session `_corc-sessions`, one window per
 //! conversation, window name = conversation uuid. Viewing swaps a Claude
 //! pane with the placeholder in the content pane slot; parking swaps it
 //! back. Nothing is ever destroyed by a view/park.
 
 use crate::provider::Provider;
 use anyhow::{Context, Result, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -21,6 +21,10 @@ macro_rules! app_name {
     };
 }
 pub const APP_NAME: &str = app_name!();
+/// Linux process name that matches vim-tmux-navigator's stock Vim pattern.
+/// The pattern accepts any prefix before `/view`, so corc receives C-hjkl and
+/// can use them internally before handing edge navigation back to tmux.
+pub const NAVIGATOR_PROCESS_NAME: &str = concat!(app_name!(), "/view");
 pub const HIDDEN_SESSION: &str = concat!("_", app_name!(), "-sessions");
 /// The visible session the TUI lives in (D15). Prefixed with `_` so it never
 /// clashes with a project session named after a directory.
@@ -114,7 +118,7 @@ pub fn ensure_tui_session(exe: &str) -> Result<()> {
         let pane = parts.next()?;
         let window = parts.next()?;
         let cmd = parts.next()?;
-        (pane != self_pane && cmd == tui_name).then(|| window.to_string())
+        (pane != self_pane && is_tui_command(cmd, &tui_name)).then(|| window.to_string())
     });
     match tui_window {
         Some(window) => {
@@ -125,6 +129,47 @@ pub fn ensure_tui_session(exe: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_tui_command(command: &str, binary_name: &str) -> bool {
+    command == binary_name || command == NAVIGATOR_PROCESS_NAME
+}
+
+#[derive(Clone, Copy)]
+pub enum PaneDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+impl PaneDirection {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Left => "-L",
+            Self::Down => "-D",
+            Self::Up => "-U",
+            Self::Right => "-R",
+        }
+    }
+}
+
+/// Hand a Ctrl+h/j/k/l edge movement back to the surrounding tmux layout,
+/// matching vim-tmux-navigator's behavior inside Vim. Fire-and-reap in the
+/// background so navigation never stalls the TUI event loop.
+pub fn select_adjacent_pane(direction: PaneDirection) {
+    let Ok(mut child) = Command::new("tmux")
+        .args(["select-pane", direction.flag()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn kill_stub() {
@@ -278,6 +323,38 @@ mod tests {
         assert!(AGENT_SHELL_COMMAND.contains("exec direnv exec . \"$@\""));
         assert!(AGENT_SHELL_COMMAND.contains("else exec \"$@\""));
     }
+
+    #[test]
+    fn pane_snapshot_keeps_ids_and_terminal_titles() {
+        let panes = parse_panes(
+            "%32\t✳ Review backup restore plan status\n\
+             %43\t⠂ platform-restore-cleanup-runbook\n",
+        );
+
+        assert_eq!(
+            panes.get("%32").map(String::as_str),
+            Some("✳ Review backup restore plan status")
+        );
+        assert_eq!(
+            panes.get("%43").map(String::as_str),
+            Some("⠂ platform-restore-cleanup-runbook")
+        );
+    }
+
+    #[test]
+    fn tui_detection_accepts_binary_and_navigator_process_names() {
+        assert!(is_tui_command("corc", "corc"));
+        assert!(is_tui_command(NAVIGATOR_PROCESS_NAME, "corc"));
+        assert!(!is_tui_command("bash", "corc"));
+    }
+
+    #[test]
+    fn vim_navigation_directions_map_to_tmux_flags() {
+        assert_eq!(PaneDirection::Left.flag(), "-L");
+        assert_eq!(PaneDirection::Down.flag(), "-D");
+        assert_eq!(PaneDirection::Up.flag(), "-U");
+        assert_eq!(PaneDirection::Right.flag(), "-R");
+    }
 }
 
 /// Split corc's own window: sidebar (this pane) fixed at 40 columns on the
@@ -329,14 +406,26 @@ pub fn pane_exists(pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Snapshot every pane currently known to tmux. Callers checking several
-/// panes should use this once and perform membership tests in memory instead
-/// of spawning one `tmux list-panes` process per pane.
-pub fn all_pane_ids() -> Result<HashSet<String>> {
-    Ok(tmux(&["list-panes", "-a", "-F", "#{pane_id}"])?
-        .lines()
-        .map(str::to_string)
-        .collect())
+/// Snapshot every pane currently known to tmux, including the terminal title
+/// set by the process inside it. Callers use one snapshot for both liveness and
+/// provider-specific runtime hints instead of spawning per-pane tmux queries.
+pub fn all_panes() -> Result<HashMap<String, String>> {
+    Ok(parse_panes(&tmux(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}",
+    ])?))
+}
+
+fn parse_panes(output: &str) -> HashMap<String, String> {
+    output
+    .lines()
+    .filter_map(|line| {
+        let (id, title) = line.split_once('\t')?;
+        Some((id.to_string(), title.to_string()))
+    })
+    .collect()
 }
 
 /// Which session a pane currently lives in.
@@ -373,7 +462,7 @@ fn hidden_window_exists(name: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Park a Claude pane stranded outside `_corc-sessions` (corc crashed mid-view,
+/// Park an agent pane stranded outside `_corc-sessions` (corc crashed mid-view,
 /// D16) back into a hidden window named by its conversation uuid.
 pub fn park_stray(pane_id: &str, id: &str) -> Result<()> {
     ensure_hidden_session()?;
@@ -404,8 +493,8 @@ pub fn kill_hidden_window(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rename a conversation's hidden window when its id changes (a pending
-/// Codex id resolving to the real session id). Renaming goes by name, so it
+/// Rename a conversation's hidden window when its provisional provider id
+/// resolves to the real session id. Renaming goes by name, so it
 /// works whether the window currently holds the agent pane or — while the
 /// conversation is viewed — the swapped-out placeholder.
 pub fn rename_hidden_window(old: &str, new: &str) -> Result<()> {

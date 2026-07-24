@@ -1,6 +1,6 @@
 //! The sidebar TUI. corc's pane is the sidebar (40 columns, left); the
 //! content pane to its right holds either a plain-shell placeholder or the
-//! currently viewed conversation's Claude pane, swapped in from the hidden
+//! currently viewed conversation's agent pane, swapped in from the hidden
 //! session (ADR-0001).
 
 use crate::provider::{self, MetaStore};
@@ -11,11 +11,13 @@ use anyhow::{Context, Result};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,6 +31,42 @@ enum Item {
     Header(String),
     /// Index into `state.conversations`.
     Conv(usize),
+}
+
+/// The three vertically stacked keyboard-navigation regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Panel {
+    Attention,
+    Conversations,
+    Menu,
+}
+
+/// Ctrl+j/k moves one whole region at a time, skipping regions that currently
+/// have no selectable rows and clamping at the first/last available region.
+fn adjacent_panel(current: Panel, dir: i64, has_attention: bool, has_conversations: bool) -> Panel {
+    let mut panels = Vec::with_capacity(3);
+    if has_attention {
+        panels.push(Panel::Attention);
+    }
+    if has_conversations {
+        panels.push(Panel::Conversations);
+    }
+    panels.push(Panel::Menu);
+    let current = panels.iter().position(|p| *p == current).unwrap_or(0);
+    panels[(current as i64 + dir).clamp(0, panels.len() as i64 - 1) as usize]
+}
+
+/// Give attention enough rows for its rule plus content while keeping at
+/// least one row for the canonical conversation list. On extremely short
+/// terminals there is no useful two-row panel, so it yields the space.
+fn attention_panel_height(count: usize, content_height: u16) -> u16 {
+    if count == 0 || content_height < 3 {
+        return 0;
+    }
+    let max = (content_height / 2)
+        .max(2)
+        .min(content_height.saturating_sub(1));
+    (count as u16 + 1).min(max)
 }
 
 /// When the cursor lands on a project's first conversation, keep that
@@ -73,23 +111,68 @@ type MenuHit = (u16, std::ops::Range<u16>, MenuAction);
 enum MenuAction {
     /// The `N` directory picker.
     New,
-    /// The `a` show-hidden toggle.
-    ToggleHidden,
+    /// The `a` history-window cycle.
+    CycleHistory,
     /// The `s` provider switch.
     SwitchProvider,
     /// The `?` shortcuts cheat-sheet popup.
     Shortcuts,
 }
 
-/// Dead conversations older than this are hidden unless `a` is on (D12).
-const HIDE_DEAD_AFTER_SECS: u64 = 7 * 24 * 3600;
+/// How far back Dead conversations remain visible. Live conversations are
+/// always shown, regardless of their age. `a` cycles through these in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryWindow {
+    ThreeHours,
+    OneDay,
+    ThreeDays,
+    OneWeek,
+    AllTime,
+}
+
+impl HistoryWindow {
+    fn next(self) -> Self {
+        match self {
+            Self::ThreeHours => Self::OneDay,
+            Self::OneDay => Self::ThreeDays,
+            Self::ThreeDays => Self::OneWeek,
+            Self::OneWeek => Self::AllTime,
+            Self::AllTime => Self::ThreeHours,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ThreeHours => "3h",
+            Self::OneDay => "1D",
+            Self::ThreeDays => "3D",
+            Self::OneWeek => "1W",
+            Self::AllTime => "all time",
+        }
+    }
+
+    fn cutoff_secs(self) -> Option<u64> {
+        match self {
+            Self::ThreeHours => Some(3 * 3600),
+            Self::OneDay => Some(24 * 3600),
+            Self::ThreeDays => Some(3 * 24 * 3600),
+            Self::OneWeek => Some(7 * 24 * 3600),
+            Self::AllTime => None,
+        }
+    }
+
+    fn hides(self, status: Option<&Status>, age_secs: u64) -> bool {
+        status == Some(&Status::Dead) && self.cutoff_secs().is_some_and(|cutoff| age_secs > cutoff)
+    }
+}
+
 /// Grace period before an empty conversation the user left is discarded
 /// (D17). A message sent an instant before leaving can still be flushing to
 /// disk — Cursor lags noticeably — so we wait and re-check emptiness rather
 /// than discarding on the spot.
 const DISCARD_GRACE: Duration = Duration::from_secs(30);
 /// Most recent conversations shown per project before the rest are hidden
-/// (D13) — the `a` toggle reveals them. Keeps each project's list short.
+/// (D13) — the all-time window reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
 /// How often corc force-repaints its whole pane, and the input poll timeout.
 /// corc gets no event when an *adjacent* pane scrolls — which is exactly what
@@ -208,6 +291,11 @@ struct App {
     placeholder_pane: String,
     /// Conversation currently swapped into the content slot.
     viewed: Option<String>,
+    /// Flat, status-driven panel above the project-grouped sidebar: indices
+    /// into `state.conversations` whose status is Running or Unseen.
+    attention: Vec<usize>,
+    /// When Some, the cursor is in the attention panel at this row.
+    attention_sel: Option<usize>,
     items: Vec<Item>,
     selected: usize,
     /// When Some, the j/k cursor sits on this bottom-menu row instead of the
@@ -221,9 +309,9 @@ struct App {
     /// Conversation id awaiting the `y/n` kill confirmation (`x` on a
     /// Running conversation, D12).
     pending_kill: Option<String>,
-    /// `a` toggle: also show Dead conversations older than a week (D12).
-    show_all: bool,
-    /// How many week-old Dead conversations the current list is hiding.
+    /// `a` cycles how far back Dead conversations remain visible (D12).
+    history_window: HistoryWindow,
+    /// How many conversations the current history window/list cap is hiding.
     hidden: usize,
     /// The `s` provider-switch overlay, when open. The `N` directory picker
     /// (which now folds in the add-directory prompt) is no longer an inline
@@ -237,9 +325,11 @@ struct App {
     /// Persistent list state so the scroll offset survives between frames —
     /// what lets a mouse click map back to the item under the pointer (D11).
     list_state: ListState,
-    /// Rows of list *content* on screen (below the title, above the footer),
-    /// for bounds-checking mouse clicks.
-    list_rows: u16,
+    /// Independent scroll state for the attention panel.
+    attention_state: ListState,
+    /// Current on-screen list rectangles, used to translate mouse clicks.
+    list_area: Rect,
+    attention_area: Rect,
     status_msg: Option<String>,
     last_refresh: Instant,
     /// On-screen hitboxes of the bottom menu buttons, rebuilt every draw so a
@@ -253,6 +343,12 @@ struct App {
 pub fn run() -> Result<()> {
     let sidebar_pane =
         std::env::var("TMUX_PANE").map_err(|_| anyhow::anyhow!("corc must run inside tmux"))?;
+
+    // vim-tmux-navigator only sends C-hjkl into processes matching its Vim
+    // pattern. Like quim, use the pattern's accepted "<prefix>/view" form;
+    // corc consumes internal panel moves and hands edge moves back to tmux.
+    #[cfg(target_os = "linux")]
+    let _ = std::fs::write("/proc/self/comm", tmux::NAVIGATOR_PROCESS_NAME);
 
     // Resolve the active provider's binary once now, so the login-shell lookup
     // cost lands at startup rather than on the first conversation spawn.
@@ -276,6 +372,8 @@ pub fn run() -> Result<()> {
         sidebar_pane,
         placeholder_pane,
         viewed: None,
+        attention: Vec::new(),
+        attention_sel: None,
         items: Vec::new(),
         selected: 0,
         menu_sel: None,
@@ -283,13 +381,15 @@ pub fn run() -> Result<()> {
         filter: String::new(),
         filter_input: false,
         pending_kill: None,
-        show_all: false,
+        history_window: HistoryWindow::OneWeek,
         hidden: 0,
         provider_picker: None,
         move_mode: false,
         pending_discard: Vec::new(),
         list_state: ListState::default(),
-        list_rows: 0,
+        attention_state: ListState::default(),
+        list_area: Rect::default(),
+        attention_area: Rect::default(),
         status_msg: None,
         last_refresh: Instant::now(),
         menu_hitboxes: Vec::new(),
@@ -301,6 +401,13 @@ pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
+    if keyboard_enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
     let result = app.event_loop(&mut terminal);
@@ -318,6 +425,9 @@ pub fn run() -> Result<()> {
     tmux::restore_window_bindings();
     let _ = app.state.save();
 
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -465,6 +575,22 @@ impl App {
         // Ctrl+d / Ctrl+u: hop one project group down / up (feature request).
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
+                KeyCode::Char('h') => {
+                    tmux::select_adjacent_pane(tmux::PaneDirection::Left);
+                }
+                KeyCode::Char('j') => {
+                    if !self.focus_panel(1) {
+                        tmux::select_adjacent_pane(tmux::PaneDirection::Down);
+                    }
+                }
+                KeyCode::Char('k') => {
+                    if !self.focus_panel(-1) {
+                        tmux::select_adjacent_pane(tmux::PaneDirection::Up);
+                    }
+                }
+                KeyCode::Char('l') => {
+                    tmux::select_adjacent_pane(tmux::PaneDirection::Right);
+                }
                 KeyCode::Char('d') => self.jump_project(1),
                 KeyCode::Char('u') => self.jump_project(-1),
                 _ => {}
@@ -501,25 +627,32 @@ impl App {
                 self.filter_input = true;
             }
             KeyCode::Esc if self.menu_sel.is_some() => self.menu_sel = None,
+            KeyCode::Esc if self.attention_sel.is_some() => self.attention_sel = None,
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.rebuild_items();
             }
-            KeyCode::Enter => match self.menu_sel {
-                Some(i) => {
+            KeyCode::Enter => {
+                if self.attention_sel.is_some() {
+                    self.open_attention_selected();
+                } else if let Some(i) = self.menu_sel {
                     if let Some((action, ..)) = self.menu_entries().into_iter().nth(i) {
                         self.activate_menu(action);
                     }
+                } else {
+                    self.view_selected();
                 }
-                None => self.view_selected(),
-            },
+            }
             KeyCode::Char('n') => self.new_conversation_here(),
             KeyCode::Char('N') => self.open_picker(),
             KeyCode::Char('s') => self.open_provider_picker(),
             KeyCode::Char('x') => self.kill_or_remove(),
-            KeyCode::Char('V') => self.move_mode = true,
+            KeyCode::Char('V') => {
+                self.focus_attention_in_list();
+                self.move_mode = true;
+            }
             KeyCode::Char('a') => {
-                self.show_all = !self.show_all;
+                self.history_window = self.history_window.next();
                 self.rebuild_keeping_selection();
             }
             KeyCode::Char('r') => self.refresh(),
@@ -561,8 +694,8 @@ impl App {
             return;
         }
         match mouse.kind {
-            MouseEventKind::ScrollDown => self.select_next(1),
-            MouseEventKind::ScrollUp => self.select_next(-1),
+            MouseEventKind::ScrollDown => self.nav(1),
+            MouseEventKind::ScrollUp => self.nav(-1),
             MouseEventKind::Down(MouseButton::Left) => {
                 // A click on a bottom-menu button fires its action; the menu
                 // sits below the list, so this is checked before the row math.
@@ -570,14 +703,23 @@ impl App {
                     self.activate_menu(action);
                     return;
                 }
-                // Rows map to items through the list's persistent scroll
-                // offset.
-                if mouse.row >= self.list_rows {
-                    return; // footer / below the list
+                if contains(self.attention_area, mouse.column, mouse.row) {
+                    let visible_row = mouse.row.saturating_sub(self.attention_area.y) as usize;
+                    let pos = self.attention_state.offset() + visible_row;
+                    if pos < self.attention.len() {
+                        self.attention_sel = Some(pos);
+                        self.menu_sel = None;
+                        self.open_attention_selected();
+                    }
+                    return;
                 }
-                if let Some(idx) = self.item_at_row(mouse.row)
+                // Rows map to items through the main list's persistent scroll
+                // offset. Its y origin is below the attention panel.
+                if contains(self.list_area, mouse.column, mouse.row)
+                    && let Some(idx) = self.item_at_row(mouse.row.saturating_sub(self.list_area.y))
                     && matches!(self.items.get(idx), Some(Item::Conv(_)))
                 {
+                    self.attention_sel = None;
                     self.menu_sel = None;
                     self.selected = idx;
                     self.view_selected();
@@ -611,7 +753,7 @@ impl App {
         // Take one tmux snapshot for every liveness check in this refresh.
         // Spawning `tmux list-panes` once per live conversation blocked input
         // for a noticeable fraction of a second on larger lists.
-        let panes = match tmux::all_pane_ids() {
+        let panes = match tmux::all_panes() {
             Ok(panes) => Some(panes),
             Err(e) => {
                 self.status_msg = Some(e.to_string());
@@ -626,7 +768,7 @@ impl App {
         if let Some(panes) = &panes {
             for conv in &mut self.state.conversations {
                 if let Some(pane_id) = &conv.pane_id
-                    && !panes.contains(pane_id)
+                    && !panes.contains_key(pane_id)
                 {
                     conv.pane_id = None;
                     dirty = true;
@@ -651,7 +793,7 @@ impl App {
         } else if self.viewed.is_none()
             && panes
                 .as_ref()
-                .is_some_and(|panes| !panes.contains(&self.placeholder_pane))
+                .is_some_and(|panes| !panes.contains_key(&self.placeholder_pane))
         {
             // Someone closed the placeholder shell; put it back.
             if let Ok(pane) = tmux::split_content_pane(&self.sidebar_pane) {
@@ -659,7 +801,7 @@ impl App {
             }
         }
 
-        // A pending Codex id that can now be resolved migrates to the real
+        // A pending provider id that can now be resolved migrates to the real
         // session id — state row, hidden window and viewed pointer together —
         // before the metadata refresh, so meta starts flowing under the new
         // key in the same tick.
@@ -672,13 +814,18 @@ impl App {
             self.status_msg = Some(e.to_string());
         }
 
-        // Keep only an in-flight turn start in state.json. Cursor's local
-        // transcript normally supplies the exact prompt time; persisting it
-        // here preserves the elapsed clock if corc restarts before completion.
+        // Persist the metadata that must survive a temporarily unavailable
+        // provider store. The turn start preserves an elapsed clock across a
+        // restart; content_seen is sticky proof that a title-less conversation
+        // is real and must never be removed by empty-conversation cleanup.
         for conv in &mut self.state.conversations {
             let Some(meta) = self.metas.meta(&conv.id) else {
                 continue;
             };
+            if meta.has_content && !conv.content_seen {
+                conv.content_seen = true;
+                dirty = true;
+            }
             let started = (meta.turn_state == crate::discovery::TurnState::Mid)
                 .then_some(meta.turn_started_at)
                 .flatten();
@@ -714,8 +861,14 @@ impl App {
             .conversations
             .iter()
             .map(|c| {
-                status::derive(
+                let runtime = c
+                    .pane_id
+                    .as_deref()
+                    .and_then(|pane| panes.as_ref()?.get(pane))
+                    .and_then(|title| provider::by_id(&c.provider).runtime_hint(title));
+                status::derive_with_runtime(
                     c.pane_id.is_some(),
+                    runtime,
                     self.metas.meta(&c.id),
                     c.last_viewed,
                     viewed.as_deref() == Some(c.id.as_str()),
@@ -730,6 +883,50 @@ impl App {
         }
 
         self.rebuild_keeping_selection();
+    }
+
+    fn rebuild_attention(&mut self) {
+        let keep = self
+            .attention_sel
+            .and_then(|pos| self.attention.get(pos))
+            .and_then(|i| self.state.conversations.get(*i))
+            .map(|c| c.id.clone());
+        self.attention = self
+            .state
+            .conversations
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                matches!(
+                    self.statuses.get(*i),
+                    Some(Status::Running | Status::Unseen)
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.attention.sort_by(|&a, &b| {
+            let ca = &self.state.conversations[a];
+            let cb = &self.state.conversations[b];
+            let project_rank = |c: &state::Conversation| {
+                self.state
+                    .projects
+                    .iter()
+                    .position(|p| *p == c.cwd.display().to_string())
+                    .unwrap_or(usize::MAX)
+            };
+            project_rank(ca)
+                .cmp(&project_rank(cb))
+                .then_with(|| cb.created_at.cmp(&ca.created_at))
+                .then_with(|| ca.id.cmp(&cb.id))
+        });
+        if let Some(id) = keep {
+            self.attention_sel = self
+                .attention
+                .iter()
+                .position(|i| self.state.conversations[*i].id == id);
+        } else if self.attention.is_empty() {
+            self.attention_sel = None;
+        }
     }
 
     fn rebuild_items(&mut self) {
@@ -761,15 +958,15 @@ impl App {
             let name = project_display(project);
             let mut kept = Vec::new();
             for i in indices {
-                // Week-old Dead conversations stay out of the list unless
-                // the `a` toggle is on (D12) — the list stays short by itself.
-                if !self.show_all && self.statuses.get(i) == Some(&Status::Dead) {
+                // Dead conversations outside the selected history window stay
+                // out of the list (D12). Live conversations are always shown.
+                if self.statuses.get(i) == Some(&Status::Dead) {
                     let conv = &self.state.conversations[i];
                     let age = now.saturating_sub(status::last_active_ts(
                         self.metas.meta(&conv.id),
                         conv.created_at,
                     ));
-                    if age > HIDE_DEAD_AFTER_SECS {
+                    if self.history_window.hides(self.statuses.get(i), age) {
                         self.hidden += 1;
                         continue;
                     }
@@ -791,9 +988,12 @@ impl App {
             // (D13). Membership follows activity, but the survivors stay in
             // the fixed creation order for display: rank a copy by activity,
             // keep the top `MAX_PER_PROJECT`, then drop the rest from `kept`
-            // without disturbing its order. The `a` toggle and an active
-            // filter both bypass the cap.
-            if !self.show_all && filter.is_empty() && kept.len() > MAX_PER_PROJECT {
+            // without disturbing its order. The all-time window and an active
+            // text filter both bypass the cap.
+            if self.history_window != HistoryWindow::AllTime
+                && filter.is_empty()
+                && kept.len() > MAX_PER_PROJECT
+            {
                 let mut ranked = kept.clone();
                 ranked.sort_by(|&a, &b| {
                     let act = |i: usize| {
@@ -815,6 +1015,7 @@ impl App {
             }
         }
         self.clamp_selection();
+        self.rebuild_attention();
     }
 
     fn clamp_selection(&mut self) {
@@ -855,35 +1056,96 @@ impl App {
     }
 
     /// Move the j/k cursor `count` steps in `dir` (±1) over the combined
-    /// space: conversation rows first, then the bottom-menu rows. The count is
-    /// clamped so a stray large prefix (`999j`) can't spin.
+    /// space: attention rows, project-grouped conversations, then bottom-menu
+    /// rows. The count is clamped so a stray large prefix (`999j`) can't spin.
     fn move_selection(&mut self, dir: i64, count: usize) {
-        let span = self.items.len() + self.menu_entries().len();
+        let span = self.attention.len() + self.items.len() + self.menu_entries().len();
         for _ in 0..count.min(span.max(1)) {
             self.nav(dir);
         }
     }
 
-    /// One j/k step. Moving down past the last conversation crosses into the
-    /// bottom menu; moving up from its top row crosses back out.
+    /// One j/k step across attention → project conversations → bottom menu.
+    /// Crossing a panel boundary lands on the nearest row in the next panel.
     fn nav(&mut self, dir: i64) {
         let menu_last = self.menu_entries().len() as i64 - 1;
+        if let Some(i) = self.attention_sel {
+            let next = i as i64 + dir;
+            if next < 0 {
+                return;
+            }
+            if next < self.attention.len() as i64 {
+                self.attention_sel = Some(next as usize);
+            } else if self.has_conversations() {
+                self.attention_sel = None;
+                self.select_edge(true);
+            } else {
+                self.attention_sel = None;
+                self.menu_sel = Some(0);
+            }
+            return;
+        }
         match self.menu_sel {
             Some(i) => {
                 let next = i as i64 + dir;
                 if next < 0 {
-                    // Back into the list — unless it has no conversation rows
-                    // to land on (the cursor would vanish).
-                    if self.items.iter().any(|it| matches!(it, Item::Conv(_))) {
+                    if self.has_conversations() {
                         self.menu_sel = None;
+                        self.select_edge(false);
+                    } else if !self.attention.is_empty() {
+                        self.menu_sel = None;
+                        self.attention_sel = Some(self.attention.len() - 1);
                     }
                 } else {
                     self.menu_sel = Some(next.min(menu_last) as usize);
                 }
             }
             None if dir > 0 && self.at_last_conv() => self.menu_sel = Some(0),
+            None if dir < 0 && self.at_first_conv() && !self.attention.is_empty() => {
+                self.attention_sel = Some(self.attention.len() - 1)
+            }
             None => self.select_next(dir),
         }
+    }
+
+    fn current_panel(&self) -> Panel {
+        if self.attention_sel.is_some() {
+            Panel::Attention
+        } else if self.menu_sel.is_some() {
+            Panel::Menu
+        } else {
+            Panel::Conversations
+        }
+    }
+
+    /// Ctrl+j/k: move directly between panels without walking every row.
+    fn focus_panel(&mut self, dir: i64) -> bool {
+        let current = self.current_panel();
+        let target = adjacent_panel(
+            current,
+            dir,
+            !self.attention.is_empty(),
+            self.has_conversations(),
+        );
+        match target {
+            Panel::Attention => {
+                self.menu_sel = None;
+                self.attention_sel = Some(0);
+            }
+            Panel::Conversations => {
+                self.attention_sel = None;
+                self.menu_sel = None;
+            }
+            Panel::Menu => {
+                self.attention_sel = None;
+                self.menu_sel = Some(0);
+            }
+        }
+        target != current
+    }
+
+    fn has_conversations(&self) -> bool {
+        self.items.iter().any(|it| matches!(it, Item::Conv(_)))
     }
 
     /// Whether the cursor sits on the last conversation row (or the list has
@@ -892,6 +1154,13 @@ impl App {
         self.items
             .iter()
             .rposition(|i| matches!(i, Item::Conv(_)))
+            .is_none_or(|p| p == self.selected)
+    }
+
+    fn at_first_conv(&self) -> bool {
+        self.items
+            .iter()
+            .position(|i| matches!(i, Item::Conv(_)))
             .is_none_or(|p| p == self.selected)
     }
 
@@ -916,6 +1185,7 @@ impl App {
     /// Ctrl+d/u or }/{: move the selection to the first conversation of the
     /// next or previous project group, clamping at the ends.
     fn jump_project(&mut self, dir: i64) {
+        self.attention_sel = None;
         self.menu_sel = None;
         let starts = self.project_starts();
         if starts.is_empty() {
@@ -930,6 +1200,7 @@ impl App {
     }
 
     fn select_edge(&mut self, top: bool) {
+        self.attention_sel = None;
         self.menu_sel = None;
         let pos = if top {
             self.items.iter().position(|i| matches!(i, Item::Conv(_)))
@@ -942,6 +1213,17 @@ impl App {
     }
 
     fn selected_conv_id(&self) -> Option<String> {
+        self.attention_selected_conv_id()
+            .or_else(|| self.main_selected_conv_id())
+    }
+
+    fn attention_selected_conv_id(&self) -> Option<String> {
+        let pos = self.attention_sel?;
+        let i = *self.attention.get(pos)?;
+        Some(self.state.conversations.get(i)?.id.clone())
+    }
+
+    fn main_selected_conv_id(&self) -> Option<String> {
         match self.items.get(self.selected)? {
             // `.get`, not `[*i]`: right after a conversation is removed from
             // state the item list is briefly stale (rebuild_keeping_selection
@@ -950,6 +1232,39 @@ impl App {
             // down. A miss just means "nothing to keep".
             Item::Conv(i) => Some(self.state.conversations.get(*i)?.id.clone()),
             Item::Header(_) => None,
+        }
+    }
+
+    /// Move the attention-panel target onto its duplicate in the normal
+    /// project-grouped sidebar. A filter or the per-project cap may have hidden
+    /// it, so widen only as much as needed before selecting it.
+    fn focus_attention_in_list(&mut self) -> Option<String> {
+        let id = self.selected_conv_id()?;
+        self.attention_sel = None;
+        self.menu_sel = None;
+        let mut pos = self
+            .items
+            .iter()
+            .position(|it| matches!(it, Item::Conv(i) if self.state.conversations[*i].id == id));
+        if pos.is_none() {
+            self.filter.clear();
+            self.history_window = HistoryWindow::AllTime;
+            self.rebuild_items();
+            pos = self.items.iter().position(
+                |it| matches!(it, Item::Conv(i) if self.state.conversations[*i].id == id),
+            );
+        }
+        if let Some(pos) = pos {
+            self.selected = pos;
+        }
+        Some(id)
+    }
+
+    /// Enter/click in the top panel means “take me to this row in the normal
+    /// sidebar and open it”, leaving keyboard focus there afterwards.
+    fn open_attention_selected(&mut self) {
+        if self.focus_attention_in_list().is_some() {
+            self.view_selected();
         }
     }
 
@@ -1071,8 +1386,8 @@ impl App {
     }
 
     /// Migrate conversations whose provisional id can now be resolved to the
-    /// agent's real session id (Codex: its rollout file appears with the
-    /// first message). Everything keyed by the id moves together — the state
+    /// agent's real session id (Codex/OpenCode persist it with the first
+    /// message). Everything keyed by the id moves together — the state
     /// row, the hidden tmux window's name and the viewed pointer. An entry in
     /// `pending_discard` intentionally does not: keyed by the old id, it
     /// cancels itself on the next check, which is exactly right — a resolved
@@ -1151,15 +1466,17 @@ impl App {
         }
     }
 
-    /// Whether provider metadata positively says the conversation contains no
-    /// real exchange. Titles are presentation only and may arrive much later.
+    /// Whether the conversation has never been observed with a real exchange
+    /// and current provider metadata still reads as empty. A missing metadata
+    /// record is how an untouched provider session normally starts, so it also
+    /// counts as empty after the grace period. Once `content_seen` is true it
+    /// is sticky: later metadata/title loss can never make the conversation
+    /// eligible for automatic cleanup again.
     fn is_empty_conversation(&self, id: &str) -> bool {
-        self.metas
-            .meta(id)
-            .is_none_or(|meta| !meta.has_content)
+        conversation_is_empty(self.state.conversation(id), self.metas.meta(id))
     }
 
-    /// Forget an empty conversation: kill its Claude pane and hidden window
+    /// Forget an empty conversation: kill its agent pane and hidden window
     /// (if any survive) and drop it from the state file. The jsonl under
     /// ~/.claude is never touched (D1).
     fn discard_conversation(&mut self, id: &str) {
@@ -1374,15 +1691,24 @@ impl App {
     /// Rebuild the item list, keeping the selection on the same conversation
     /// if it is still visible.
     fn rebuild_keeping_selection(&mut self) {
-        let keep = self.selected_conv_id();
+        // The duplicated rows have independent cursor memory. Merely browsing
+        // Attention must not move the canonical list's selection on refresh.
+        let keep_main = self.main_selected_conv_id();
+        let keep_attention = self.attention_selected_conv_id();
         self.rebuild_items();
-        if let Some(id) = keep
+        if let Some(id) = keep_main.as_ref()
             && let Some(pos) = self
                 .items
                 .iter()
-                .position(|i| matches!(i, Item::Conv(c) if self.state.conversations[*c].id == id))
+                .position(|i| matches!(i, Item::Conv(c) if self.state.conversations[*c].id == *id))
         {
             self.selected = pos;
+        }
+        if let Some(id) = keep_attention {
+            self.attention_sel = self
+                .attention
+                .iter()
+                .position(|i| self.state.conversations[*i].id == id);
         }
     }
 
@@ -1405,40 +1731,46 @@ impl App {
             .and_then(|m| m.context_tokens);
         let readout = (usage.is_some() || ctx.is_some()).then_some(provider::accent(&pid));
         let menu_h = self.menu_entries().len() as u16 + 1 + 2 * readout.is_some() as u16;
+        // Attention gets enough room to show every row when practical, but at
+        // most half of the content region so the canonical project list never
+        // disappears. Its own ListState scrolls any overflow.
+        let content_h = f.area().height.saturating_sub(menu_h + 1);
+        let attention_h = attention_panel_height(self.attention.len(), content_h);
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(attention_h),
                 Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(menu_h),
             ])
             .split(f.area());
-        self.draw_list(f, outer[0]);
-        self.draw_footer(f, outer[1]);
-        self.draw_menu(f, outer[2], usage.as_deref(), ctx, readout);
+        self.draw_attention(f, outer[0]);
+        self.draw_list(f, outer[1]);
+        self.draw_footer(f, outer[2]);
+        self.draw_menu(f, outer[3], usage.as_deref(), ctx, readout);
         self.draw_provider_picker(f);
     }
 
     /// The bottom-menu rows, top to bottom: (action, marker, label, key hint).
-    /// The count of week-old dead rows currently folded away lives on the
-    /// Hidden row; the provider row always names the active agent.
+    /// The current window and folded-row count live on the History row; the
+    /// provider row always names the active agent.
     fn menu_entries(&self) -> Vec<(MenuAction, &'static str, String, &'static str)> {
         let provider = provider::by_id(&self.state.active_provider).display_name();
-        let hidden = if self.hidden > 0 {
-            format!("Hidden ({})", self.hidden)
+        let history = if self.hidden > 0 {
+            format!(
+                "History · {} ({} hidden)",
+                self.history_window.label(),
+                self.hidden
+            )
         } else {
-            "Hidden".to_string()
+            format!("History · {}", self.history_window.label())
         };
         // The provider row sits last so it lands right above the usage
         // readout at the sidebar's bottom edge — agent and its gauge together.
         vec![
             (MenuAction::New, "+", "New conversation".to_string(), "N"),
-            (
-                MenuAction::ToggleHidden,
-                if self.show_all { "●" } else { "○" },
-                hidden,
-                "a",
-            ),
+            (MenuAction::CycleHistory, "◷", history, "a"),
             (MenuAction::Shortcuts, "?", "Shortcuts".to_string(), "?"),
             (MenuAction::SwitchProvider, "⇄", provider.to_string(), "s"),
         ]
@@ -1448,8 +1780,7 @@ impl App {
     /// label left, key hint right-aligned — echoing the conversation rows
     /// instead of shouting like a button bar. j past the last conversation
     /// walks the cursor in; the cursor row carries the same gray highlight as
-    /// the list. The provider row is tinted with the active agent's accent and
-    /// the Hidden marker fills in while its `a` toggle is on.
+    /// the list. The provider row is tinted with the active agent's accent.
     fn draw_menu(
         &mut self,
         f: &mut Frame,
@@ -1460,13 +1791,12 @@ impl App {
     ) {
         let width = area.width as usize;
         let dim = Style::default().fg(Color::DarkGray);
-        let mut lines = vec![Line::from(Span::styled("─".repeat(width), dim))];
+        let mut lines = vec![divider(width)];
         self.menu_hitboxes.clear();
         for (i, (action, marker, label, hint)) in self.menu_entries().into_iter().enumerate() {
             let selected = self.menu_sel == Some(i);
             let fg = match action {
                 MenuAction::SwitchProvider => provider::accent(&self.state.active_provider),
-                MenuAction::ToggleHidden if self.show_all => Color::Rgb(122, 162, 247),
                 _ => Color::Rgb(206, 211, 221),
             };
             let mut row = Style::default().fg(fg);
@@ -1514,9 +1844,9 @@ impl App {
     fn activate_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::New => self.open_picker(),
-            MenuAction::ToggleHidden => {
-                self.show_all = !self.show_all;
-                self.rebuild_items();
+            MenuAction::CycleHistory => {
+                self.history_window = self.history_window.next();
+                self.rebuild_keeping_selection();
             }
             MenuAction::SwitchProvider => self.open_provider_picker(),
             MenuAction::Shortcuts => self.show_shortcuts(),
@@ -1614,11 +1944,12 @@ impl App {
     /// showing status like any other row.
     fn render_conv(
         &self,
-        idx: usize,
         i: usize,
         width: usize,
         now: u64,
         multi_provider: bool,
+        selected: bool,
+        show_project: bool,
     ) -> ListItem<'static> {
         let conv = &self.state.conversations[i];
         let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
@@ -1629,10 +1960,13 @@ impl App {
             Status::Dead => ("○", Color::Gray),
         };
         let meta = self.metas.meta(&conv.id);
-        let title = meta
+        let mut title = meta
             .and_then(|m| m.display_title())
             .unwrap_or("(untitled)")
             .to_string();
+        if show_project {
+            title = format!("{} · {title}", project_display(&conv.cwd.to_string_lossy()));
+        }
         let time = status::time_column(status, meta, conv.created_at, now);
         let viewed = self.viewed.as_deref() == Some(conv.id.as_str());
         // Tint the title by which agent CLI spawned it (D6 addition) — but
@@ -1644,7 +1978,7 @@ impl App {
             Some(c) => Style::default().fg(c),
             None => Style::default(),
         };
-        let title_style = if idx == self.selected {
+        let title_style = if selected {
             base.add_modifier(Modifier::BOLD)
         } else if status == Status::Dead {
             Style::default().fg(Color::Gray)
@@ -1654,7 +1988,7 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         // The selected row uses DarkGray as its hover background, so the
         // normally dim time needs a lighter foreground to stay readable.
-        let time_style = if self.menu_sel.is_none() && idx == self.selected {
+        let time_style = if selected {
             Style::default().fg(Color::Gray)
         } else {
             dim
@@ -1699,20 +2033,25 @@ impl App {
         let now = state::unix_now();
         let width = area.width as usize;
         let multi = self.uses_multiple_providers();
+        let focused = self.attention_sel.is_none() && self.menu_sel.is_none();
         let items: Vec<ListItem> = (0..self.items.len())
             .map(|idx| match &self.items[idx] {
                 Item::Header(name) => self.render_header(name, width),
-                Item::Conv(i) => self.render_conv(idx, *i, width, now, multi),
+                Item::Conv(i) => self.render_conv(
+                    *i,
+                    width,
+                    now,
+                    multi,
+                    focused && idx == self.selected,
+                    false,
+                ),
             })
             .collect();
 
-        self.list_rows = area.height;
-        // While the cursor is down in the bottom menu the list drops its
-        // highlight, so exactly one row on screen ever reads as selected.
-        set_list_highlight(&mut self.list_state, match self.menu_sel {
-            Some(_) => None,
-            None => Some(self.selected),
-        });
+        self.list_area = area;
+        // While the cursor is in another panel the list drops its highlight,
+        // so exactly one row on screen ever reads as selected.
+        set_list_highlight(&mut self.list_state, focused.then_some(self.selected));
         keep_first_conversation_context_visible(
             &self.items,
             self.selected,
@@ -1721,6 +2060,37 @@ impl App {
         );
         let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
         f.render_stateful_widget(list, area, &mut self.list_state);
+    }
+
+    /// Status-driven panel at the top. Rows deliberately echo the normal
+    /// conversation grammar, adding the project name because this list is
+    /// flat rather than grouped. A plain bottom rule separates it from the
+    /// canonical list, matching the rule above the settings menu.
+    fn draw_attention(&mut self, f: &mut Frame, area: Rect) {
+        if area.height == 0 || self.attention.is_empty() {
+            self.attention_area = Rect::default();
+            return;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        let width = area.width as usize;
+        let now = state::unix_now();
+        let multi = self.uses_multiple_providers();
+        let items: Vec<ListItem> = self
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(pos, i)| {
+                self.render_conv(*i, width, now, multi, self.attention_sel == Some(pos), true)
+            })
+            .collect();
+        self.attention_area = rows[0];
+        set_list_highlight(&mut self.attention_state, self.attention_sel);
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+        f.render_stateful_widget(list, rows[0], &mut self.attention_state);
+        f.render_widget(Paragraph::new(divider(width)), rows[1]);
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -1773,6 +2143,13 @@ impl App {
     }
 }
 
+fn divider(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
 /// The plan-usage readout: `ctx 97k · 5h 21% · wk 24% · fable 41%`, one line
 /// uniformly in the provider's accent — a single tone, since mixing dim labels
 /// with brighter percents made the numbers jump out as clutter. Only a limit
@@ -1820,6 +2197,13 @@ fn force_full_redraw<B: Backend>(terminal: &mut Terminal<B>) {
     terminal.swap_buffers();
 }
 
+fn contains(area: Rect, col: u16, row: u16) -> bool {
+    col >= area.x
+        && col < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 /// Project group header (D8): directory basename only. A git worktree —
 /// detected by `.git` being a *file* with a `gitdir:` pointer — shows as
 /// `{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
@@ -1853,12 +2237,25 @@ fn worktree_repo(dir: &Path) -> Option<String> {
     )
 }
 
+fn conversation_is_empty(
+    conversation: Option<&state::Conversation>,
+    meta: Option<&crate::discovery::Meta>,
+) -> bool {
+    conversation.is_some_and(|conversation| {
+        !conversation.content_seen && meta.is_none_or(|meta| !meta.has_content)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Item, RenderKind, RenderSchedule, RepaintSchedule, force_full_redraw,
+        HistoryWindow, Item, Panel, RenderKind, RenderSchedule, RepaintSchedule, adjacent_panel,
+        attention_panel_height, conversation_is_empty, force_full_redraw,
         keep_first_conversation_context_visible, project_display, set_list_highlight,
     };
+    use crate::discovery::Meta;
+    use crate::state::Conversation;
+    use crate::status::Status;
     use ratatui::Terminal;
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
@@ -1868,6 +2265,117 @@ mod tests {
     use std::fs;
     use std::io;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn history_window_cycles_through_every_supported_age() {
+        let mut window = HistoryWindow::ThreeHours;
+        let mut labels = Vec::new();
+        for _ in 0..5 {
+            labels.push(window.label());
+            window = window.next();
+        }
+
+        assert_eq!(labels, ["3h", "1D", "3D", "1W", "all time"]);
+        assert_eq!(window, HistoryWindow::ThreeHours);
+    }
+
+    #[test]
+    fn history_window_only_hides_dead_conversations_past_its_cutoff() {
+        let three_hours = HistoryWindow::ThreeHours;
+        assert!(!three_hours.hides(Some(&Status::Dead), 3 * 3600));
+        assert!(three_hours.hides(Some(&Status::Dead), 3 * 3600 + 1));
+        assert!(!three_hours.hides(Some(&Status::Idle), 3 * 3600 + 1));
+        assert!(!HistoryWindow::AllTime.hides(Some(&Status::Dead), u64::MAX));
+    }
+
+    #[test]
+    fn ctrl_panel_navigation_follows_attention_conversations_menu() {
+        assert_eq!(
+            adjacent_panel(Panel::Attention, 1, true, true),
+            Panel::Conversations
+        );
+        assert_eq!(
+            adjacent_panel(Panel::Conversations, 1, true, true),
+            Panel::Menu
+        );
+        assert_eq!(
+            adjacent_panel(Panel::Menu, -1, true, true),
+            Panel::Conversations
+        );
+        assert_eq!(
+            adjacent_panel(Panel::Conversations, -1, true, true),
+            Panel::Attention
+        );
+    }
+
+    #[test]
+    fn ctrl_panel_navigation_skips_empty_panels_and_clamps() {
+        assert_eq!(
+            adjacent_panel(Panel::Conversations, -1, false, true),
+            Panel::Conversations
+        );
+        assert_eq!(
+            adjacent_panel(Panel::Conversations, 1, false, true),
+            Panel::Menu
+        );
+        assert_eq!(
+            adjacent_panel(Panel::Attention, 1, true, false),
+            Panel::Menu
+        );
+        assert_eq!(adjacent_panel(Panel::Menu, 1, true, true), Panel::Menu);
+    }
+
+    #[test]
+    fn attention_panel_scrolls_before_it_crowds_out_the_main_list() {
+        assert_eq!(attention_panel_height(0, 20), 0);
+        assert_eq!(attention_panel_height(2, 20), 3);
+        assert_eq!(attention_panel_height(20, 20), 10);
+        assert_eq!(attention_panel_height(2, 2), 0);
+        assert_eq!(attention_panel_height(2, 3), 2);
+    }
+
+    fn conversation(content_seen: bool) -> Conversation {
+        Conversation {
+            id: "conversation".into(),
+            cwd: "/tmp".into(),
+            pane_id: None,
+            last_viewed: 0,
+            created_at: 0,
+            provider: "claude".into(),
+            turn_started_at: None,
+            content_seen,
+        }
+    }
+
+    #[test]
+    fn untouched_conversation_is_empty_with_or_without_metadata() {
+        let conversation = conversation(false);
+        assert!(conversation_is_empty(Some(&conversation), None));
+        assert!(conversation_is_empty(
+            Some(&conversation),
+            Some(&Meta::default())
+        ));
+    }
+
+    #[test]
+    fn current_content_prevents_empty_cleanup_before_it_is_persisted() {
+        let conversation = conversation(false);
+        let meta = Meta {
+            has_content: true,
+            ..Meta::default()
+        };
+        assert!(!conversation_is_empty(Some(&conversation), Some(&meta)));
+    }
+
+    #[test]
+    fn previously_seen_content_survives_missing_or_empty_metadata() {
+        let conversation = conversation(true);
+        assert!(!conversation_is_empty(Some(&conversation), None));
+        assert!(!conversation_is_empty(
+            Some(&conversation),
+            Some(&Meta::default())
+        ));
+    }
 
     #[test]
     fn repaint_schedule_cannot_be_accelerated_by_events() {

@@ -81,7 +81,7 @@ or deleted**.
 
 | State | Condition | Look | Time column |
 |---|---|---|---|
-| **Running** | pane alive, turn in flight | yellow ● | elapsed since turn start (`4m`, `1h12m`) |
+| **Running** | pane alive, runtime working hint or turn in flight | yellow ● | elapsed since turn start (`4m`, `1h12m`) |
 | **Unseen** | pane alive, turn completed after `last_viewed` | blue ● | duration the completed turn ran |
 | **Idle** | pane alive, turn complete, viewed since | gray ● | empty if < 1h old, else coarse age (`5h`) |
 | **Dead** | no pane | hollow ○ | coarse age (`5h`, `3d`), never finer than hours |
@@ -89,6 +89,10 @@ or deleted**.
 - The conversation currently in the content pane counts as continuously
   viewed: it goes straight to Idle, never Unseen, and its `last_viewed`
   follows along.
+- Claude's animated/idle tmux pane-title glyph is the primary live working
+  signal for every live Claude pane. Unknown or disabled title formats fall
+  back to the transcript, including its stalled-turn timeout. The runtime
+  signal never replaces transcript timing or the Unseen distinction.
 - Seconds are never shown anywhere (feature 5).
 - Known limitation (out of scope): a Claude blocked on a permission prompt is
   mid-turn in the jsonl and shows as Running. Fixable later with a Claude Code
@@ -141,8 +145,8 @@ selection.
   refresh tick.
 - `x` on a live conversation kills its Claude and window (`y/n` confirm if
   Running); `x` on a Dead one removes it from the state file and the list.
-- Dead conversations older than a week are hidden by default; `a` toggles
-  showing everything.
+- Dead conversations outside the selected history window are hidden; `a`
+  cycles 3h / 1D / 3D / 1W / all time (default 1W).
 
 ### D13 — Digit jump (feature 11)
 
@@ -198,7 +202,7 @@ into a uuid-named hidden window.
 | `x` | kill live / remove dead (confirm when Running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `1`–`9` | digit jump to real session window N |
-| `a` | show hidden (dead > 1 week) |
+| `a` | cycle visible history (3h / 1D / 3D / 1W / all time) |
 | `/` | filter |
 | `q` | quit (swap home, remove content pane) |
 
@@ -257,7 +261,7 @@ conversation never turns blue, and no seconds appear anywhere.
 - Refresh tick notices vanished uuid-windows → mark Dead (D12); recreate the
   content-pane placeholder if the viewed Claude died.
 - `x` with `y/n` confirm for Running; state-file removal for Dead.
-- Default hiding of week-old Dead conversations behind `a`.
+- Configurable Dead-conversation history behind `a`, defaulting to one week.
 - `Enter` on Dead respawns via `claude --resume <id>` in a new hidden window.
 
 **Done when:** exiting Claude leaves no zombie window, `x` behaves per state,

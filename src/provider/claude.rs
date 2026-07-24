@@ -4,6 +4,7 @@
 
 use super::Provider;
 use crate::discovery::{MetaSource, Store};
+use crate::status::RuntimeHint;
 use crate::{state, usage};
 use anyhow::Result;
 use serde::Deserialize;
@@ -33,6 +34,22 @@ impl Provider for Claude {
     fn spawn_args(&self, id: &str, resume: bool) -> Vec<String> {
         let flag = if resume { "--resume" } else { "--session-id" };
         vec![flag.to_string(), id.to_string()]
+    }
+
+    fn runtime_hint(&self, pane_title: &str) -> Option<RuntimeHint> {
+        match pane_title.chars().next()? {
+            // Claude animates its terminal title with fixed-width Braille
+            // spinners while the main agent loop is active. Different work
+            // phases use different patterns, so accept the non-blank Braille
+            // block rather than one observed animation sequence.
+            c if ('\u{2801}'..='\u{28ff}').contains(&c) => Some(RuntimeHint::Working),
+            // At the input prompt Claude prefixes the conversation title with
+            // this static glyph.
+            '✳' => Some(RuntimeHint::Idle),
+            // Startup, disabled/custom titles, and future formats use the
+            // transcript fallback rather than being guessed at.
+            _ => None,
+        }
     }
 
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
@@ -118,7 +135,30 @@ fn usage_entry(limit: &Limit) -> Option<usage::Entry> {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageResponse, usage_entry};
+    use super::{Claude, UsageResponse, usage_entry};
+    use crate::provider::Provider;
+    use crate::status::RuntimeHint;
+
+    #[test]
+    fn terminal_title_reports_working_idle_or_unknown() {
+        for spinner in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+            assert_eq!(
+                Claude.runtime_hint(&format!("{spinner} backup-restore")),
+                Some(RuntimeHint::Working)
+            );
+        }
+        assert_eq!(
+            Claude.runtime_hint("⠂ platform-restore-cleanup-runbook"),
+            Some(RuntimeHint::Working)
+        );
+        assert_eq!(
+            Claude.runtime_hint("✳ Review backup restore plan status"),
+            Some(RuntimeHint::Idle)
+        );
+        assert_eq!(Claude.runtime_hint("Claude Code"), None);
+        assert_eq!(Claude.runtime_hint("custom terminal title"), None);
+        assert_eq!(Claude.runtime_hint(""), None);
+    }
 
     #[test]
     fn parses_the_three_usage_limits() {

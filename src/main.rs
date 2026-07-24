@@ -108,11 +108,11 @@ fn jump(args: &[String]) -> Result<()> {
     tmux::jump_to_window(&conv.cwd, n)
 }
 
-/// The conversation whose Claude pane is currently swapped into corc's content
+/// The conversation whose agent pane is currently swapped into corc's content
 /// slot — the one the user is looking at. Its pane is the only conversation
 /// pane living in the corc session; every other conversation's pane sits
 /// parked in the hidden session. This is deterministic — exactly "the session
-/// this Claude pane belongs to" — where a `last_viewed` guess could be stale
+/// this agent pane belongs to" — where a `last_viewed` guess could be stale
 /// and point at whichever project the user last switched to. Falls back to the
 /// most recently viewed when nothing is swapped in (placeholder showing).
 fn viewed_conversation(state: &state::State) -> Option<&state::Conversation> {
@@ -146,7 +146,8 @@ fn shortcuts() -> Result<()> {
     println!("\r\n{BOLD}corc — keyboard shortcuts{RESET}\r");
 
     section("Navigate");
-    row("j / k  ↑ ↓", "move selection (j continues into the menu)");
+    row("j / k  ↑ ↓", "move selection across panels");
+    row("Ctrl+j / k", "next / previous panel (tmux at outer edge)");
     row("g / G", "jump to top / bottom");
     row("} / {  Ctrl+d / u", "next / previous project");
     row("Alt+1 – 9", "jump to window N of the project's session");
@@ -161,7 +162,7 @@ fn shortcuts() -> Result<()> {
 
     section("Layout & misc");
     row("V, then K/J", "move mode: reorder projects");
-    row("a", "show hidden (week-old dead) conversations");
+    row("a", "cycle history: 3h / 1D / 3D / 1W / all time");
     row("r", "refresh now");
     row("?", "this help");
     row("Ctrl+C", "quit corc");
@@ -232,6 +233,7 @@ fn list() -> Result<()> {
         println!("no conversations");
         return Ok(());
     }
+    let panes = tmux::all_panes().unwrap_or_default();
     let now = state::unix_now();
     for project in &state.projects {
         let convs: Vec<_> = state
@@ -244,9 +246,20 @@ fn list() -> Result<()> {
         }
         println!("\n{}", display_dir(project));
         for conv in convs {
-            let alive = conv.pane_id.as_deref().is_some_and(tmux::pane_exists);
+            let pane_title = conv.pane_id.as_deref().and_then(|pane| panes.get(pane));
+            let alive = pane_title.is_some();
+            let runtime =
+                pane_title.and_then(|title| provider::by_id(&conv.provider).runtime_hint(title));
             let meta = store.meta(&conv.id);
-            let s = status::derive(alive, meta, conv.last_viewed, false, now, conv.created_at);
+            let s = status::derive_with_runtime(
+                alive,
+                runtime,
+                meta,
+                conv.last_viewed,
+                false,
+                now,
+                conv.created_at,
+            );
             let title = meta.and_then(|m| m.display_title()).unwrap_or("(untitled)");
             let pane = conv.pane_id.as_deref().unwrap_or("-");
             println!(
