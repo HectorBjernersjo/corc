@@ -201,14 +201,6 @@ fn apply(meta: &mut Meta, v: &Value) {
             meta.turn_state = TurnState::Complete;
             meta.turn_completed_at = line_timestamp(v);
         }
-        Some("token_count") => {
-            // `last_token_usage` is the most recent request: its total is
-            // what currently sits in the context window. `info` is null on
-            // the occasional bare rate-limit event — keep the last reading.
-            if let Some(tokens) = p["info"]["last_token_usage"]["total_tokens"].as_u64() {
-                meta.context_tokens = Some(tokens);
-            }
-        }
         _ => {}
     }
 }
@@ -408,23 +400,6 @@ mod tests {
         );
         assert_eq!(meta.first_prompt.as_deref(), Some("say hi"));
         assert_eq!(meta.display_title(), Some("say hi"));
-
-        // token_count events carry the context reading; a bare rate-limit
-        // event (`info: null`) keeps the previous one.
-        apply(
-            &mut meta,
-            &json!({"timestamp":"2026-07-10T18:39:03.500Z","type":"event_msg",
-                    "payload":{"type":"token_count",
-                        "info":{"last_token_usage":{"input_tokens":85176,"total_tokens":85424},
-                                "model_context_window":353400}}}),
-        );
-        assert_eq!(meta.context_tokens, Some(85424));
-        apply(
-            &mut meta,
-            &json!({"timestamp":"2026-07-10T18:39:03.600Z","type":"event_msg",
-                    "payload":{"type":"token_count","info":null,"rate_limits":{}}}),
-        );
-        assert_eq!(meta.context_tokens, Some(85424));
 
         apply(
             &mut meta,

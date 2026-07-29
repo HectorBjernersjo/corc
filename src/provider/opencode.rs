@@ -231,7 +231,6 @@ fn read_meta(conn: &Connection, id: &str, persisted_start: Option<u64>) -> Resul
         }
     }
 
-    meta.context_tokens = latest_context_tokens(conn, id)?;
     Ok(Some(meta))
 }
 
@@ -327,38 +326,6 @@ fn has_running_tool(conn: &Connection, message_id: &str) -> Result<bool> {
         )
         .optional()?
         .is_some())
-}
-
-fn latest_context_tokens(conn: &Connection, session_id: &str) -> Result<Option<u64>> {
-    let raw = conn
-        .query_row(
-            "SELECT data
-             FROM message
-             WHERE session_id = ?1
-               AND json_extract(data, '$.role') = 'assistant'
-               AND COALESCE(json_extract(data, '$.tokens.output'), 0) > 0
-             ORDER BY time_created DESC, id DESC
-             LIMIT 1",
-            [session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(raw
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|data| context_tokens(&data)))
-}
-
-/// Mirror OpenCode's own TUI context readout: all token categories from the
-/// latest assistant response with output, including cache reads/writes.
-fn context_tokens(data: &Value) -> Option<u64> {
-    let tokens = data.get("tokens")?;
-    let n = |path: &[&str]| json_path(tokens, path).and_then(Value::as_u64).unwrap_or(0);
-    let total = n(&["input"])
-        .saturating_add(n(&["output"]))
-        .saturating_add(n(&["reasoning"]))
-        .saturating_add(n(&["cache", "read"]))
-        .saturating_add(n(&["cache", "write"]));
-    (total > 0).then_some(total)
 }
 
 fn json_millis(value: &Value, path: &[&str]) -> Option<u64> {
@@ -599,7 +566,6 @@ mod tests {
         store.refresh(&known).unwrap();
         let meta = store.meta(session).unwrap();
         assert_eq!(meta.turn_state, TurnState::Mid);
-        assert_eq!(meta.context_tokens, Some(1575));
 
         conn.execute(
             "UPDATE part SET data = ?1 WHERE id = 'part_tool'",
@@ -618,7 +584,6 @@ mod tests {
         assert_eq!(meta.turn_state, TurnState::Complete);
         assert_eq!(meta.turn_started_at, Some(101));
         assert_eq!(meta.turn_completed_at, Some(104));
-        assert_eq!(meta.context_tokens, Some(1575));
     }
 
     #[test]

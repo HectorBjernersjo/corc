@@ -129,9 +129,9 @@ one with the same CLI. The `s` picker only changes the agent used for
 conversations you start afterwards; it's persisted, so the choice survives
 restarts. Provider metadata is read from each CLI's local, read-only history:
 Claude and Codex JSONL transcripts, Cursor's chat stores, and OpenCode's SQLite
-database. This drives titles, context size, and the same Running, Unseen, Idle,
-and Dead states across providers. An untouched Codex or OpenCode conversation
-stays `(untitled)` until the CLI creates its real session on the first prompt.
+database. This drives titles and the same Running, Unseen, Idle, and Dead
+states across providers. An untouched Codex or OpenCode conversation stays
+`(untitled)` until the CLI creates its real session on the first prompt.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`

@@ -152,14 +152,36 @@ impl PaneDirection {
             Self::Right => "-R",
         }
     }
+
+    /// The `pane_at_*` format that is true when there is no pane further in
+    /// this direction.
+    fn edge(self) -> &'static str {
+        match self {
+            Self::Left => "#{pane_at_left}",
+            Self::Down => "#{pane_at_bottom}",
+            Self::Up => "#{pane_at_top}",
+            Self::Right => "#{pane_at_right}",
+        }
+    }
 }
 
 /// Hand a Ctrl+h/j/k/l edge movement back to the surrounding tmux layout,
 /// matching vim-tmux-navigator's behavior inside Vim. Fire-and-reap in the
 /// background so navigation never stalls the TUI event loop.
+///
+/// `select-pane -L` wraps around to the opposite side of the window, so guard
+/// it with `pane_at_*` and do nothing at the outer edge — pressing Ctrl+h in
+/// the leftmost pane should stay put, not jump to the rightmost one. The guard
+/// rides along in the same tmux invocation to keep this a single spawn.
 pub fn select_adjacent_pane(direction: PaneDirection) {
     let Ok(mut child) = Command::new("tmux")
-        .args(["select-pane", direction.flag()])
+        .args([
+            "if-shell",
+            "-F",
+            direction.edge(),
+            "",
+            &format!("select-pane {}", direction.flag()),
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

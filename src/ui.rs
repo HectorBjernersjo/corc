@@ -1716,8 +1716,8 @@ impl App {
         // One row per menu entry plus the rule above them, plus the usage
         // readout (its own divider + row) when there is anything to show.
         // The readout follows the *selected conversation*: its provider's
-        // plan usage, accent and context size — not the active provider's —
-        // so cursoring across a mixed list swaps the whole gauge with it.
+        // plan usage and accent — not the active provider's — so cursoring
+        // across a mixed list swaps the whole gauge with it.
         // With nothing selected it falls back to the active provider.
         let pid = self
             .selected_conv_id()
@@ -1725,11 +1725,7 @@ impl App {
             .map(|c| c.provider.clone())
             .unwrap_or_else(|| self.state.active_provider.clone());
         let usage = self.usage.entries(&pid).filter(|e| !e.is_empty());
-        let ctx = self
-            .selected_conv_id()
-            .and_then(|id| self.metas.meta(&id))
-            .and_then(|m| m.context_tokens);
-        let readout = (usage.is_some() || ctx.is_some()).then_some(provider::accent(&pid));
+        let readout = usage.is_some().then_some(provider::accent(&pid));
         let menu_h = self.menu_entries().len() as u16 + 1 + 2 * readout.is_some() as u16;
         // Attention gets enough room to show every row when practical, but at
         // most half of the content region so the canonical project list never
@@ -1748,7 +1744,7 @@ impl App {
         self.draw_attention(f, outer[0]);
         self.draw_list(f, outer[1]);
         self.draw_footer(f, outer[2]);
-        self.draw_menu(f, outer[3], usage.as_deref(), ctx, readout);
+        self.draw_menu(f, outer[3], usage.as_deref(), readout);
         self.draw_provider_picker(f);
     }
 
@@ -1786,7 +1782,6 @@ impl App {
         f: &mut Frame,
         area: Rect,
         usage: Option<&[usage::Entry]>,
-        ctx: Option<u64>,
         readout: Option<Color>,
     ) {
         let width = area.width as usize;
@@ -1823,7 +1818,6 @@ impl App {
         if let Some(accent) = readout {
             lines.push(Line::from(Span::styled("─".repeat(width), dim)));
             lines.push(usage_line(
-                ctx,
                 usage.unwrap_or_default(),
                 Style::default().fg(accent),
             ));
@@ -2150,17 +2144,13 @@ fn divider(width: usize) -> Line<'static> {
     ))
 }
 
-/// The plan-usage readout: `ctx 97k · 5h 21% · wk 24% · fable 41%`, one line
+/// The plan-usage readout: `5h 21% · wk 24% · fable 41%`, one line
 /// uniformly in the provider's accent — a single tone, since mixing dim labels
 /// with brighter percents made the numbers jump out as clutter. Only a limit
 /// about to bite gets a different color: its whole `label percent%` segment
-/// turns yellow from 70% and red from 90%. The leading `ctx` segment is the
-/// selected conversation's current context size, read from its transcript.
-fn usage_line(ctx: Option<u64>, entries: &[usage::Entry], base: Style) -> Line<'static> {
+/// turns yellow from 70% and red from 90%.
+fn usage_line(entries: &[usage::Entry], base: Style) -> Line<'static> {
     let mut spans = vec![Span::styled(" ", base)];
-    if let Some(tokens) = ctx {
-        spans.push(Span::styled(format!("ctx {}", fmt_tokens(tokens)), base));
-    }
     for e in entries {
         if spans.len() > 1 {
             spans.push(Span::styled(" · ", base));
@@ -2173,16 +2163,6 @@ fn usage_line(ctx: Option<u64>, entries: &[usage::Entry], base: Style) -> Line<'
         spans.push(Span::styled(format!("{} {}%", e.label, e.percent), style));
     }
     Line::from(spans)
-}
-
-/// Token counts at readout scale: `412`, `97k`, `133k` — one significant
-/// rounding, no decimals, matching the row's terse `label value` grammar.
-fn fmt_tokens(tokens: u64) -> String {
-    if tokens < 1000 {
-        tokens.to_string()
-    } else {
-        format!("{}k", (tokens + 500) / 1000)
-    }
 }
 
 /// Make ratatui treat every cell as changed on the next draw without emitting

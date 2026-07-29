@@ -56,12 +56,6 @@ pub struct Meta {
     /// the jsonl mtime this ignores background title/checkpoint writes, so it
     /// can safely be used to detect an abandoned in-flight turn.
     pub turn_progress_at: Option<u64>,
-    /// Tokens currently in the conversation's context window, from the most
-    /// recent API usage the transcript records (Claude: the last assistant
-    /// record's `message.usage`; Codex: `token_count` events). Drops after a
-    /// compaction just like the real window. None for providers whose
-    /// transcripts carry no usage (Cursor).
-    pub context_tokens: Option<u64>,
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
@@ -112,7 +106,6 @@ impl Default for Meta {
             turn_started_at: None,
             turn_completed_at: None,
             turn_progress_at: None,
-            context_tokens: None,
             mtime: SystemTime::UNIX_EPOCH,
         }
     }
@@ -308,9 +301,6 @@ fn apply(meta: &mut Meta, v: &Value) {
             if let Some(ts) = record_timestamp(v) {
                 meta.turn_progress_at = Some(ts);
             }
-            if let Some(tokens) = context_tokens(v) {
-                meta.context_tokens = Some(tokens);
-            }
             match v["message"]["stop_reason"].as_str() {
                 Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
                     meta.turn_state = TurnState::Complete;
@@ -347,18 +337,6 @@ fn apply(meta: &mut Meta, v: &Value) {
         }
         _ => {}
     }
-}
-
-/// Context size after an assistant record: the request's usage counts every
-/// input token — fresh (`input_tokens`) plus both cache flavors — which is
-/// exactly what sat in the window. Synthetic records (API-error stand-ins)
-/// carry an all-zero usage and yield None so they never blank a real reading.
-fn context_tokens(v: &Value) -> Option<u64> {
-    let usage = v["message"].get("usage")?;
-    let n = |key: &str| usage[key].as_u64().unwrap_or(0);
-    let total =
-        n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
-    (total > 0).then_some(total)
 }
 
 /// User records that don't represent a prompt: caveat/meta records and the
@@ -628,52 +606,6 @@ mod tests {
             &json!({"type":"ai-title","aiTitle":"Generated architecture review"}),
         );
         assert_eq!(meta.display_title(), Some("platform api architecture"));
-    }
-
-    /// Context size tracks the latest assistant record's usage — every input
-    /// flavor summed — while zero-usage synthetic records and sidechain
-    /// traffic leave the reading alone.
-    #[test]
-    fn context_tokens_follow_latest_assistant_usage() {
-        let mut meta = Meta::default();
-        assert_eq!(meta.context_tokens, None);
-
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","message":{"stop_reason":"tool_use",
-                    "usage":{"input_tokens":2,"cache_creation_input_tokens":5538,
-                             "cache_read_input_tokens":29708,"output_tokens":911}},
-                    "timestamp":"2026-07-08T10:02:00Z"}),
-        );
-        assert_eq!(meta.context_tokens, Some(2 + 5538 + 29708));
-
-        // A synthetic record (API-error stand-in) has all-zero usage: the
-        // real reading survives. So does sidechain (subagent) usage.
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","message":{"stop_reason":null,
-                    "usage":{"input_tokens":0,"cache_creation_input_tokens":0,
-                             "cache_read_input_tokens":0,"output_tokens":0}},
-                    "timestamp":"2026-07-08T10:03:00Z"}),
-        );
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","isSidechain":true,
-                    "message":{"stop_reason":"end_turn",
-                    "usage":{"input_tokens":999999}},
-                    "timestamp":"2026-07-08T10:04:00Z"}),
-        );
-        assert_eq!(meta.context_tokens, Some(35248));
-
-        // The next real reading replaces it — including a post-compaction
-        // drop to a smaller window.
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","message":{"stop_reason":"end_turn",
-                    "usage":{"input_tokens":3,"cache_read_input_tokens":11000}},
-                    "timestamp":"2026-07-08T10:05:00Z"}),
-        );
-        assert_eq!(meta.context_tokens, Some(11003));
     }
 
     /// A Ctrl+C interrupt is written as a user record (with an
