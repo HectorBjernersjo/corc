@@ -34,18 +34,42 @@ pub fn self_exe() -> PathBuf {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => ui::run(),
+        None => open(),
         Some("open") => open(),
         Some("list") => list(),
         Some("doctor") => doctor::run(),
+        Some("-h" | "--help" | "help") => {
+            print_help();
+            Ok(())
+        }
+        // Private entry point for the process tmux runs inside the dedicated
+        // corc session. Keeping this explicit means public startup never
+        // depends on guessing its role from the surrounding tmux session.
+        Some("__tui") => ui::run(),
         Some("projects") => projects::run(),
         Some("pick-dir") => pick_dir(&args),
         Some("jump") => jump(&args),
         Some("shortcuts") => shortcuts(),
-        Some(other) => anyhow::bail!(
-            "unknown command: {other} (expected: open, list, doctor, projects, pick-dir, jump, shortcuts)"
-        ),
+        Some(other) => anyhow::bail!("unknown command: {other} (run `corc --help` for usage)"),
     }
+}
+
+fn print_help() {
+    println!(
+        "\
+corc — a tmux-native hub for agent CLIs
+
+Usage:
+  corc [COMMAND]
+
+Commands:
+  open    Open corc, or toggle back when already there
+  list    List every conversation corc owns
+  doctor  Check tmux, agents, PATH, and state access
+  help    Print this help
+
+Running corc without a command is the same as `corc open`."
+    );
 }
 
 /// `corc pick-dir [--out FILE]` (D22): a centered picker over the merged
@@ -183,10 +207,10 @@ fn shortcuts() -> Result<()> {
     Ok(())
 }
 
-/// `corc open` (D15): the Ctrl+q toggle. Already in the corc session ⇒ go back
-/// to the session the client came from; anywhere else ⇒ make sure the visible
-/// `corc` session exists with the TUI running and take the client there. Bound
-/// to Ctrl+q in tmux.conf via run-shell.
+/// `corc` / `corc open` (D15): the Ctrl+q toggle. Already in the corc session
+/// ⇒ go back to the session the client came from; anywhere else ⇒ make sure
+/// the visible `corc` session exists with the TUI running and take the client
+/// there. Bound to Ctrl+q in tmux.conf via run-shell.
 fn open() -> Result<()> {
     let exe = self_exe();
     // switch-client only works from inside tmux; that covers both a shell in

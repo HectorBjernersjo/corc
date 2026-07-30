@@ -53,16 +53,16 @@ cargo install --path .
 
 ## tmux setup — do you need to change anything?
 
-**Not strictly.** You can launch corc from any terminal with:
+**Not strictly.** Launch corc from any terminal with:
 
 ```sh
-corc open
+corc
 ```
 
 That creates the visible `_corc` session, starts the TUI in it, and attaches
-your terminal (or switches your client if you're already in tmux). Running the
-bare `corc` command only works from inside tmux, because the TUI takes over the
-current pane — so `corc open` is the entry point you actually want.
+your terminal (or switches your client if you're already in tmux). `corc open`
+is the explicit form of the same command and doubles as a toggle when invoked
+from the `_corc` session.
 
 **Recommended:** bind it to a key so you can jump to corc from anywhere. Add
 this to your `~/.tmux.conf` (or `~/.config/tmux/tmux.conf`):
@@ -83,16 +83,15 @@ first use. Reload with `tmux source-file ~/.tmux.conf`.
 The `N` key opens a picker to start a new conversation in a directory. It reads
 `~/.config/corc/directories.txt` (one directory path per line), merges it with
 machine-local directories stored in corc's state, and expands each git repo's
-worktrees. For compatibility, the old `~/.config/tmux/directories.txt` path is
-used when the corc-specific file does not exist. The `p` key adds a directory
-to the machine-local list in `~/.local/state/corc/state.json` (with `Tab`
-completion, prefilled from `$HOME`) and immediately starts a conversation
-there. Use `directories.txt` for a hand-curated list you want to sync between
-machines, and `p` for local additions.
+worktrees. The `p` key adds a directory to the machine-local list in
+`~/.local/state/corc/state.json` (with `Tab` completion, prefilled from
+`$HOME`) and immediately starts a conversation there. Use `directories.txt`
+for a hand-curated list you want to sync between machines, and `p` for local
+additions.
 
 ## Usage
 
-Launch with `corc open` (or `Ctrl+q` if you bound it). Inside the TUI:
+Launch with `corc` (or `Ctrl+q` if you bound it). Inside the TUI:
 
 | Key | Action |
 |---|---|
@@ -139,11 +138,12 @@ still exits if you need a hard escape hatch.
 
 ### Other commands
 
-- `corc` — the TUI (must be run inside tmux; normally launched via `corc open`).
-- `corc open` — create/enter the corc session (bind this to a key).
+- `corc` — create or enter the corc session.
+- `corc open` — the explicit form of `corc` (bind this to a key).
 - `corc list` — print every conversation corc owns, grouped by project.
 - `corc doctor` — check tmux compatibility, agent binaries, `PATH`, and state
   file permissions.
+- `corc --help` — show command-line help.
 
 ## How it works
 

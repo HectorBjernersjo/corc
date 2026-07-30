@@ -86,8 +86,8 @@ pub fn ensure_hidden_session() -> Result<()> {
 }
 
 /// Make sure the TUI session exists with the TUI running in it (D15).
-/// `exe` is the absolute path to the corc binary (the TUI becomes
-/// the pane command, so quitting it closes its window).
+/// `exe` is the absolute path to the corc binary. tmux starts its private
+/// `__tui` entry point as the pane command, so quitting it closes its window.
 ///
 /// The session can exist without a TUI pane (something went wrong), in
 /// which case the TUI gets a fresh window there. If a TUI pane already
@@ -95,7 +95,7 @@ pub fn ensure_hidden_session() -> Result<()> {
 /// lands on it.
 pub fn ensure_tui_session(exe: &str) -> Result<()> {
     if !session_exists(TUI_SESSION) {
-        tmux(&["new-session", "-d", "-s", TUI_SESSION, exe])?;
+        tmux(&["new-session", "-d", "-s", TUI_SESSION, exe, "__tui"])?;
         return Ok(());
     }
     let tui_name = Path::new(exe)
@@ -125,7 +125,13 @@ pub fn ensure_tui_session(exe: &str) -> Result<()> {
             tmux(&["select-window", "-t", &format!("={TUI_SESSION}:{window}")])?;
         }
         None => {
-            tmux(&["new-window", "-t", &format!("={TUI_SESSION}:"), exe])?;
+            tmux(&[
+                "new-window",
+                "-t",
+                &format!("={TUI_SESSION}:"),
+                exe,
+                "__tui",
+            ])?;
         }
     }
     Ok(())

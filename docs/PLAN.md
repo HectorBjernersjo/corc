@@ -163,7 +163,7 @@ selection.
 
 ### D14 — Directory picker (feature 12)
 
-`n` opens a ratatui-native overlay: `~/.config/tmux/directories.txt` expanded
+`n` opens a ratatui-native overlay: `~/.config/corc/directories.txt` expanded
 with `git worktree list --porcelain` per repo, deduped — the same source and
 expansion as `new.sh`, ported to Rust. Same word-substring matching as the
 existing `/` filter. Selecting spawns a fresh Claude in a new hidden window
@@ -172,8 +172,9 @@ and swaps it in immediately; `Esc` cancels. The picker shows directories only
 
 ### D15 — Where corc lives
 
-A **visible** session named `_corc`. New subcommand `corc open`: ensure the
-session exists with the TUI running, then `switch-client` to it. Dotfiles get
+A **visible** session named `_corc`. Both `corc` and `corc open` ensure the
+session exists with the TUI running, then `switch-client` to it. tmux starts
+the TUI through the private `corc __tui` entry point. Dotfiles get
 `bind -n C-q run-shell "corc open"` (C-q is free; C-f keeps `new.sh`).
 
 ### D16 — Startup reconciliation
@@ -185,8 +186,8 @@ into a uuid-named hidden window.
 
 ### D17 — CLI surface
 
-- `corc` — the TUI.
-- `corc open` — see D15.
+- `corc` — create/enter the corc session; see D15.
+- `corc open` — explicit form of `corc`, used by the tmux binding.
 - `corc list` — kept, rewritten to read the state file + statuses (for
   scripting/inspection).
 - `corc watch` — deleted (debug tool for the guessing logic that no longer

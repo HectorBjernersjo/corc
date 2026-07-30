@@ -16,21 +16,12 @@ fn config_directories_file() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/corc/directories.txt"))
 }
 
-/// The lines of the shared directory list. Falls back to the pre-D20 path
-/// (`~/.config/tmux/directories.txt`, shared with the old new.sh) while the
-/// file has not been migrated, so nothing is lost on upgrade. Missing files
-/// are treated as empty rather than an error — the local list may be enough.
+/// The lines of the shared directory list. A missing file is treated as empty
+/// rather than an error — the local list may be enough.
 fn config_directories() -> Vec<String> {
-    let read = |p: PathBuf| std::fs::read_to_string(p).ok();
     let text = config_directories_file()
         .ok()
-        .and_then(read)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".config/tmux/directories.txt"))
-                .and_then(read)
-        })
+        .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
     text.lines()
         .map(str::trim)

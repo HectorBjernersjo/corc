@@ -43,7 +43,7 @@ spawns a fresh conversation with the active provider in a hidden-session
 window and swaps it in immediately; Esc cancels.
 
 **corc session**:
-The visible tmux session named `_corc` where the TUI itself lives (underscore-prefixed so it never clashes with a project session named after a directory). `Ctrl+q` (root-table tmux binding → `corc open`) creates it and starts the TUI if needed, then switches the client there. On quit corc swaps the viewed pane home and removes the content pane it created.
+The visible tmux session named `_corc` where the TUI itself lives (underscore-prefixed so it never clashes with a project session named after a directory). `corc` creates it and starts the TUI through the private `corc __tui` entry point if needed, then attaches or switches the client there. `Ctrl+q` uses the explicit `corc open` form from a root-table tmux binding. On quit corc swaps the viewed pane home and removes the content pane it created.
 
 **Real session**:
 The user's normal tmux session for a project (created by `new.sh`, named after the directory) — where nvim etc. live, as opposed to the hidden session.
