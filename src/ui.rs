@@ -4,6 +4,7 @@
 //! session (ADR-0001).
 
 use crate::provider::{self, MetaStore};
+use crate::repo::project_display;
 use crate::state::{self, State};
 use crate::status::{self, Status};
 use crate::{picker, tmux, truncate, usage};
@@ -24,7 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 enum Item {
@@ -67,6 +68,43 @@ fn attention_panel_height(count: usize, content_height: u16) -> u16 {
         .max(2)
         .min(content_height.saturating_sub(1));
     (count as u16 + 1).min(max)
+}
+
+/// Build the top-panel rows. Pins are always included and sort before the
+/// transient Running/Question/Unseen rows; each group then follows project
+/// order and newest-created-first order for a stable, predictable list.
+fn attention_indices(state: &State, statuses: &[Status]) -> Vec<usize> {
+    let mut indices: Vec<usize> = state
+        .conversations
+        .iter()
+        .enumerate()
+        .filter(|(i, conversation)| {
+            conversation.pinned
+                || matches!(
+                    statuses.get(*i),
+                    Some(Status::Running | Status::Question | Status::Unseen)
+                )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let project_rank = |conversation: &state::Conversation| {
+        state
+            .projects
+            .iter()
+            .position(|project| *project == conversation.cwd.display().to_string())
+            .unwrap_or(usize::MAX)
+    };
+    indices.sort_by(|&a, &b| {
+        let ca = &state.conversations[a];
+        let cb = &state.conversations[b];
+        cb.pinned.cmp(&ca.pinned).then_with(|| {
+            project_rank(ca)
+                .cmp(&project_rank(cb))
+                .then_with(|| cb.created_at.cmp(&ca.created_at))
+                .then_with(|| ca.id.cmp(&cb.id))
+        })
+    });
+    indices
 }
 
 /// When the cursor lands on a project's first conversation, keep that
@@ -119,10 +157,12 @@ enum MenuAction {
     Shortcuts,
 }
 
-/// How far back Dead conversations remain visible. Live conversations are
-/// always shown, regardless of their age. `a` cycles through these in order.
+/// Which conversations remain visible in history. The Active option shows
+/// only conversations with a live tmux pane; the age windows add progressively
+/// older Dead conversations. `a` cycles through these in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryWindow {
+    Active,
     ThreeHours,
     OneDay,
     ThreeDays,
@@ -133,16 +173,18 @@ enum HistoryWindow {
 impl HistoryWindow {
     fn next(self) -> Self {
         match self {
+            Self::Active => Self::ThreeHours,
             Self::ThreeHours => Self::OneDay,
             Self::OneDay => Self::ThreeDays,
             Self::ThreeDays => Self::OneWeek,
             Self::OneWeek => Self::AllTime,
-            Self::AllTime => Self::ThreeHours,
+            Self::AllTime => Self::Active,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Active => "active",
             Self::ThreeHours => "3h",
             Self::OneDay => "1D",
             Self::ThreeDays => "3D",
@@ -153,6 +195,7 @@ impl HistoryWindow {
 
     fn cutoff_secs(self) -> Option<u64> {
         match self {
+            Self::Active => Some(0),
             Self::ThreeHours => Some(3 * 3600),
             Self::OneDay => Some(24 * 3600),
             Self::ThreeDays => Some(3 * 24 * 3600),
@@ -162,7 +205,14 @@ impl HistoryWindow {
     }
 
     fn hides(self, status: Option<&Status>, age_secs: u64) -> bool {
-        status == Some(&Status::Dead) && self.cutoff_secs().is_some_and(|cutoff| age_secs > cutoff)
+        status == Some(&Status::Dead)
+            && (self == Self::Active || self.cutoff_secs().is_some_and(|cutoff| age_secs > cutoff))
+    }
+
+    /// The two endpoint views mean exactly what their labels say: neither is
+    /// allowed to fold conversations behind the per-project list cap.
+    fn is_uncapped(self) -> bool {
+        matches!(self, Self::Active | Self::AllTime)
     }
 }
 
@@ -260,6 +310,21 @@ impl RenderSchedule {
 /// apart from the merely-selected one. Frees its dot to show real status (D6)
 /// instead of a green "you are here" marker.
 const VIEWED_BG: Color = Color::Rgb(38, 50, 71);
+/// Pinned conversations reuse the existing status circle with an orchid pink
+/// color, keeping the row geometry and background exactly as before.
+const PINNED_DOT: Color = Color::Rgb(218, 112, 214);
+
+/// Activity is more urgent than organization: Running stays yellow and
+/// Question/Unseen stay blue even when pinned. The pin color is the fallback
+/// for quiet Idle/Dead conversations, preserving Dead's hollow circle.
+fn conversation_dot(status: Status, pinned: bool) -> (&'static str, Color) {
+    match status {
+        Status::Running => ("●", Color::Yellow),
+        Status::Question | Status::Unseen => ("●", Color::Blue),
+        Status::Idle => ("●", if pinned { PINNED_DOT } else { Color::Gray }),
+        Status::Dead => ("○", if pinned { PINNED_DOT } else { Color::Gray }),
+    }
+}
 
 /// The `s` provider-switch overlay: a fuzzy picker over the registered
 /// providers. Enter sets the provider for conversations spawned from now on.
@@ -292,7 +357,7 @@ struct App {
     /// Conversation currently swapped into the content slot.
     viewed: Option<String>,
     /// Flat, status-driven panel above the project-grouped sidebar: indices
-    /// into `state.conversations` whose status is Running or Unseen.
+    /// into `state.conversations` whose status is Running, Question, or Unseen.
     attention: Vec<usize>,
     /// When Some, the cursor is in the attention panel at this row.
     attention_sel: Option<usize>,
@@ -309,7 +374,7 @@ struct App {
     /// Conversation id awaiting the `y/n` kill confirmation (`x` on a
     /// Running conversation, D12).
     pending_kill: Option<String>,
-    /// `a` cycles how far back Dead conversations remain visible (D12).
+    /// `a` cycles active-only and how far back Dead conversations remain visible (D12).
     history_window: HistoryWindow,
     /// How many conversations the current history window/list cap is hiding.
     hidden: usize,
@@ -646,6 +711,7 @@ impl App {
             KeyCode::Char('n') => self.new_conversation_here(),
             KeyCode::Char('N') => self.open_picker(),
             KeyCode::Char('s') => self.open_provider_picker(),
+            KeyCode::Char('p') => self.toggle_selected_pin(),
             KeyCode::Char('x') => self.kill_or_remove(),
             KeyCode::Char('V') => {
                 self.focus_attention_in_list();
@@ -891,34 +957,7 @@ impl App {
             .and_then(|pos| self.attention.get(pos))
             .and_then(|i| self.state.conversations.get(*i))
             .map(|c| c.id.clone());
-        self.attention = self
-            .state
-            .conversations
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                matches!(
-                    self.statuses.get(*i),
-                    Some(Status::Running | Status::Unseen)
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
-        self.attention.sort_by(|&a, &b| {
-            let ca = &self.state.conversations[a];
-            let cb = &self.state.conversations[b];
-            let project_rank = |c: &state::Conversation| {
-                self.state
-                    .projects
-                    .iter()
-                    .position(|p| *p == c.cwd.display().to_string())
-                    .unwrap_or(usize::MAX)
-            };
-            project_rank(ca)
-                .cmp(&project_rank(cb))
-                .then_with(|| cb.created_at.cmp(&ca.created_at))
-                .then_with(|| ca.id.cmp(&cb.id))
-        });
+        self.attention = attention_indices(&self.state, &self.statuses);
         if let Some(id) = keep {
             self.attention_sel = self
                 .attention
@@ -959,7 +998,7 @@ impl App {
             let mut kept = Vec::new();
             for i in indices {
                 // Dead conversations outside the selected history window stay
-                // out of the list (D12). Live conversations are always shown.
+                // out of the list (D12). The Active window hides all of them.
                 if self.statuses.get(i) == Some(&Status::Dead) {
                     let conv = &self.state.conversations[i];
                     let age = now.saturating_sub(status::last_active_ts(
@@ -988,9 +1027,9 @@ impl App {
             // (D13). Membership follows activity, but the survivors stay in
             // the fixed creation order for display: rank a copy by activity,
             // keep the top `MAX_PER_PROJECT`, then drop the rest from `kept`
-            // without disturbing its order. The all-time window and an active
-            // text filter both bypass the cap.
-            if self.history_window != HistoryWindow::AllTime
+            // without disturbing its order. The active-only and all-time
+            // windows, plus an active text filter, bypass the cap.
+            if !self.history_window.is_uncapped()
                 && filter.is_empty()
                 && kept.len() > MAX_PER_PROJECT
             {
@@ -1404,7 +1443,12 @@ impl App {
         for i in 0..self.state.conversations.len() {
             let (id, cwd, created_at, provider_id) = {
                 let c = &self.state.conversations[i];
-                (c.id.clone(), c.cwd.clone(), c.created_at, c.provider.clone())
+                (
+                    c.id.clone(),
+                    c.cwd.clone(),
+                    c.created_at,
+                    c.provider.clone(),
+                )
             };
             let prov = provider::by_id(&provider_id);
             if !prov.is_pending(&id) {
@@ -1513,7 +1557,41 @@ impl App {
                 self.refresh();
             }
             Status::Running => self.pending_kill = Some(id),
-            Status::Unseen | Status::Idle => self.kill_conversation(&id),
+            Status::Question | Status::Unseen | Status::Idle => self.kill_conversation(&id),
+        }
+    }
+
+    /// `p`: persistently pin or unpin the conversation under the active
+    /// cursor. Pinned conversations live first in the top panel even when
+    /// Dead or outside the selected history window.
+    fn toggle_selected_pin(&mut self) {
+        let from_attention = self.attention_sel.is_some();
+        let id = if from_attention {
+            self.attention_selected_conv_id()
+        } else if self.menu_sel.is_none() {
+            self.main_selected_conv_id()
+        } else {
+            None
+        };
+        let Some(id) = id else {
+            return;
+        };
+        let Some(pinned) = self.state.toggle_pin(&id) else {
+            return;
+        };
+        self.status_msg = self.state.save().err().map(|e| e.to_string());
+        self.rebuild_keeping_selection();
+
+        // Unpinning an Idle/Dead row removes it from the top panel. Hand the
+        // cursor back to its canonical project row when that row is visible.
+        if from_attention
+            && !pinned
+            && self.attention_sel.is_none()
+            && let Some(pos) = self.items.iter().position(
+                |item| matches!(item, Item::Conv(i) if self.state.conversations[*i].id == id),
+            )
+        {
+            self.selected = pos;
         }
     }
 
@@ -1932,8 +2010,8 @@ impl App {
     }
 
     /// A conversation row: `● title………time`, the time right-aligned and
-    /// dim. Status colors per D6: Running yellow ●, Unseen blue ●, Idle
-    /// gray ●, Dead hollow ○. The viewed conversation carries a blue row
+    /// dim. Status colors per D6: Running yellow ●, Question/Unseen blue ●,
+    /// Idle gray ●, Dead hollow ○. The viewed conversation carries a blue row
     /// background (`VIEWED_BG`) rather than a recolored dot, so its dot keeps
     /// showing status like any other row.
     fn render_conv(
@@ -1947,12 +2025,7 @@ impl App {
     ) -> ListItem<'static> {
         let conv = &self.state.conversations[i];
         let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
-        let (dot, color) = match status {
-            Status::Running => ("●", Color::Yellow),
-            Status::Unseen => ("●", Color::Blue),
-            Status::Idle => ("●", Color::Gray),
-            Status::Dead => ("○", Color::Gray),
-        };
+        let (dot, dot_color) = conversation_dot(status, conv.pinned);
         let meta = self.metas.meta(&conv.id);
         let mut title = meta
             .and_then(|m| m.display_title())
@@ -1993,7 +2066,7 @@ impl App {
         let pad = width.saturating_sub(3 + t.chars().count() + time_w);
         let item = ListItem::new(Line::from(vec![
             Span::raw(" "),
-            Span::styled(dot, Style::default().fg(color)),
+            Span::styled(dot, Style::default().fg(dot_color)),
             Span::raw(" "),
             Span::styled(t, title_style),
             Span::raw(" ".repeat(pad)),
@@ -2184,39 +2257,6 @@ fn contains(area: Rect, col: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-/// Project group header (D8): directory basename only. A git worktree —
-/// detected by `.git` being a *file* with a `gitdir:` pointer — shows as
-/// `{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
-fn project_display(path: &str) -> String {
-    let dir = Path::new(path);
-    let base = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    if let Some(repo) = worktree_repo(dir) {
-        return format!("{repo}/{base}");
-    }
-    base
-}
-
-/// The main repo's basename if `dir` is a git worktree, else None. A
-/// worktree's `.git` is a file `gitdir: <repo>/.git/worktrees/<name>`.
-fn worktree_repo(dir: &Path) -> Option<String> {
-    let gitfile = dir.join(".git");
-    if !std::fs::metadata(&gitfile).ok()?.is_file() {
-        return None;
-    }
-    let content = std::fs::read_to_string(&gitfile).ok()?;
-    let gitdir = content.strip_prefix("gitdir:")?.trim();
-    let (repo_path, _) = gitdir.split_once("/.git/worktrees/")?;
-    Some(
-        Path::new(repo_path)
-            .file_name()?
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
 fn conversation_is_empty(
     conversation: Option<&state::Conversation>,
     meta: Option<&crate::discovery::Meta>,
@@ -2229,9 +2269,10 @@ fn conversation_is_empty(
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryWindow, Item, Panel, RenderKind, RenderSchedule, RepaintSchedule, adjacent_panel,
-        attention_panel_height, conversation_is_empty, force_full_redraw,
-        keep_first_conversation_context_visible, project_display, set_list_highlight,
+        HistoryWindow, Item, PINNED_DOT, Panel, RenderKind, RenderSchedule, RepaintSchedule,
+        adjacent_panel, attention_indices, attention_panel_height, conversation_dot,
+        conversation_is_empty, force_full_redraw, keep_first_conversation_context_visible,
+        set_list_highlight,
     };
     use crate::discovery::Meta;
     use crate::state::Conversation;
@@ -2240,23 +2281,23 @@ mod tests {
     use ratatui::backend::{Backend, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
     use ratatui::layout::{Position, Size};
+    use ratatui::style::Color;
     use ratatui::text::Line;
     use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-    use std::fs;
     use std::io;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn history_window_cycles_through_every_supported_age() {
-        let mut window = HistoryWindow::ThreeHours;
+    fn history_window_cycles_through_every_supported_view() {
+        let mut window = HistoryWindow::Active;
         let mut labels = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             labels.push(window.label());
             window = window.next();
         }
 
-        assert_eq!(labels, ["3h", "1D", "3D", "1W", "all time"]);
-        assert_eq!(window, HistoryWindow::ThreeHours);
+        assert_eq!(labels, ["active", "3h", "1D", "3D", "1W", "all time"]);
+        assert_eq!(window, HistoryWindow::Active);
     }
 
     #[test]
@@ -2266,6 +2307,9 @@ mod tests {
         assert!(three_hours.hides(Some(&Status::Dead), 3 * 3600 + 1));
         assert!(!three_hours.hides(Some(&Status::Idle), 3 * 3600 + 1));
         assert!(!HistoryWindow::AllTime.hides(Some(&Status::Dead), u64::MAX));
+        assert!(HistoryWindow::Active.hides(Some(&Status::Dead), 0));
+        assert!(!HistoryWindow::Active.hides(Some(&Status::Idle), u64::MAX));
+        assert!(HistoryWindow::Active.is_uncapped());
     }
 
     #[test]
@@ -2324,7 +2368,59 @@ mod tests {
             provider: "claude".into(),
             turn_started_at: None,
             content_seen,
+            pinned: false,
         }
+    }
+
+    #[test]
+    fn pins_are_always_included_and_sort_before_transient_attention() {
+        let mut running = conversation(true);
+        running.id = "running".into();
+        running.created_at = 20;
+
+        let mut pinned = conversation(true);
+        pinned.id = "pinned".into();
+        pinned.created_at = 10;
+        pinned.pinned = true;
+
+        let mut unseen = conversation(true);
+        unseen.id = "unseen".into();
+        unseen.created_at = 30;
+
+        let mut question = conversation(true);
+        question.id = "question".into();
+        question.created_at = 35;
+
+        let mut idle = conversation(true);
+        idle.id = "idle".into();
+        idle.created_at = 40;
+
+        let state = crate::state::State {
+            projects: vec!["/tmp".into()],
+            conversations: vec![running, pinned, unseen, question, idle],
+            ..Default::default()
+        };
+        let statuses = [
+            Status::Running,
+            Status::Dead,
+            Status::Unseen,
+            Status::Question,
+            Status::Idle,
+        ];
+
+        assert_eq!(attention_indices(&state, &statuses), [1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn activity_dot_colors_take_precedence_over_pin_color() {
+        assert_eq!(
+            conversation_dot(Status::Running, true),
+            ("●", Color::Yellow)
+        );
+        assert_eq!(conversation_dot(Status::Question, true), ("●", Color::Blue));
+        assert_eq!(conversation_dot(Status::Unseen, true), ("●", Color::Blue));
+        assert_eq!(conversation_dot(Status::Idle, true), ("●", PINNED_DOT));
+        assert_eq!(conversation_dot(Status::Dead, true), ("○", PINNED_DOT));
     }
 
     #[test]
@@ -2511,40 +2607,11 @@ mod tests {
 
     #[test]
     fn entering_menu_hides_list_highlight_without_resetting_scroll() {
-        let mut state = ListState::default()
-            .with_offset(8)
-            .with_selected(Some(10));
+        let mut state = ListState::default().with_offset(8).with_selected(Some(10));
 
         set_list_highlight(&mut state, None);
 
         assert_eq!(state.selected(), None);
         assert_eq!(state.offset(), 8);
-    }
-
-    /// D8: basename for plain dirs, `{repo}/{worktree}` for git worktrees.
-    #[test]
-    fn project_headers() {
-        let base = std::env::temp_dir().join("corc-test-project-display");
-        let _ = fs::remove_dir_all(&base);
-
-        let plain = base.join("myproj");
-        fs::create_dir_all(&plain).unwrap();
-        assert_eq!(project_display(&plain.to_string_lossy()), "myproj");
-
-        // A normal repo has a .git *directory* — still basename only.
-        fs::create_dir_all(plain.join(".git")).unwrap();
-        assert_eq!(project_display(&plain.to_string_lossy()), "myproj");
-
-        // A worktree has a .git *file* with a gitdir: pointer.
-        let wt = base.join("fix-ui");
-        fs::create_dir_all(&wt).unwrap();
-        fs::write(
-            wt.join(".git"),
-            "gitdir: /home/hector/Projects/corc/.git/worktrees/fix-ui\n",
-        )
-        .unwrap();
-        assert_eq!(project_display(&wt.to_string_lossy()), "corc/fix-ui");
-
-        let _ = fs::remove_dir_all(&base);
     }
 }

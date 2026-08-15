@@ -82,6 +82,7 @@ or deleted**.
 | State | Condition | Look | Time column |
 |---|---|---|---|
 | **Running** | pane alive, runtime working hint or turn in flight | yellow ● | elapsed since turn start (`4m`, `1h12m`) |
+| **Question** | pane alive, unanswered provider question | blue ● | age of the active question |
 | **Unseen** | pane alive, turn completed after `last_viewed` | blue ● | duration the completed turn ran |
 | **Idle** | pane alive, turn complete, viewed since | gray ● | empty if < 1h old, else coarse age (`5h`) |
 | **Dead** | no pane | hollow ○ | coarse age (`5h`, `3d`), never finer than hours |
@@ -146,7 +147,8 @@ selection.
 - `x` on a live conversation kills its Claude and window (`y/n` confirm if
   Running); `x` on a Dead one removes it from the state file and the list.
 - Dead conversations outside the selected history window are hidden; `a`
-  cycles 3h / 1D / 3D / 1W / all time (default 1W).
+  cycles active / 3h / 1D / 3D / 1W / all time (default 1W). Active shows
+  every conversation backed by a live tmux pane and no dead conversations.
 
 ### D13 — Digit jump (feature 11)
 
@@ -203,7 +205,7 @@ into a uuid-named hidden window.
 | `x` | kill live / remove dead (confirm when Running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `1`–`9` | digit jump to real session window N |
-| `a` | cycle visible history (3h / 1D / 3D / 1W / all time) |
+| `a` | cycle visible history (active / 3h / 1D / 3D / 1W / all time) |
 | `/` | filter |
 | `q` | quit (swap home, remove content pane) |
 
@@ -247,15 +249,15 @@ survives corc restart (reconciliation), and quitting restores everything.
 
 - `discovery.rs`: track `turn_started_at` / `turn_completed_at` per
   conversation (D7).
-- `status.rs` rewritten: derive Running/Unseen/Idle/Dead from window
+- `status.rs` rewritten: derive Running/Question/Unseen/Idle/Dead from window
   existence + turn state + `last_viewed` (D6).
 - Sidebar rows: the four looks (yellow/blue/gray/hollow) and the per-state
   time column; `last_viewed` maintained for the viewed conversation and
   persisted on swap/quit.
 - Fixed within-project ordering by creation time, newest first (D9).
 
-**Done when:** a finished run turns blue until swapped in, the viewed
-conversation never turns blue, and no seconds appear anywhere.
+**Done when:** a finished run turns blue until swapped in, only an active
+question remains blue while viewed, and no seconds appear anywhere.
 
 ### Step 3 — Lifecycle
 

@@ -25,8 +25,10 @@ they exit or you reboot.
     resumes with `opencode --session <id>`. OpenCode creates its session when
     the first prompt is sent, after which corc adopts its `ses_...` id.
   - Switch which one new conversations use with `s` (see below).
-- **git** (optional) — only used to detect git worktrees for the project
-  labels and the directory picker.
+- **git** / **jj** (both optional) — only used to expand a repo into its other
+  checkouts (git worktrees, jj workspaces) for the directory picker. Project
+  labels and session names detect a checkout straight from the filesystem, so
+  they work without either binary.
 
 ## Install
 
@@ -81,13 +83,29 @@ first use. Reload with `tmux source-file ~/.tmux.conf`.
 ### Optional: the directory picker
 
 The `N` key opens a picker to start a new conversation in a directory. It reads
-`~/.config/corc/directories.txt` (one directory path per line), merges it with
-machine-local directories stored in corc's state, and expands each git repo's
-worktrees. The `p` key adds a directory to the machine-local list in
-`~/.local/state/corc/state.json` (with `Tab` completion, prefilled from
-`$HOME`) and immediately starts a conversation there. Use `directories.txt`
-for a hand-curated list you want to sync between machines, and `p` for local
-additions.
+`~/.config/corc/directories.txt` (one directory path per line, `~` expanded,
+`#` comments ignored), merges it with machine-local directories stored in corc's
+state, and expands each repo into its other checkouts — git worktrees and jj
+workspaces alike. A secondary checkout is labelled `{repo}/{checkout}`, which is
+also the name of the tmux session it gets.
+
+A line ending in `/*` is a **scan root**: every checkout up to three levels
+below it is listed on its own, most recently modified first, without being
+named in the file. Containers are looked through, checkouts are never descended
+into, and dotted directories and symlinks are skipped:
+
+```
+~/projects/*
+~/work/*
+~/some/one-off-repo
+```
+
+That covers new worktrees and workspaces the moment they exist, and costs no
+`git`/`jj` process at all — a checkout is recognised straight from disk.
+
+The picker's “+ add directory…” row switches to path completion and can save
+a new machine-local directory in `~/.local/state/corc/state.json`. Use
+`directories.txt` for a hand-curated list you want to sync between machines.
 
 ## Usage
 
@@ -101,22 +119,24 @@ Launch with `corc` (or `Ctrl+q` if you bound it). Inside the TUI:
 | `Enter` / click | view the conversation (resumes it if dead) |
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
-| `p` | add a machine-local directory (Tab-complete) → new conversation there |
+| `p` | pin / unpin the selected conversation at the top |
 | `s` | switch which agent new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `Alt+1`–`Alt+9` | jump to window N of the project's normal tmux session |
-| `a` | cycle visible history: `3h` / `1D` / `3D` / `1W` / `all time` |
+| `a` | cycle visible history: `active` / `3h` / `1D` / `3D` / `1W` / `all time` |
 | `/` | filter the list |
 
-The history window applies to dead conversations; live conversations always
-remain visible. It starts at `1W` each time corc launches.
+The `active` history view shows every conversation with a live tmux pane and
+no dead conversations. The age windows add recent dead conversations; live
+ones always remain visible. History starts at `1W` each time corc launches.
 
-Running (yellow) and unseen (blue) conversations are also collected in an
-unlabelled status panel at the top. `j`/`k` cross into adjacent panels at their
-boundaries, while `Ctrl+j`/`Ctrl+k` jump directly between panels. Selecting an
-status row opens it and moves the selection to its normal project-grouped
-row in the sidebar.
+Pinned conversations (pink-purple while idle or dead), running conversations
+(yellow), active questions (blue), and unseen conversations (blue) are collected in an
+unlabelled panel at the top, with pinned rows first. Pins remain there across restarts and regardless of the
+history window. `j`/`k` cross into adjacent panels at their boundaries, while
+`Ctrl+j`/`Ctrl+k` jump directly between panels. Selecting a top-panel row opens
+it and moves the selection to its normal project-grouped row in the sidebar.
 
 On Linux this also works with stock `vim-tmux-navigator` configuration. corc
 identifies its sidebar process as `corc/view`, consumes `Ctrl+j`/`Ctrl+k` while
@@ -129,7 +149,8 @@ conversations you start afterwards; it's persisted, so the choice survives
 restarts. Provider metadata is read from each CLI's local, read-only history:
 Claude and Codex JSONL transcripts, Cursor's chat stores, and OpenCode's SQLite
 database. This drives titles and the same Running, Unseen, Idle, and Dead
-states across providers. An untouched Codex or OpenCode conversation stays
+states across providers, plus a blue Question state where the provider exposes
+structured interactive questions. An untouched Codex or OpenCode conversation stays
 `(untitled)` until the CLI creates its real session on the first prompt.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop

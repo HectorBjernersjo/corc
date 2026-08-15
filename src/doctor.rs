@@ -2,7 +2,7 @@
 //! It checks tmux compatibility, agent binaries, PATH visibility and whether
 //! the persistent state can be read and written.
 
-use crate::{provider, state, tmux};
+use crate::{picker, provider, state, tmux};
 use anyhow::{Result, bail};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ pub fn run() -> Result<()> {
     check_path(&mut errors, &mut warnings);
     check_providers(&mut errors, &mut warnings);
     check_state(&mut errors);
+    check_directories(&mut warnings);
 
     println!();
     if errors > 0 {
@@ -196,6 +197,60 @@ fn check_state(errors: &mut usize) {
             error("state write", &format!("{}: {e}", path.display()));
             *errors += 1;
         }
+    }
+}
+
+/// What the `N` picker and `corc projects` would list, and which machine-local
+/// entries have gone stale — a moved or deleted directory is silently dropped
+/// from the list, so this is the only place it shows up. Purely informational:
+/// a stale entry costs nothing but noise in `state.json`.
+fn check_directories(warnings: &mut usize) {
+    let Ok(state) = state::State::load() else {
+        return; // check_state already reported it.
+    };
+    let Ok(dirs) = picker::list_directories(&state.directories) else {
+        return;
+    };
+    ok(
+        "directories",
+        &format!(
+            "{} directories from {} local entr{}",
+            dirs.len(),
+            state.directories.len(),
+            if state.directories.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ),
+    );
+
+    let stale: Vec<&String> = state
+        .directories
+        .iter()
+        .filter(|dir| {
+            let expanded = picker::expand_tilde(dir.trim());
+            let root = expanded.strip_suffix("/*").unwrap_or(&expanded);
+            !Path::new(root).is_dir()
+        })
+        .collect();
+    if !stale.is_empty() {
+        let sample: Vec<&str> = stale.iter().take(3).map(|d| d.as_str()).collect();
+        warn(
+            "directories",
+            &format!(
+                "{} local entr{} no longer exist and are skipped: {}{}",
+                stale.len(),
+                if stale.len() == 1 { "y" } else { "ies" },
+                sample.join(", "),
+                if stale.len() > sample.len() {
+                    ", …"
+                } else {
+                    ""
+                }
+            ),
+        );
+        *warnings += 1;
     }
 }
 

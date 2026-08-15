@@ -376,6 +376,35 @@ mod tests {
         assert!(!is_tui_command("bash", "corc"));
     }
 
+    /// A plain project keeps its basename (with tmux-reserved `.` replaced);
+    /// a secondary checkout is scoped by its repo so same-named worktrees of
+    /// different repos get one session each.
+    #[test]
+    fn session_names_scope_secondary_checkouts_by_repo() {
+        let base = std::env::temp_dir().join("corc-test-session-names");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let plain = base.join("my.proj");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(session_name_for(&plain), "my_proj");
+
+        let worktree = base.join("fix-ui");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /home/hector/projects/my.proj/.git/worktrees/fix-ui\n",
+        )
+        .unwrap();
+        assert_eq!(session_name_for(&worktree), "my_proj/fix-ui");
+
+        let workspace = base.join("fix-jj");
+        std::fs::create_dir_all(workspace.join(".jj")).unwrap();
+        std::fs::write(workspace.join(".jj/repo"), "../../my.proj/.jj/repo").unwrap();
+        assert_eq!(session_name_for(&workspace), "my_proj/fix-jj");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn vim_navigation_directions_map_to_tmux_flags() {
         assert_eq!(PaneDirection::Left.flag(), "-L");
@@ -448,12 +477,12 @@ pub fn all_panes() -> Result<HashMap<String, String>> {
 
 fn parse_panes(output: &str) -> HashMap<String, String> {
     output
-    .lines()
-    .filter_map(|line| {
-        let (id, title) = line.split_once('\t')?;
-        Some((id.to_string(), title.to_string()))
-    })
-    .collect()
+        .lines()
+        .filter_map(|line| {
+            let (id, title) = line.split_once('\t')?;
+            Some((id.to_string(), title.to_string()))
+        })
+        .collect()
 }
 
 /// Which session a pane currently lives in.
@@ -539,11 +568,21 @@ pub fn rename_hidden_window(old: &str, new: &str) -> Result<()> {
 // Real-session helpers, kept for digit jump (step 4).
 // ---------------------------------------------------------------------------
 
-/// Session naming convention from new.sh: basename with '.' → '_'.
+/// Session naming convention from new.sh: basename with '.' → '_' (tmux
+/// reserves `.` in session names). A secondary checkout — git worktree or jj
+/// workspace — is named `{repo}/{checkout}` instead, matching the sidebar's
+/// project header, so two repos' `fix-ui` worktrees get one session each.
+/// `/` is fine in a tmux session name, and every target here is an exact
+/// `=name` match, so the slash never reads as a pattern.
 pub fn session_name_for(dir: &Path) -> String {
-    dir.file_name()
-        .map(|n| n.to_string_lossy().replace('.', "_"))
-        .unwrap_or_else(|| format!("{APP_NAME}-unknown"))
+    let Some(base) = dir.file_name() else {
+        return format!("{APP_NAME}-unknown");
+    };
+    let base = base.to_string_lossy().replace('.', "_");
+    match crate::repo::parent_repo(dir) {
+        Some(repo) => format!("{}/{base}", repo.replace('.', "_")),
+        None => base,
+    }
 }
 
 /// Create a detached session (D13). A per-project `.tmux.sh` hook, if present,

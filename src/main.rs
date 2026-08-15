@@ -3,6 +3,7 @@ mod doctor;
 mod picker;
 mod projects;
 mod provider;
+mod repo;
 mod state;
 mod status;
 mod tmux;
@@ -180,13 +181,17 @@ fn shortcuts() -> Result<()> {
     section("Conversations");
     row("Enter · click", "view (resumes it if dead)");
     row("n", "new conversation in the selected directory");
-    row("N", "new conversation via the directory picker (add or create one from there)");
+    row(
+        "N",
+        "new conversation via the directory picker (add or create one from there)",
+    );
+    row("p", "pin / unpin the selected conversation at the top");
     row("s", "switch which agent new conversations use");
     row("x", "kill a live conversation / remove a dead one");
 
     section("Layout & misc");
     row("V, then K/J", "move mode: reorder projects");
-    row("a", "cycle history: 3h / 1D / 3D / 1W / all time");
+    row("a", "cycle history: active / 3h / 1D / 3D / 1W / all time");
     row("r", "refresh now");
     row("?", "this help");
     row("Ctrl+C", "quit corc");
@@ -303,6 +308,7 @@ fn list() -> Result<()> {
 pub fn status_icon(status: status::Status) -> &'static str {
     match status {
         status::Status::Running => "\x1b[33m●\x1b[0m",
+        status::Status::Question => "\x1b[34m●\x1b[0m",
         status::Status::Unseen => "\x1b[34m●\x1b[0m",
         status::Status::Idle => "\x1b[90m●\x1b[0m",
         status::Status::Dead => "\x1b[90m○\x1b[0m",

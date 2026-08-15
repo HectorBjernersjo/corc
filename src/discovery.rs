@@ -56,6 +56,16 @@ pub struct Meta {
     /// the jsonl mtime this ignores background title/checkpoint writes, so it
     /// can safely be used to detect an abandoned in-flight turn.
     pub turn_progress_at: Option<u64>,
+    /// Claude Code has emitted an `AskUserQuestion` tool call that has not
+    /// received its matching tool result yet. This is distinct from ordinary
+    /// Mid-turn work: the agent is blocked on the user, so the conversation
+    /// needs attention rather than a Running/Idle signal.
+    pub active_question: bool,
+    /// When the currently active question was asked, for its age column.
+    pub question_asked_at: Option<u64>,
+    /// Tool-use id used to distinguish the question's answer from unrelated
+    /// tool results in the same turn.
+    pub(crate) active_question_tool_id: Option<String>,
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
@@ -106,6 +116,9 @@ impl Default for Meta {
             turn_started_at: None,
             turn_completed_at: None,
             turn_progress_at: None,
+            active_question: false,
+            question_asked_at: None,
+            active_question_tool_id: None,
             mtime: SystemTime::UNIX_EPOCH,
         }
     }
@@ -204,7 +217,8 @@ impl Store {
                 }
             }
         }
-        self.files.retain(|id, _| known.iter().any(|(k, _)| k == id));
+        self.files
+            .retain(|id, _| known.iter().any(|(k, _)| k == id));
         Ok(())
     }
 
@@ -266,6 +280,19 @@ fn parse_from(
 
 fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
+
+    // AskUserQuestion stays open in Claude's transcript until its matching
+    // tool result is written. Track that structured lifecycle instead of
+    // scraping the terminal UI, whose pane title is identical to normal idle.
+    if !sidechain
+        && v["type"] == "user"
+        && question_was_answered(v, meta.active_question_tool_id.as_deref())
+    {
+        meta.active_question = false;
+        meta.question_asked_at = None;
+        meta.active_question_tool_id = None;
+    }
+
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
             meta.has_content = true;
@@ -300,6 +327,11 @@ fn apply(meta: &mut Meta, v: &Value) {
             meta.has_content = true;
             if let Some(ts) = record_timestamp(v) {
                 meta.turn_progress_at = Some(ts);
+            }
+            if let Some(id) = ask_user_question_id(v) {
+                meta.active_question = true;
+                meta.question_asked_at = record_timestamp(v);
+                meta.active_question_tool_id = Some(id.to_string());
             }
             match v["message"]["stop_reason"].as_str() {
                 Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
@@ -362,12 +394,42 @@ fn is_tool_result(v: &Value) -> bool {
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
 }
 
+/// The id of an AskUserQuestion tool call in an assistant record.
+fn ask_user_question_id(v: &Value) -> Option<&str> {
+    v["message"]["content"]
+        .as_array()?
+        .iter()
+        .find_map(|block| {
+            (block["type"] == "tool_use" && block["name"] == "AskUserQuestion")
+                .then(|| block["id"].as_str())?
+        })
+}
+
+/// Whether a user record answers the currently open AskUserQuestion. A real
+/// prompt also clears it as recovery for transcript versions that represent
+/// a cancelled question without a matching tool-result block.
+fn question_was_answered(v: &Value, question_id: Option<&str>) -> bool {
+    let Some(question_id) = question_id else {
+        return false;
+    };
+    if !is_tool_result(v) {
+        return !is_meta_user(v);
+    }
+    v["message"]["content"].as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block["type"] == "tool_result" && block["tool_use_id"].as_str() == Some(question_id)
+        })
+    })
+}
+
 /// The prompt text of a user record, reduced to a one-line title stand-in.
 fn prompt_text(v: &Value) -> Option<String> {
     let content = &v["message"]["content"];
     let text = content.as_str().map(str::to_string).or_else(|| {
         content.as_array()?.iter().find_map(|b| {
-            (b["type"] == "text").then(|| b["text"].as_str())?.map(str::to_string)
+            (b["type"] == "text")
+                .then(|| b["text"].as_str())?
+                .map(str::to_string)
         })
     })?;
     title_line(&text)
@@ -396,9 +458,7 @@ pub(crate) fn parse_iso8601(s: &str) -> Option<u64> {
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
     }
-    let num = |range: std::ops::Range<usize>| -> Option<i64> {
-        s.get(range)?.parse().ok()
-    };
+    let num = |range: std::ops::Range<usize>| -> Option<i64> { s.get(range)?.parse().ok() };
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
 
@@ -527,10 +587,7 @@ mod tests {
         );
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, start);
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:03:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:03:00Z"));
 
         // The turn_duration record completes the turn.
         apply(
@@ -553,10 +610,7 @@ mod tests {
                     "timestamp":"2026-07-08T10:06:00Z"}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:05:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
 
         // Claude's background records can touch the jsonl but are not turn
         // progress and must not extend the Running timeout.
@@ -565,10 +619,7 @@ mod tests {
             &json!({"type":"system","subtype":"away_summary",
                     "timestamp":"2026-07-08T10:07:00Z"}),
         );
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:05:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
 
         // The next prompt starts a fresh turn.
         apply(
@@ -637,8 +688,67 @@ mod tests {
                     "timestamp":"2026-07-08T10:02:00Z"}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(meta.turn_completed_at, parse_iso8601("2026-07-08T10:02:00Z"));
+        assert_eq!(
+            meta.turn_completed_at,
+            parse_iso8601("2026-07-08T10:02:00Z")
+        );
         // The interrupt is not a prompt: it never becomes the title stand-in.
         assert_eq!(meta.first_prompt.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn ask_user_question_stays_active_until_its_matching_answer() {
+        let mut meta = Meta::default();
+
+        apply(
+            &mut meta,
+            &json!({
+                "type":"assistant",
+                "message":{
+                    "stop_reason":"tool_use",
+                    "content":[{
+                        "type":"tool_use",
+                        "id":"question-1",
+                        "name":"AskUserQuestion",
+                        "input":{"questions":[]}
+                    }]
+                },
+                "timestamp":"2026-07-08T10:02:00Z"
+            }),
+        );
+        assert!(meta.active_question);
+        assert_eq!(
+            meta.question_asked_at,
+            parse_iso8601("2026-07-08T10:02:00Z")
+        );
+
+        // An unrelated tool result must not dismiss the question.
+        apply(
+            &mut meta,
+            &json!({
+                "type":"user",
+                "toolUseResult":{},
+                "message":{"content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"some-other-tool"
+                }]}
+            }),
+        );
+        assert!(meta.active_question);
+
+        apply(
+            &mut meta,
+            &json!({
+                "type":"user",
+                "toolUseResult":{},
+                "message":{"content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"question-1",
+                    "content":"selected option 1"
+                }]}
+            }),
+        );
+        assert!(!meta.active_question);
+        assert_eq!(meta.question_asked_at, None);
     }
 }

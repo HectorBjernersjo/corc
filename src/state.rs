@@ -35,6 +35,10 @@ pub struct Conversation {
     /// mistake that uncertainty for an untouched conversation.
     #[serde(default)]
     pub content_seen: bool,
+    /// User-controlled placement in the always-visible top panel. Defaults to
+    /// false so state files written before pinning support remain compatible.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,7 +173,13 @@ impl State {
 
     /// Record a freshly spawned conversation, appending its project to the
     /// order list if this is the project's first conversation (D9).
-    pub fn add_conversation(&mut self, id: String, cwd: PathBuf, pane_id: String, provider: String) {
+    pub fn add_conversation(
+        &mut self,
+        id: String,
+        cwd: PathBuf,
+        pane_id: String,
+        provider: String,
+    ) {
         let project = cwd.display().to_string();
         if !self.projects.contains(&project) {
             self.projects.push(project);
@@ -184,7 +194,15 @@ impl State {
             provider,
             turn_started_at: None,
             content_seen: false,
+            pinned: false,
         });
+    }
+
+    /// Toggle a conversation's persisted pin and return its new state.
+    pub fn toggle_pin(&mut self, id: &str) -> Option<bool> {
+        let conversation = self.conversation_mut(id)?;
+        conversation.pinned = !conversation.pinned;
+        Some(conversation.pinned)
     }
 }
 
@@ -229,7 +247,7 @@ pub fn state_file() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::Conversation;
+    use super::{Conversation, State};
 
     #[test]
     fn old_conversation_state_defaults_new_persisted_metadata() {
@@ -246,5 +264,30 @@ mod tests {
         .unwrap();
         assert_eq!(conversation.turn_started_at, None);
         assert!(!conversation.content_seen);
+        assert!(!conversation.pinned);
+    }
+
+    #[test]
+    fn pin_toggle_is_persisted_on_the_conversation() {
+        let mut state = State::default();
+        state.conversations.push(Conversation {
+            id: "chat".into(),
+            cwd: "/tmp".into(),
+            pane_id: None,
+            last_viewed: 1,
+            created_at: 1,
+            provider: "claude".into(),
+            turn_started_at: None,
+            content_seen: true,
+            pinned: false,
+        });
+
+        assert_eq!(state.toggle_pin("chat"), Some(true));
+        assert!(state.conversation("chat").unwrap().pinned);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: State = serde_json::from_str(&json).unwrap();
+        assert!(restored.conversation("chat").unwrap().pinned);
+        assert_eq!(restored.toggle_pin("chat"), Some(false));
+        assert_eq!(restored.toggle_pin("missing"), None);
     }
 }
