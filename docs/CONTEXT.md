@@ -72,8 +72,19 @@ The user's normal tmux session for a project (created by `new.sh`, named after t
 The pane next to the sidebar where the selected conversation's agent pane is
 swapped in (see ADR-0001); holds a placeholder when nothing is selected.
 
+**Browser view**:
+The optional pane beside the **Content pane** (`b`) mirroring, live, the page
+the agent is driving through Playwright. corc attaches to the browser
+Playwright already launched rather than owning it, and streams CDP screencast
+frames as kitty graphics (see ADR-0002). It belongs to one **Conversation**: a
+persisted per-conversation flag decides whether the pane opens while that
+conversation is the one in view. Three ways to set it, all the same flag: `b`
+in the sidebar, `Ctrl+b` anywhere in the **corc session**, or `corc browser`
+from inside the agent pane.
+_Avoid_: preview pane, screenshot pane
+
 **State file**:
-corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
+corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
 
 ### Conversation states
 

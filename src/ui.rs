@@ -4,10 +4,10 @@
 //! session (ADR-0001).
 
 use crate::provider::{self, MetaStore};
-use crate::repo::project_display;
+use crate::repo;
 use crate::state::{self, State};
 use crate::status::{self, Status};
-use crate::{picker, tmux, truncate, usage};
+use crate::{browser, picker, tmux, truncate, usage};
 use anyhow::{Context, Result};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -25,6 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -70,9 +71,10 @@ fn attention_panel_height(count: usize, content_height: u16) -> u16 {
     (count as u16 + 1).min(max)
 }
 
-/// Build the top-panel rows. Pins are always included and sort before the
-/// transient Running/Question/Unseen rows; each group then follows project
-/// order and newest-created-first order for a stable, predictable list.
+/// Build the top-panel rows. Pins are always included; rows then sort by dot
+/// color — blue (Question/Unseen) first, then yellow (Running), then the pink
+/// pins — and each group follows project order and newest-created-first order
+/// for a stable, predictable list.
 fn attention_indices(state: &State, statuses: &[Status]) -> Vec<usize> {
     let mut indices: Vec<usize> = state
         .conversations
@@ -94,10 +96,16 @@ fn attention_indices(state: &State, statuses: &[Status]) -> Vec<usize> {
             .position(|project| *project == conversation.cwd.display().to_string())
             .unwrap_or(usize::MAX)
     };
+    // Blue, then yellow, then pink — matching the dot colors the eye scans by.
+    let color_rank = |i: usize| match statuses.get(i) {
+        Some(Status::Question | Status::Unseen) => 0,
+        Some(Status::Running) => 1,
+        _ => 2,
+    };
     indices.sort_by(|&a, &b| {
         let ca = &state.conversations[a];
         let cb = &state.conversations[b];
-        cb.pinned.cmp(&ca.pinned).then_with(|| {
+        color_rank(a).cmp(&color_rank(b)).then_with(|| {
             project_rank(ca)
                 .cmp(&project_rank(cb))
                 .then_with(|| cb.created_at.cmp(&ca.created_at))
@@ -356,12 +364,20 @@ struct App {
     placeholder_pane: String,
     /// Conversation currently swapped into the content slot.
     viewed: Option<String>,
+    /// The browser view pane beside the agent, when open (D24). Whether it
+    /// exists is derived from the viewed conversation's persisted `browser`
+    /// flag by `sync_browser_pane` — never toggled directly.
+    browser_pane: Option<String>,
     /// Flat, status-driven panel above the project-grouped sidebar: indices
     /// into `state.conversations` whose status is Running, Question, or Unseen.
     attention: Vec<usize>,
     /// When Some, the cursor is in the attention panel at this row.
     attention_sel: Option<usize>,
     items: Vec<Item>,
+    /// Project label per path (D8), rebuilt with the item list because a label
+    /// depends on the whole set of projects — adding one can lengthen another.
+    /// Keyed by path since that, not the label, is what identifies a project.
+    project_labels: HashMap<String, String>,
     selected: usize,
     /// When Some, the j/k cursor sits on this bottom-menu row instead of the
     /// list — reached by pressing j past the last conversation.
@@ -427,6 +443,8 @@ pub fn run() -> Result<()> {
     // from inside the Claude pane too, without ever editing the user's tmux
     // config.
     tmux::install_jump_bindings(&crate::self_exe().to_string_lossy());
+    // And C-b, which toggles the browser view from inside the agent pane (D24).
+    tmux::install_browser_binding(&crate::self_exe().to_string_lossy());
 
     let placeholder_pane = tmux::split_content_pane(&sidebar_pane)?;
 
@@ -437,9 +455,11 @@ pub fn run() -> Result<()> {
         sidebar_pane,
         placeholder_pane,
         viewed: None,
+        browser_pane: None,
         attention: Vec::new(),
         attention_sel: None,
         items: Vec::new(),
+        project_labels: HashMap::new(),
         selected: 0,
         menu_sel: None,
         count: None,
@@ -477,6 +497,9 @@ pub fn run() -> Result<()> {
 
     let result = app.event_loop(&mut terminal);
 
+    // The browser view goes first: parking rearranges the content slot, and a
+    // pane left streaming into a torn-down layout would repaint over it.
+    app.close_browser_pane();
     // Swap the viewed pane home and remove the content pane we created (D10).
     app.park();
     // Respect the normal grace period on shutdown too. A message sent just
@@ -486,8 +509,9 @@ pub fn run() -> Result<()> {
     if tmux::pane_exists(&app.placeholder_pane) {
         let _ = tmux::kill_pane(&app.placeholder_pane);
     }
-    // Put the plain Alt+number window switch back, matching the user's config.
-    tmux::restore_window_bindings();
+    // Put the plain Alt+number window switch back and drop C-b, matching the
+    // user's config again.
+    tmux::restore_bindings();
     let _ = app.state.save();
 
     if keyboard_enhanced {
@@ -721,6 +745,7 @@ impl App {
                 self.history_window = self.history_window.next();
                 self.rebuild_keeping_selection();
             }
+            KeyCode::Char('b') => self.toggle_selected_browser(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_shortcuts(),
             _ => {}
@@ -815,6 +840,13 @@ impl App {
     fn refresh(&mut self) {
         self.last_refresh = Instant::now();
         let mut dirty = false;
+
+        // Browser-view requests from `corc browser`, run from inside an agent
+        // pane. The TUI is the only writer of state.json, so the CLI hands the
+        // change over here rather than editing the file under us.
+        if browser::apply_requests(&mut self.state) {
+            dirty = true;
+        }
 
         // Take one tmux snapshot for every liveness check in this refresh.
         // Spawning `tmux list-panes` once per live conversation blocked input
@@ -947,6 +979,7 @@ impl App {
         if dirty {
             let _ = self.state.save();
         }
+        self.sync_browser_pane();
 
         self.rebuild_keeping_selection();
     }
@@ -973,8 +1006,18 @@ impl App {
         let now = state::unix_now();
         self.items.clear();
         self.hidden = 0;
+        // Labels come from the set, so they are computed once here rather than
+        // per project or per row.
+        let labels = repo::labels(&self.state.projects);
+        self.project_labels = self
+            .state
+            .projects
+            .iter()
+            .cloned()
+            .zip(labels.iter().cloned())
+            .collect();
 
-        for project in &self.state.projects {
+        for (pi, project) in self.state.projects.iter().enumerate() {
             // Conversations of this project in a fixed order: newest created
             // at the top, never re-sorted (D9). `created_at` is immutable, so
             // a row never moves once placed — status flips and fresh activity
@@ -994,7 +1037,7 @@ impl App {
                     .then_with(|| ca.id.cmp(&cb.id))
             });
 
-            let name = project_display(project);
+            let name = labels[pi].clone();
             let mut kept = Vec::new();
             for i in indices {
                 // Dead conversations outside the selected history window stay
@@ -1378,6 +1421,9 @@ impl App {
             c.last_viewed = state::unix_now();
         }
         self.state.save()?;
+        // The browser view belongs to the conversation, so a switch opens or
+        // closes the pane rather than repointing it.
+        self.sync_browser_pane();
         Ok(())
     }
 
@@ -1562,8 +1608,9 @@ impl App {
     }
 
     /// `p`: persistently pin or unpin the conversation under the active
-    /// cursor. Pinned conversations live first in the top panel even when
-    /// Dead or outside the selected history window.
+    /// cursor. Pinned conversations always appear in the top panel — last,
+    /// after the blue and yellow rows — even when Dead or outside the
+    /// selected history window.
     fn toggle_selected_pin(&mut self) {
         let from_attention = self.attention_sel.is_some();
         let id = if from_attention {
@@ -1739,6 +1786,110 @@ impl App {
             self.view(&id)
         })();
         self.status_msg = result.err().map(|e| e.to_string());
+    }
+
+    /// `b` (D24): turn the browser view on or off for the conversation under
+    /// the cursor. The flag is persisted per conversation; the pane itself is
+    /// derived from it by `sync_browser_pane`, so toggling a conversation that
+    /// is not in view takes effect the moment you open it.
+    fn toggle_selected_browser(&mut self) {
+        let Some(id) = self.selected_conv_id() else {
+            return;
+        };
+        let Some(conv) = self.state.conversation_mut(&id) else {
+            return;
+        };
+        conv.browser = !conv.browser;
+        let on = conv.browser;
+        self.status_msg = self.state.save().err().map(|e| e.to_string());
+        self.sync_browser_pane();
+        // A pane appearing beside the agent is its own feedback; a flag set on
+        // some other conversation would otherwise be invisible.
+        if self.viewed.as_deref() != Some(id.as_str()) && self.status_msg.is_none() {
+            let label = if on { "on" } else { "off" };
+            self.status_msg = Some(format!("browser view {label} for that conversation"));
+        }
+    }
+
+    /// Make the pane match the viewed conversation's `browser` flag (D24).
+    /// Runs on every refresh and after a conversation switch, which is what
+    /// makes the view follow the conversation rather than the content slot.
+    fn sync_browser_pane(&mut self) {
+        // A pane the user closed by hand clears the flag instead of being
+        // respawned a second later.
+        if let Some(pane) = self.browser_pane.clone()
+            && !tmux::pane_exists(&pane)
+        {
+            self.browser_pane = None;
+            self.set_viewed_browser(false);
+        }
+        let wanted = self
+            .viewed
+            .as_deref()
+            .and_then(|id| self.state.conversation(id))
+            .is_some_and(|c| c.browser);
+
+        match (wanted, self.browser_pane.clone()) {
+            (true, None) => {
+                let result = (|| -> Result<()> {
+                    browser::check_ready()?;
+                    if !tmux::passthrough_enabled() {
+                        anyhow::bail!(
+                            "tmux swallows image escapes; add `set -g allow-passthrough on` to tmux.conf"
+                        );
+                    }
+                    let exe = crate::self_exe();
+                    let pane =
+                        tmux::split_browser_pane(&self.content_pane(), &exe.to_string_lossy())?;
+                    self.browser_pane = Some(pane);
+                    tmux::enforce_sidebar_width(&self.sidebar_pane)
+                })();
+                if let Err(e) = result {
+                    // Clear the flag rather than retrying — and failing — on
+                    // every tick from here on.
+                    self.set_viewed_browser(false);
+                    self.status_msg = Some(e.to_string());
+                }
+            }
+            (false, Some(pane)) => {
+                self.browser_pane = None;
+                if tmux::pane_exists(&pane) {
+                    let _ = tmux::kill_pane(&pane);
+                }
+                let _ = tmux::enforce_sidebar_width(&self.sidebar_pane);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_viewed_browser(&mut self, on: bool) {
+        let Some(id) = self.viewed.clone() else {
+            return;
+        };
+        if let Some(conv) = self.state.conversation_mut(&id)
+            && conv.browser != on
+        {
+            conv.browser = on;
+            let _ = self.state.save();
+        }
+    }
+
+    /// The pane sitting in the content slot right now: the viewed
+    /// conversation's agent, or the placeholder when nothing is viewed.
+    fn content_pane(&self) -> String {
+        self.viewed
+            .as_deref()
+            .and_then(|id| self.state.conversation(id))
+            .and_then(|c| c.pane_id.clone())
+            .unwrap_or_else(|| self.placeholder_pane.clone())
+    }
+
+    fn close_browser_pane(&mut self) {
+        if let Some(pane) = self.browser_pane.take()
+            && tmux::pane_exists(&pane)
+        {
+            let _ = tmux::kill_pane(&pane);
+        }
     }
 
     /// Move mode `K`/`J` (D9): shift the selected row's project one step in
@@ -2032,7 +2183,15 @@ impl App {
             .unwrap_or("(untitled)")
             .to_string();
         if show_project {
-            title = format!("{} · {title}", project_display(&conv.cwd.to_string_lossy()));
+            let cwd = conv.cwd.to_string_lossy();
+            // Every conversation's project is in the map; the basename is a
+            // fallback for the frame between a spawn and the next rebuild.
+            let project = self
+                .project_labels
+                .get(cwd.as_ref())
+                .cloned()
+                .unwrap_or_else(|| repo::label_for(&cwd, &[]));
+            title = format!("{project} · {title}");
         }
         let time = status::time_column(status, meta, conv.created_at, now);
         let viewed = self.viewed.as_deref() == Some(conv.id.as_str());
@@ -2369,11 +2528,12 @@ mod tests {
             turn_started_at: None,
             content_seen,
             pinned: false,
+            browser: false,
         }
     }
 
     #[test]
-    fn pins_are_always_included_and_sort_before_transient_attention() {
+    fn attention_sorts_blue_then_yellow_then_pinned() {
         let mut running = conversation(true);
         running.id = "running".into();
         running.created_at = 20;
@@ -2408,7 +2568,7 @@ mod tests {
             Status::Idle,
         ];
 
-        assert_eq!(attention_indices(&state, &statuses), [1, 3, 2, 0]);
+        assert_eq!(attention_indices(&state, &statuses), [3, 2, 0, 1]);
     }
 
     #[test]

@@ -107,9 +107,22 @@ turn complete = the `end_turn`/`turn_duration` record. Running shows
 
 ### D8 — Project naming (features 1, 2)
 
-Group headers show the directory **basename only**. A git worktree (detected
-by `.git` being a *file* with a `gitdir:` pointer) shows as
-`{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
+**The path is the identity; the name is only a label.** State groups
+conversations by exact cwd, and a tmux project session is found by its
+directory (`#{session_path}`), never by its name. Nothing downstream depends
+on what a project is called, which is what makes the label free to change.
+
+A label is the directory **basename, grown one directory to the left at a time
+until it is unique among the projects corc knows** (`repo::labels`).
+`~/projects/corc` stays `corc`; a lone `main` stays `main`; two repos' `main`
+worktrees become `gbandit/main` and `work/main`. Git worktrees and jj
+workspaces need no detection at all — what actually tells two checkouts with
+the same basename apart is where they are.
+
+Because a label depends on the whole set, adding a project can lengthen
+another's. `tmux::ensure_session` therefore **renames** a session whose label
+has moved rather than creating a second one in the same directory. Branches
+and jj workspace names are never shown.
 
 ### D9 — Fixed, user-managed project order (feature 4)
 

@@ -40,6 +40,11 @@ pub struct Meta {
     pub title: Option<String>,
     /// First real user prompt, kept as a title stand-in until `title` exists.
     pub first_prompt: Option<String>,
+    /// The slash command a conversation was started with (`/impeccable teach`),
+    /// for conversations that have no real prompt at all. Ranked below
+    /// `first_prompt` — the command is the weakest of the stand-ins, but it
+    /// beats `(untitled)`.
+    pub first_command: Option<String>,
     /// Whether the conversation contains a real user/assistant exchange.
     /// Deliberately independent of `title`, which providers may generate late
     /// or fail to generate at all.
@@ -73,12 +78,14 @@ pub struct Meta {
 
 impl Meta {
     /// What the sidebar should show: an explicit rename, the generated title,
-    /// or the first user prompt while no title has been generated yet.
+    /// the first user prompt while no title has been generated yet, or — for a
+    /// conversation opened with a slash command and nothing else — the command.
     pub fn display_title(&self) -> Option<&str> {
         self.custom_title
             .as_deref()
             .or(self.title.as_deref())
             .or(self.first_prompt.as_deref())
+            .or(self.first_command.as_deref())
     }
 }
 
@@ -111,6 +118,7 @@ impl Default for Meta {
             custom_title: None,
             title: None,
             first_prompt: None,
+            first_command: None,
             has_content: false,
             turn_state: TurnState::Unknown,
             turn_started_at: None,
@@ -293,6 +301,13 @@ fn apply(meta: &mut Meta, v: &Value) {
         meta.active_question_tool_id = None;
     }
 
+    // Slash-command records are meta — they must not count as content or move
+    // the turn state — but they are the only trace of what a conversation is
+    // about until a real prompt or a generated title shows up.
+    if !sidechain && v["type"] == "user" && meta.first_command.is_none() {
+        meta.first_command = slash_command(v);
+    }
+
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
             meta.has_content = true;
@@ -381,6 +396,25 @@ fn is_meta_user(v: &Value) -> bool {
         v["message"]["content"].as_str(),
         Some(s) if s.starts_with("<command-") || s.starts_with("<local-command")
     )
+}
+
+/// The invocation a `<command-…>` user record stands for, rendered the way it
+/// was typed: `/impeccable teach`. Only the name is required; a command with no
+/// arguments writes an empty (or missing) `<command-args>`.
+fn slash_command(v: &Value) -> Option<String> {
+    let content = v["message"]["content"].as_str()?;
+    let name = tagged(content, "command-name")?;
+    let line = match tagged(content, "command-args") {
+        Some(args) if !args.is_empty() => format!("{name} {args}"),
+        _ => name.to_string(),
+    };
+    title_line(&line)
+}
+
+/// The text between `<tag>` and `</tag>`, trimmed.
+fn tagged<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let rest = text.split_once(&format!("<{tag}>"))?.1;
+    Some(rest.split_once(&format!("</{tag}>"))?.0.trim())
 }
 
 /// Tool results come back as user records with a `toolUseResult` key (and
@@ -633,17 +667,52 @@ mod tests {
         assert_eq!(meta.turn_progress_at, meta.turn_started_at);
     }
 
+    /// A conversation opened with a slash command has no prompt to fall back
+    /// on, so the command itself names it — but it is the weakest stand-in:
+    /// a real prompt, a generated title and a rename all outrank it.
     #[test]
-    fn custom_title_names_a_slash_command_conversation_and_wins_over_generated_titles() {
+    fn slash_command_names_a_conversation_until_something_better_arrives() {
         let mut meta = Meta::default();
 
         apply(
             &mut meta,
             &json!({"type":"user","message":{"content":
-                "<command-message>improve-codebase-architecture</command-message>\n\
-                 <command-name>/improve-codebase-architecture</command-name>"}}),
+                "<command-message>impeccable</command-message>\n\
+                 <command-name>/impeccable</command-name>\n\
+                 <command-args>teach</command-args>"}}),
         );
-        assert_eq!(meta.display_title(), None);
+        assert_eq!(meta.display_title(), Some("/impeccable teach"));
+        // Still meta: the command neither counts as content nor starts a turn.
+        assert!(!meta.has_content);
+        assert_eq!(meta.turn_state, TurnState::Unknown);
+
+        // The skill's own injected text is meta too, and a later command does
+        // not rename the conversation.
+        apply(
+            &mut meta,
+            &json!({"type":"user","isMeta":true,"message":{"content":
+                [{"type":"text","text":"Base directory for this skill: …"}]}}),
+        );
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":
+                "<command-name>/clear</command-name>"}}),
+        );
+        assert_eq!(meta.display_title(), Some("/impeccable teach"));
+
+        // A real prompt is more descriptive than the command that opened the
+        // conversation, so it takes over.
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"look for sloppy frontend bits"},
+                    "timestamp":"2026-08-16T17:40:00Z"}),
+        );
+        assert_eq!(meta.display_title(), Some("look for sloppy frontend bits"));
+    }
+
+    #[test]
+    fn custom_title_wins_over_generated_titles() {
+        let mut meta = Meta::default();
 
         apply(
             &mut meta,

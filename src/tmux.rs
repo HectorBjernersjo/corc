@@ -26,8 +26,9 @@ pub const APP_NAME: &str = app_name!();
 /// can use them internally before handing edge navigation back to tmux.
 pub const NAVIGATOR_PROCESS_NAME: &str = concat!(app_name!(), "/view");
 pub const HIDDEN_SESSION: &str = concat!("_", app_name!(), "-sessions");
-/// The visible session the TUI lives in (D15). Prefixed with `_` so it never
-/// clashes with a project session named after a directory.
+/// The visible session the TUI lives in (D15). Prefixed with `_` so it is
+/// unlikely to clash with a project session named after a directory — only a
+/// project literally called `.corc` would, and `ensure_session` suffixes it.
 pub const TUI_SESSION: &str = concat!("_", app_name!());
 /// Transient window that keeps `_corc-sessions` alive while it has no conversation
 /// windows; killed as soon as a real window exists.
@@ -52,10 +53,19 @@ pub fn session_exists(name: &str) -> bool {
     tmux(&["has-session", "-t", &format!("={name}")]).is_ok()
 }
 
+/// The two sessions corc runs itself, which are never project sessions. Matched
+/// by name rather than by their `_` prefix: `ensure_session` turns a leading
+/// `.` into `_`, so a project like `~/dotfiles/.agents` legitimately owns the
+/// session `_agents` — treating that as internal made it invisible to
+/// `session_for_dir`, and every C-q created another `_agents-N` beside it.
+fn is_internal(name: &str) -> bool {
+    name == TUI_SESSION || name == HIDDEN_SESSION
+}
+
 /// Visible session names for the `corc projects` sessionizer (D21), most
-/// recently attached first. The `_`-prefixed sessions corc owns (`_corc`,
-/// `_corc-sessions`) are hidden. Any tmux error (no server, no sessions)
-/// yields an empty list rather than failing the picker.
+/// recently attached first. The sessions corc owns (`_corc`, `_corc-sessions`)
+/// are hidden. Any tmux error (no server, no sessions) yields an empty list
+/// rather than failing the picker.
 pub fn list_sessions() -> Vec<String> {
     let Ok(out) = tmux(&[
         "list-sessions",
@@ -68,7 +78,7 @@ pub fn list_sessions() -> Vec<String> {
         .lines()
         .filter_map(|l| {
             let (ts, name) = l.split_once('\t')?;
-            (!name.starts_with('_')).then(|| (ts.parse().unwrap_or(0), name.to_string()))
+            (!is_internal(name)).then(|| (ts.parse().unwrap_or(0), name.to_string()))
         })
         .collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0));
@@ -376,31 +386,31 @@ mod tests {
         assert!(!is_tui_command("bash", "corc"));
     }
 
-    /// A plain project keeps its basename (with tmux-reserved `.` replaced);
-    /// a secondary checkout is scoped by its repo so same-named worktrees of
-    /// different repos get one session each.
+    /// A session is found by its directory, so the key has to survive the ways
+    /// a path can be spelled — a symlink, a trailing slash — and has to keep
+    /// working for a directory that no longer exists, which is the state every
+    /// session whose project was moved or trashed is in.
     #[test]
-    fn session_names_scope_secondary_checkouts_by_repo() {
-        let base = std::env::temp_dir().join("corc-test-session-names");
+    fn session_dir_keys_survive_symlinks_and_deletion() {
+        let base = std::env::temp_dir().join("corc-test-dir-key");
         let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let real = base.join("real");
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
 
-        let plain = base.join("my.proj");
-        std::fs::create_dir_all(&plain).unwrap();
-        assert_eq!(session_name_for(&plain), "my_proj");
+        let key = |p: &std::path::Path| dir_key(&p.to_string_lossy());
+        // The same directory reached three ways is one key.
+        assert_eq!(key(&real), real.to_string_lossy());
+        assert_eq!(key(&base.join("link")), key(&real));
+        assert_eq!(key(&real.join("../real")), key(&real));
 
-        let worktree = base.join("fix-ui");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            "gitdir: /home/hector/projects/my.proj/.git/worktrees/fix-ui\n",
-        )
-        .unwrap();
-        assert_eq!(session_name_for(&worktree), "my_proj/fix-ui");
-
-        let workspace = base.join("fix-jj");
-        std::fs::create_dir_all(workspace.join(".jj")).unwrap();
-        std::fs::write(workspace.join(".jj/repo"), "../../my.proj/.jj/repo").unwrap();
-        assert_eq!(session_name_for(&workspace), "my_proj/fix-jj");
+        // A directory that is gone cannot be canonicalized, and falls back to
+        // its spelling — still equal to itself, still distinct from others,
+        // which is all the lookup needs.
+        let gone = base.join("trashed");
+        assert_eq!(key(&gone), gone.to_string_lossy());
+        assert_ne!(key(&gone), key(&real));
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -439,6 +449,76 @@ pub fn split_content_pane(sidebar_pane: &str) -> Result<String> {
 pub fn enforce_sidebar_width(sidebar_pane: &str) -> Result<()> {
     tmux(&["resize-pane", "-t", sidebar_pane, "-x", "40"])?;
     Ok(())
+}
+
+/// Split the content pane to put the browser view beside the agent (D24),
+/// running corc's private `__browser` entry point. Returns the new pane id.
+/// The view follows whichever conversation is in the content slot, so this
+/// pane is created once and never respawned on a conversation switch.
+pub fn split_browser_pane(content_pane: &str, exe: &str) -> Result<String> {
+    let out = tmux(&[
+        "split-window",
+        "-h",
+        "-d",
+        "-t",
+        content_pane,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        exe,
+        "__browser",
+    ])?;
+    Ok(out.trim().to_string())
+}
+
+/// Process id of the program running in a pane — the root corc walks down
+/// from to find the agent's Playwright browser.
+pub fn pane_pid(pane_id: &str) -> Option<u32> {
+    tmux(&["display-message", "-p", "-t", pane_id, "#{pane_pid}"])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A pane's size in cells and the terminal type of the client showing it,
+/// in one query — the browser view asks for all of it on every tick, and one
+/// tmux process is cheaper than three.
+///
+/// The terminal name is the *outer* terminal, which is what decides whether
+/// images can be drawn at all (`$TERM` inside tmux only ever says
+/// `tmux-256color`). It is empty when no client is attached, which means
+/// "don't know yet" rather than "no".
+pub fn pane_info(pane_id: &str) -> Option<(u16, u16, String)> {
+    let out = tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane_id,
+        "#{pane_width}\t#{pane_height}\t#{client_termname}",
+    ])
+    .ok()?;
+    let mut fields = out.trim_end_matches('\n').split('\t');
+    Some((
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next().unwrap_or_default().to_string(),
+    ))
+}
+
+/// Terminal type of the current client, for `corc doctor`.
+pub fn client_terminal() -> String {
+    tmux(&["display-message", "-p", "#{client_termname}"])
+        .map(|out| out.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether tmux will forward graphics escape sequences to the terminal at all.
+/// Without `allow-passthrough` every frame corc emits is swallowed silently.
+pub fn passthrough_enabled() -> bool {
+    tmux(&["show", "-gv", "allow-passthrough"])
+        .map(|out| matches!(out.trim(), "on" | "all"))
+        .unwrap_or(false)
 }
 
 /// Swap two panes without touching active/last-pane state.
@@ -568,21 +648,88 @@ pub fn rename_hidden_window(old: &str, new: &str) -> Result<()> {
 // Real-session helpers, kept for digit jump (step 4).
 // ---------------------------------------------------------------------------
 
-/// Session naming convention from new.sh: basename with '.' → '_' (tmux
-/// reserves `.` in session names). A secondary checkout — git worktree or jj
-/// workspace — is named `{repo}/{checkout}` instead, matching the sidebar's
-/// project header, so two repos' `fix-ui` worktrees get one session each.
-/// `/` is fine in a tmux session name, and every target here is an exact
-/// `=name` match, so the slash never reads as a pattern.
-pub fn session_name_for(dir: &Path) -> String {
-    let Some(base) = dir.file_name() else {
-        return format!("{APP_NAME}-unknown");
+/// A project session is identified by its **directory**, never by its name.
+/// The name is a label — `repo::labels` derives it from whichever paths corc
+/// knows about, so it changes when a new project makes an old label ambiguous
+/// — and a key that moves under you is no key at all. Keying on the directory
+/// instead means a relabelling renames the session rather than orphaning it
+/// and starting a second one in the same directory.
+///
+/// tmux's `#{session_path}` is the `-c` value the session was created with,
+/// not the active pane's cwd, which is exactly the identity wanted: a session
+/// belongs to the project it was opened for, wherever the user has since cd'd.
+///
+/// corc's own sessions (`_corc`, `_corc-sessions`) are never candidates —
+/// `_corc` sits in `$HOME`, which would otherwise be adopted by a conversation
+/// rooted there.
+fn session_dirs_with_names() -> Vec<(String, String)> {
+    let Ok(out) = tmux(&["list-sessions", "-F", "#{session_path}\t#{session_name}"]) else {
+        return Vec::new();
     };
-    let base = base.to_string_lossy().replace('.', "_");
-    match crate::repo::parent_repo(dir) {
-        Some(repo) => format!("{}/{base}", repo.replace('.', "_")),
-        None => base,
+    out.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(_, name)| !is_internal(name))
+        .map(|(path, name)| (dir_key(path), name.to_string()))
+        .collect()
+}
+
+/// Comparison key for a session's directory: the canonical path while it
+/// exists, else the path as given. A session whose directory was renamed or
+/// deleted keeps matching itself rather than matching everything or nothing.
+pub fn dir_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.trim_end_matches('/').to_string())
+}
+
+/// Directories that already have a session — what the sessionizer filters its
+/// directory list against, in one tmux call rather than one per directory.
+pub fn session_dirs() -> std::collections::HashSet<String> {
+    session_dirs_with_names()
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect()
+}
+
+/// The name of the session living in `dir`, if any.
+pub fn session_for_dir(dir: &Path) -> Option<String> {
+    let want = dir_key(&dir.to_string_lossy());
+    session_dirs_with_names()
+        .into_iter()
+        .find(|(d, _)| *d == want)
+        .map(|(_, name)| name)
+}
+
+/// The session for `dir`, created if it does not have one yet, returned with
+/// whether this call created it (the digit jump starts nvim only on a fresh
+/// session). An existing session is used whatever it is called, and renamed to
+/// `label` when the label has moved on — so a project whose label grew from
+/// `main` to `gbandit/main` keeps the very session its editor is open in.
+///
+/// `.` is replaced with `_` (tmux reserves it in session names). `/` is fine,
+/// and every target here is an exact `=name` match, so the slash from a
+/// grown label never reads as a pattern.
+pub fn ensure_session(dir: &Path, label: &str) -> Result<(String, bool)> {
+    let label = label.replace('.', "_");
+    if let Some(existing) = session_for_dir(dir) {
+        // Renaming onto a name someone else holds would fail; keep the old
+        // name in that case — the lookup is by path, so nothing is lost.
+        if existing != label && !session_exists(&label) {
+            tmux(&["rename-session", "-t", &format!("={existing}"), &label])?;
+            return Ok((label, false));
+        }
+        return Ok((existing, false));
     }
+    // The label is unique among corc's paths, but a session corc did not make
+    // can still hold the name. Suffix rather than fail to create.
+    let mut name = label.clone();
+    let mut n = 2;
+    while session_exists(&name) {
+        name = format!("{label}-{n}");
+        n += 1;
+    }
+    create_session(&name, dir)?;
+    Ok((name, true))
 }
 
 /// Create a detached session (D13). A per-project `.tmux.sh` hook, if present,
@@ -592,7 +739,10 @@ pub fn session_name_for(dir: &Path) -> String {
 /// window — a C-q that just created the session lands on the editor. Never
 /// used for the hidden session.
 pub fn create_session(name: &str, dir: &Path) -> Result<()> {
-    let dir_str = dir.to_string_lossy();
+    // Canonical, because this is the value `#{session_path}` reports back and
+    // `session_for_dir` matches on: a session created through a symlinked path
+    // has to answer to the real one.
+    let dir_str = dir_key(&dir.to_string_lossy());
     tmux(&["new-session", "-d", "-s", name, "-c", &dir_str])?;
     let hook = dir.join(".tmux.sh");
     if is_executable(&hook) {
@@ -691,7 +841,7 @@ const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "n
 /// session they run `corc jump N` — the sidebar's `1`-`9`, now reachable while
 /// focus is in the Claude pane — and in every other session they keep the
 /// conventional Alt+number window switch. Overwriting is idempotent, so
-/// re-launching corc is safe; `restore_window_bindings` undoes it on quit.
+/// re-launching corc is safe; `restore_bindings` undoes it on quit.
 /// `exe` is the absolute corc binary path.
 pub fn install_jump_bindings(exe: &str) {
     let cond = format!("#{{==:#{{session_name}},{TUI_SESSION}}}");
@@ -705,17 +855,73 @@ pub fn install_jump_bindings(exe: &str) {
     }
 }
 
-/// Undo `install_jump_bindings` on quit: put the plain Alt+number window
-/// switch back, so once corc exits the tmux server matches the user's config
-/// again. A crash that skips this leaves the conditional binding in place —
-/// harmless, since its non-corc branch is the same window switch and `corc
-/// jump` runs headless regardless.
-pub fn restore_window_bindings() {
+/// The key that toggles the browser view for the conversation in view (D24).
+const BROWSER_KEY: &str = "C-b";
+
+/// Key table an earlier version of this code pointed the corc session at, kept
+/// only so `install_browser_binding` can undo it. See that function.
+const STALE_KEY_TABLE: &str = "corc";
+
+/// Bind `C-b` to the browser toggle (D24), session-scoped the same way the
+/// digit jump is: a root binding whose `if-shell -F` condition runs the toggle
+/// inside corc and, everywhere else, passes the key through as if unbound.
+/// Idempotent, so relaunching corc is safe; `restore_bindings` unbinds it on
+/// quit. Stdout is dropped because tmux shows a key binding's output in view
+/// mode over the pane, which a "browser view: on" line does not deserve;
+/// stderr is left alone so a real failure still surfaces.
+///
+/// A session-local key table would be the tidier home for this, but a session's
+/// `key-table` option *replaces* the root table rather than layering over it,
+/// so every `bind-key -n` the user has — and corc's own digit jump — goes dead
+/// inside the corc session. That is what this used to do, so the option is
+/// unset here too: a corc session that outlives the upgrade would otherwise
+/// keep swallowing root bindings until it is killed.
+///
+/// A user whose tmux prefix is `C-b` never reaches this binding — tmux checks
+/// the prefix first, so the key stays their prefix and the toggle is simply
+/// unavailable. `corc doctor` says so.
+pub fn install_browser_binding(exe: &str) {
+    let _ = tmux(&["set-option", "-u", "-t", TUI_SESSION, "key-table"]);
+    let _ = tmux(&["unbind-key", "-T", STALE_KEY_TABLE, BROWSER_KEY]);
+
+    let cond = format!("#{{==:#{{session_name}},{TUI_SESSION}}}");
+    let toggle = format!("run-shell \"'{exe}' browser >/dev/null\"");
+    let passthrough = format!("send-keys {BROWSER_KEY}");
+    let _ = tmux(&[
+        "bind-key",
+        "-n",
+        BROWSER_KEY,
+        "if-shell",
+        "-F",
+        &cond,
+        &toggle,
+        &passthrough,
+    ]);
+}
+
+/// Whether the in-corc `C-b` binding can fire at all: a `C-b` prefix shadows
+/// it, since tmux checks the prefix before the root table.
+pub fn browser_key_is_reachable() -> bool {
+    let prefix = tmux(&["show", "-gv", "prefix"]).unwrap_or_default();
+    !prefix.trim().eq_ignore_ascii_case(BROWSER_KEY)
+}
+
+/// Undo the runtime bindings on quit, so once corc exits the tmux server
+/// matches the user's config again: the plain Alt+number window switch goes
+/// back, and `C-b` becomes unbound. A crash that skips this leaves the
+/// conditional bindings in place — harmless, since outside corc they do what
+/// the key did before (switch window, reach the application) and `corc jump`
+/// and `corc browser` run headless regardless.
+///
+/// A user who had their own root `C-b` binding loses it until their config is
+/// reloaded; `install_browser_binding` overwrote it on the way in either way.
+pub fn restore_bindings() {
     for n in 1..=9u8 {
         let key = format!("M-{n}");
         let idx = n.to_string();
         let _ = tmux(&["bind-key", "-n", &key, "select-window", "-t", &idx]);
     }
+    let _ = tmux(&["unbind-key", "-n", BROWSER_KEY]);
 }
 
 /// Digit jump (D13): take the client to window `n` of `dir`'s real session,
@@ -724,12 +930,8 @@ pub fn restore_window_bindings() {
 /// there gets `nvim` typed into it — but a busy foreground process is never
 /// disturbed, just focused. Shared by the sidebar's `1`-`9` and the headless
 /// `corc jump N` that a tmux binding runs from inside the Claude pane.
-pub fn jump_to_window(dir: &Path, n: u8) -> Result<()> {
-    let session = session_name_for(dir);
-    let created = !session_exists(&session);
-    if created {
-        create_session(&session, dir)?;
-    }
+pub fn jump_to_window(dir: &Path, n: u8, label: &str) -> Result<()> {
+    let (session, created) = ensure_session(dir, label)?;
     if !window_exists(&session, n) {
         let cmd = (n == 1).then_some("nvim");
         create_window_at(&session, n, dir, cmd)?;
@@ -752,11 +954,8 @@ pub fn jump_to_window(dir: &Path, n: u8) -> Result<()> {
 /// `.tmux.sh` hook, or corc's default nvim+console layout — if missing. The
 /// window-less counterpart to `jump_to_window`: the C-q toggle uses it to
 /// reach the viewed conversation's project without a fixed window number.
-pub fn jump_to_session(dir: &Path) -> Result<()> {
-    let session = session_name_for(dir);
-    if !session_exists(&session) {
-        create_session(&session, dir)?;
-    }
+pub fn jump_to_session(dir: &Path, label: &str) -> Result<()> {
+    let (session, _) = ensure_session(dir, label)?;
     switch_client(&session)
 }
 

@@ -1,64 +1,82 @@
-//! Repo layout: what a directory's project label is, which sibling checkouts a
-//! repo directory expands to, and which checkouts live under a scan root. Git
-//! worktrees and jj workspaces are handled symmetrically — the rest of corc
-//! only cares that a checkout may have a parent repo and siblings, never which
-//! VCS provides them.
+//! Repo layout: what a set of project directories is labelled, which sibling
+//! checkouts a repo directory expands to, and which checkouts live under a
+//! scan root. Git worktrees and jj workspaces are handled symmetrically — the
+//! rest of corc only cares that a checkout may have siblings, never which VCS
+//! provides them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-/// Project label (D8): the directory basename, or `{repo}/{checkout}` when the
-/// directory is a git worktree or a secondary jj workspace — e.g. `corc/fix-ui`.
-/// Branches and jj workspace names are never shown; the directory name is.
-pub fn project_display(path: &str) -> String {
-    let dir = Path::new(path);
-    let base = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    match parent_repo(dir) {
-        Some(repo) => format!("{repo}/{base}"),
-        None => base,
-    }
-}
-
-/// The main repo's basename when `dir` is a secondary checkout, else None.
-/// Filesystem reads only, no subprocess: this runs on every sidebar frame and
-/// once per entry in the sessionizer's list.
+/// Project labels (D8): each path's basename, grown one directory to the left
+/// at a time until it tells that path apart from every other in the set.
+/// `~/projects/corc` stays `corc`; two repos' `main` worktrees become
+/// `gbandit/main` and `work/main`; a lone `main` stays `main`.
 ///
-/// A git worktree's `.git` is a *file* `gitdir: <repo>/.git/worktrees/<name>`;
-/// a secondary jj workspace's `.jj/repo` is a *file* holding the path to the
-/// main workspace's `.jj/repo`, usually relative (`../../myrepo/.jj/repo`).
-/// A main checkout has both as directories, and yields None.
-pub fn parent_repo(dir: &Path) -> Option<String> {
-    git_worktree_repo(dir).or_else(|| jj_workspace_repo(dir))
-}
-
-fn git_worktree_repo(dir: &Path) -> Option<String> {
-    let pointer = pointer_file(&dir.join(".git"))?;
-    let gitdir = pointer.strip_prefix("gitdir:")?.trim();
-    let (repo, _) = gitdir.split_once("/.git/worktrees/")?;
-    basename(repo)
-}
-
-fn jj_workspace_repo(dir: &Path) -> Option<String> {
-    let pointer = pointer_file(&dir.join(".jj/repo"))?;
-    basename(pointer.strip_suffix("/.jj/repo")?)
-}
-
-/// The trimmed contents of `path` when it is a regular file — the shape both
-/// VCSs use to point a secondary checkout at its repo. None for a directory,
-/// which is what the main checkout has there.
-fn pointer_file(path: &Path) -> Option<String> {
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
+/// The label is derived from the set, never from the VCS. A git worktree and a
+/// jj workspace need no detection at all, because the thing that actually
+/// distinguishes two checkouts sharing a basename is where they are. The path
+/// is the identity everywhere in corc — state groups conversations by exact
+/// cwd, tmux sessions are looked up by their directory — so a set of distinct
+/// paths always yields distinct labels, and a label is safe to show, and safe
+/// to change, without anything being lost by it.
+pub fn labels(paths: &[String]) -> Vec<String> {
+    let parts: Vec<Vec<&str>> = paths.iter().map(|p| components(p)).collect();
+    let mut depth = vec![1usize; paths.len()];
+    // Grow every label that still collides, and keep going until a pass
+    // changes nothing. Paths that are genuinely equal run out of components
+    // together, which is what ends the loop rather than a depth cap.
+    loop {
+        let mut groups: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, part) in parts.iter().enumerate() {
+            groups.entry(suffix(part, depth[i])).or_default().push(i);
+        }
+        let mut grew = false;
+        for group in groups.into_values().filter(|g| g.len() > 1) {
+            for i in group {
+                if depth[i] < parts[i].len() {
+                    depth[i] += 1;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
     }
-    Some(std::fs::read_to_string(path).ok()?.trim().to_string())
+    parts
+        .iter()
+        .zip(&depth)
+        .zip(paths)
+        .map(|((part, &d), path)| match suffix(part, d) {
+            // A path with no components at all (`/`) has no suffix to show.
+            s if s.is_empty() => path.clone(),
+            s => s,
+        })
+        .collect()
 }
 
-fn basename(path: &str) -> Option<String> {
-    Some(Path::new(path).file_name()?.to_string_lossy().into_owned())
+/// One path's label within `set` — [`labels`] applied to the set, picking out
+/// `path`. A path the set does not contain falls back to its basename: the
+/// sessionizer's path mode can name a directory that is in no list yet.
+pub fn label_for(path: &str, set: &[String]) -> String {
+    match set.iter().position(|p| p == path) {
+        Some(i) => labels(set).swap_remove(i),
+        None => match suffix(&components(path), 1) {
+            s if s.is_empty() => path.to_string(),
+            s => s,
+        },
+    }
+}
+
+fn components(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// The last `n` components of a split path, joined — the label at depth `n`.
+fn suffix(parts: &[&str], n: usize) -> String {
+    parts[parts.len().saturating_sub(n)..].join("/")
 }
 
 /// How deep below a scan root a checkout is still found. `~/projects/*` has to
@@ -270,47 +288,61 @@ fn lines_of(out: std::io::Result<std::process::Output>) -> impl Iterator<Item = 
 
 #[cfg(test)]
 mod tests {
-    use super::{Expansions, project_display, scan_checkouts};
+    use super::{Expansions, label_for, labels, scan_checkouts};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    /// D8: basename for plain dirs and main checkouts, `{repo}/{checkout}` for
-    /// git worktrees and secondary jj workspaces alike.
+    /// D8: a label is the shortest trailing path that is unique in the set.
+    /// Nothing here touches the filesystem or a VCS — the paths are the whole
+    /// input, which is the point of deriving labels from the set.
     #[test]
-    fn project_headers() {
-        let base = std::env::temp_dir().join("corc-test-project-display");
-        let _ = fs::remove_dir_all(&base);
+    fn labels_grow_until_unique() {
+        let of = |paths: &[&str]| labels(&paths.iter().map(|s| s.to_string()).collect::<Vec<_>>());
 
-        let plain = base.join("myproj");
-        fs::create_dir_all(&plain).unwrap();
-        assert_eq!(project_display(&plain.to_string_lossy()), "myproj");
+        // Unique basenames stay basenames — including a lone `main`, which is
+        // uninformative but unambiguous, and that is the bar.
+        assert_eq!(
+            of(&["/home/h/projects/corc", "/home/h/projects/gbandit/main"]),
+            ["corc", "main"]
+        );
 
-        // A normal repo has a .git *directory*, and a main jj workspace a
-        // .jj/repo *directory* — still basename only.
-        fs::create_dir_all(plain.join(".git")).unwrap();
-        fs::create_dir_all(plain.join(".jj/repo")).unwrap();
-        assert_eq!(project_display(&plain.to_string_lossy()), "myproj");
+        // A collision grows both sides, and only far enough to separate them.
+        // The worktree case falls out of this with no VCS detection at all.
+        assert_eq!(
+            of(&["/home/h/projects/gbandit/main", "/home/h/work/main"]),
+            ["gbandit/main", "work/main"]
+        );
 
-        // A git worktree has a .git *file* with a gitdir: pointer.
-        let wt = base.join("fix-ui");
-        fs::create_dir_all(&wt).unwrap();
-        fs::write(
-            wt.join(".git"),
-            "gitdir: /home/hector/Projects/corc/.git/worktrees/fix-ui\n",
-        )
-        .unwrap();
-        assert_eq!(project_display(&wt.to_string_lossy()), "corc/fix-ui");
+        // Three-way, uneven: two need a third component, the rest stop early.
+        assert_eq!(
+            of(&[
+                "/home/h/projects/gbandit/shadcn",
+                "/home/h/.local/share/Trash/files/gbandit-before-monorepo/shadcn",
+                "/home/h/projects/corc",
+            ]),
+            ["gbandit/shadcn", "gbandit-before-monorepo/shadcn", "corc"]
+        );
 
-        // A secondary jj workspace has a .jj/repo *file* pointing — relatively,
-        // as `jj workspace add` writes it — at the main workspace's repo.
-        let ws = base.join("fix-jj");
-        fs::create_dir_all(ws.join(".jj")).unwrap();
-        fs::write(ws.join(".jj/repo"), "../../corc/.jj/repo").unwrap();
-        assert_eq!(project_display(&ws.to_string_lossy()), "corc/fix-jj");
+        // One path a suffix of another: the shorter one runs out of components
+        // and the longer keeps growing, so the loop still terminates.
+        assert_eq!(of(&["/a/main", "/x/a/main"]), ["a/main", "x/a/main"]);
 
-        let _ = fs::remove_dir_all(&base);
+        // Genuinely equal paths cannot be told apart; both max out and stop.
+        assert_eq!(of(&["/a/b", "/a/b"]), ["a/b", "a/b"]);
+
+        // Degenerate paths are returned as-is rather than as an empty label.
+        assert_eq!(of(&["/"]), ["/"]);
+
+        // `label_for` picks one out of the set, and falls back to the basename
+        // for a path the set never had — the sessionizer's path mode.
+        let set: Vec<String> = ["/home/h/projects/gbandit/main", "/home/h/work/main"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(label_for("/home/h/work/main", &set), "work/main");
+        assert_eq!(label_for("/home/h/elsewhere/solo", &set), "solo");
     }
 
     /// The real thing: create a git repo with a worktree and a jj repo with a
@@ -351,9 +383,6 @@ mod tests {
                 assert!(found.contains(&path(&main).to_string()), "{found:?}");
                 assert!(found.contains(&path(&wt).to_string()), "{found:?}");
             }
-            // The worktree is labelled by the repo it belongs to.
-            assert_eq!(project_display(path(&wt)), "gitrepo/gitrepo-fix");
-
             // A bare repo has no `.git` marker at all — it is the git dir —
             // and still has to expand, which is what its `HEAD` + `objects/`
             // let the cheap "is this git's business?" gate see.
@@ -377,7 +406,6 @@ mod tests {
                 assert!(found.contains(&path(&main).to_string()), "{found:?}");
                 assert!(found.contains(&path(&ws).to_string()), "{found:?}");
             }
-            assert_eq!(project_display(path(&ws)), "jjrepo/jjrepo-fix");
         }
 
         let _ = fs::remove_dir_all(&base);

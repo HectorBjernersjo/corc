@@ -122,6 +122,8 @@ Launch with `corc` (or `Ctrl+q` if you bound it). Inside the TUI:
 | `p` | pin / unpin the selected conversation at the top |
 | `s` | switch which agent new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
+| `b` | browser view on/off for the selected conversation |
+| `Ctrl+b` | the same toggle, from anywhere inside corc (agent pane included) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `Alt+1`–`Alt+9` | jump to window N of the project's normal tmux session |
 | `a` | cycle visible history: `active` / `3h` / `1D` / `3D` / `1W` / `all time` |
@@ -153,6 +155,59 @@ states across providers, plus a blue Question state where the provider exposes
 structured interactive questions. An untouched Codex or OpenCode conversation stays
 `(untitled)` until the CLI creates its real session on the first prompt.
 
+### Browser view
+
+`b` opens a pane beside the agent showing, live, whatever page it is driving
+through Playwright. corc attaches to the browser Playwright already launched —
+it never starts one — so an agent that has not opened a browser simply says so.
+
+The view belongs to the conversation, not to the layout: `b` turns it on for
+the conversation under the cursor, the setting is remembered across restarts,
+and the pane appears whenever you view that conversation and disappears when
+you leave it. Closing the pane yourself turns the setting off.
+
+You do not have to go to the sidebar to toggle it: **`Ctrl+b` works anywhere
+inside corc**, the agent pane included. corc binds the key at runtime, scoped
+to its own session — in every other session the key passes straight through as
+before — and unbinds it again on exit, so your tmux config is never touched.
+tmux resolves the prefix before the root table, so if your prefix *is* `C-b`
+the key stays your prefix and the toggle is simply unavailable; `corc doctor`
+tells you.
+
+The same toggle is a command, which is what the key runs:
+
+```
+corc browser          # toggle; !corc browser types it at Claude Code
+corc browser on|off   # the explicit forms
+```
+
+Run inside an agent pane it applies to that conversation, anywhere else to the
+one you are viewing.
+
+It needs three things, all checked by `corc doctor`:
+
+1. A terminal that draws kitty graphics: ghostty, kitty, or wezterm.
+2. `set -g allow-passthrough on` in your tmux config.
+3. Playwright launching Chromium with a debugging port. `corc doctor` writes
+   `~/.config/corc/playwright.json` for you; add it to the Playwright MCP
+   server's arguments and restart the agent:
+
+   ```
+   --config ~/.config/corc/playwright.json
+   ```
+
+   The file only adds `--remote-debugging-port=0`, letting the kernel pick a
+   free port that corc then finds on its own. Nothing else about your
+   Playwright setup changes.
+
+Note that Playwright refuses to open a second browser against a profile already
+in use, so only one conversation at a time can have one. The lock is held by
+whichever Chromium is still alive, so a browser left behind by a conversation
+you have moved on from will block the next one too — close it rather than
+starting over. To run two at once, pass `--isolated` as well, which keeps the
+profile in memory and so drops any logins you rely on persisting. That tradeoff
+is yours to make; corc does not make it for you.
+
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`
 still exits if you need a hard escape hatch.
@@ -162,8 +217,10 @@ still exits if you need a hard escape hatch.
 - `corc` — create or enter the corc session.
 - `corc open` — the explicit form of `corc` (bind this to a key).
 - `corc list` — print every conversation corc owns, grouped by project.
-- `corc doctor` — check tmux compatibility, agent binaries, `PATH`, and state
-  file permissions.
+- `corc browser [on|off]` — toggle the browser view for the conversation the
+  command runs in; meant for `!corc browser` from inside the agent.
+- `corc doctor` — check tmux compatibility, agent binaries, `PATH`, state file
+  permissions, and the browser view's prerequisites.
 - `corc --help` — show command-line help.
 
 ## How it works

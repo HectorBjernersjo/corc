@@ -39,6 +39,11 @@ pub struct Conversation {
     /// false so state files written before pinning support remain compatible.
     #[serde(default)]
     pub pinned: bool,
+    /// Whether the browser view (D24) opens beside this conversation while it
+    /// is the one in view. Per-conversation rather than one global pane, and
+    /// persisted so the choice survives a corc restart.
+    #[serde(default)]
+    pub browser: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +200,7 @@ impl State {
             turn_started_at: None,
             content_seen: false,
             pinned: false,
+            browser: false,
         });
     }
 
@@ -265,6 +271,7 @@ mod tests {
         assert_eq!(conversation.turn_started_at, None);
         assert!(!conversation.content_seen);
         assert!(!conversation.pinned);
+        assert!(!conversation.browser);
     }
 
     #[test]
@@ -280,6 +287,7 @@ mod tests {
             turn_started_at: None,
             content_seen: true,
             pinned: false,
+            browser: false,
         });
 
         assert_eq!(state.toggle_pin("chat"), Some(true));

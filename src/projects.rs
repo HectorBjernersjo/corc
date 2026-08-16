@@ -7,7 +7,7 @@
 
 use crate::state::State;
 use crate::widget::{self, Choice};
-use crate::{display_dir, picker, tmux};
+use crate::{display_dir, picker, repo, tmux};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,14 +18,20 @@ pub fn run() -> Result<()> {
     let session_set: HashSet<&str> = sessions.iter().map(String::as_str).collect();
 
     // Existing sessions first, then project directories that don't already
-    // have a session (new.sh rad 47-57), keyed by the name they'd create.
+    // have a session (new.sh rad 47-57). A session belongs to a *directory*,
+    // not to a name, so the filter is on the directory — a session the user
+    // renamed by hand still hides its own project from the list.
     let mut items: Vec<Choice> = sessions.iter().map(|s| Choice::new(s, s)).collect();
-    for dir in picker::list_directories(&state.directories)? {
-        if session_set.contains(tmux::session_name_for(&dir).as_str()) {
+    let dirs: Vec<String> = picker::list_directories(&state.directories)?
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    let taken = tmux::session_dirs();
+    for path in &dirs {
+        if taken.contains(&tmux::dir_key(path)) {
             continue;
         }
-        let path = dir.to_string_lossy().into_owned();
-        items.push(Choice::new(display_dir(&path), path));
+        items.push(Choice::new(display_dir(path), path.clone()));
     }
 
     // The picker's path mode (input starting with `~` or `/`) lets the user
@@ -46,9 +52,11 @@ pub fn run() -> Result<()> {
     if !known.contains(&choice) && state.add_directory(&dir) {
         let _ = state.save();
     }
-    let name = tmux::session_name_for(&dir);
-    if !tmux::session_exists(&name) {
-        tmux::create_session(&name, &dir)?;
-    }
+    // The label is disambiguated against the directory list this picker was
+    // built from; a path typed in path mode falls back to its basename. Either
+    // way it is only the name the session gets — `ensure_session` finds an
+    // existing one by directory whatever it ended up called.
+    let label = repo::label_for(&choice, &dirs);
+    let (name, _) = tmux::ensure_session(&dir, &label)?;
     tmux::switch_client(&name)
 }

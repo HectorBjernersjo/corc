@@ -20,6 +20,7 @@ pub fn run() -> Result<()> {
     check_providers(&mut errors, &mut warnings);
     check_state(&mut errors);
     check_directories(&mut warnings);
+    check_browser_view(&mut warnings);
 
     println!();
     if errors > 0 {
@@ -37,6 +38,78 @@ pub fn run() -> Result<()> {
         println!("[ok] all checks passed");
     }
     Ok(())
+}
+
+/// The browser view (D24) has three external requirements, none of which corc
+/// can fix on the user's behalf: a terminal that draws images, tmux forwarding
+/// the escapes, and Playwright launching Chromium with a debugging port. All
+/// three are warnings — corc works fine without the view — and the config file
+/// is written here so the remedy is a single line to paste.
+fn check_browser_view(warnings: &mut usize) {
+    let terminal = tmux::client_terminal();
+    if terminal.is_empty() {
+        warn(
+            "browser view",
+            "no attached tmux client to ask about graphics",
+        );
+        *warnings += 1;
+    } else if crate::kitty::terminal_supports_graphics(&terminal) {
+        ok("browser view", &format!("{terminal} draws kitty graphics"));
+    } else {
+        warn(
+            "browser view",
+            &format!("{terminal} has no image support; the view will stay blank"),
+        );
+        *warnings += 1;
+    }
+
+    if tmux::passthrough_enabled() {
+        ok("browser view", "tmux allow-passthrough is on");
+    } else {
+        warn(
+            "browser view",
+            "tmux allow-passthrough is off; add `set -g allow-passthrough on` to tmux.conf",
+        );
+        *warnings += 1;
+    }
+
+    // tmux resolves the prefix before the root table, so a C-b prefix quietly
+    // swallows the in-corc toggle. Nothing is broken by it — the sidebar's `b`
+    // and `corc browser` still work — so this only says what to expect.
+    if tmux::browser_key_is_reachable() {
+        ok("browser view", "Ctrl+b toggles the view inside corc");
+    } else {
+        warn(
+            "browser view",
+            "your tmux prefix is C-b, which shadows corc's Ctrl+b toggle; \
+             use `b` in the sidebar or `!corc browser` in the agent",
+        );
+        *warnings += 1;
+    }
+
+    match crate::browser::ensure_config() {
+        Ok(path) if crate::browser::config_is_wired() => {
+            ok(
+                "browser view",
+                &format!("playwright loads {}", path.display()),
+            );
+        }
+        Ok(path) => {
+            warn(
+                "browser view",
+                &format!(
+                    "playwright is not exposing a debugging port — add `--config {}` \
+                     to its MCP server args",
+                    path.display()
+                ),
+            );
+            *warnings += 1;
+        }
+        Err(e) => {
+            warn("browser view", &format!("could not write the config: {e}"));
+            *warnings += 1;
+        }
+    }
 }
 
 fn check_tmux(errors: &mut usize) {
