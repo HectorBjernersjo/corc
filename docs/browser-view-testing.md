@@ -105,13 +105,18 @@ suspects. Diagnose from the bottom of the stack up.
    running started its MCP server with the old arguments and will never expose
    a port. To reuse an existing conversation instead, press `x` then `Enter` on
    the dead row, which respawns it with `--resume`.
-4. Ask the agent to navigate somewhere with Playwright.
-5. Press `b`.
+4. Ask the agent to navigate somewhere with Playwright, and press nothing.
 
-Expected: a pane appears to the right of the agent. Its top row is a dim URL,
-and the rest is the page, updating as the agent clicks around. The URL should
-follow the agent within half a second of each navigation, fragment included.
+Expected: within a second of the agent's tool call a pane appears to the right
+of the agent, without `b`. Its top row is a dim URL, and the rest is the page,
+updating as the agent clicks around. The URL should follow the agent within half
+a second of each navigation, fragment included.
 
+5. **Closing it means closed.** Press `b` (or `Ctrl+b`) while the browser is
+   still open: the pane goes away and *stays* away — if it reappears a second
+   later, `auto_open_browser` is level-triggering instead of firing on the
+   browser appearing. Ask the agent to close the browser and open a new one:
+   the pane comes back on its own.
 6. **The view belongs to the conversation.** Switch to another conversation:
    the pane goes away. Switch back: it returns. Press `b` on a conversation
    that is not in view and nothing happens on screen until you open it.
@@ -247,7 +252,7 @@ the pane. Note that limitation in the ADR if you make the switch.
 | `src/kitty.rs` | graphics protocol, tmux passthrough, placeholder grid |
 | `src/base64.rs` | encoder, for the WebSocket handshake key only |
 | `src/tmux.rs` | `split_browser_pane`, `pane_pid`, `pane_info`, `passthrough_enabled`, `install_browser_binding` |
-| `src/ui.rs` | the `b` key, `toggle_selected_browser`, `sync_browser_pane` |
+| `src/ui.rs` | the `b` key, `toggle_selected_browser`, `auto_open_browser`, `browser_appeared`, `sync_browser_pane` |
 | `src/doctor.rs` | `check_browser_view` |
 
 corc never decodes an image: CDP hands over base64 PNG, Chromium does the

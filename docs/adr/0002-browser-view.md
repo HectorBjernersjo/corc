@@ -1,7 +1,8 @@
 # The browser view attaches to Playwright's browser instead of owning it
 
 corc can show, live, whatever page the agent is driving through Playwright, in
-a pane beside the agent (`b`). It does this by attaching to the Chromium
+a pane beside the agent — opened by the agent reaching for a browser, or by `b`.
+It does this by attaching to the Chromium
 Playwright already launched — discovered by walking down from the agent pane's
 pid — and streaming CDP screencast frames into the pane with the kitty
 graphics protocol. corc never launches, wraps or proxies anything.
@@ -100,8 +101,33 @@ tells them to wire up). Everything else corc discovers.
   read as "my tmux plugin stopped working" rather than as corc's doing.
   `install_browser_binding` unsets the option on startup so a corc session that
   outlives the upgrade recovers without being killed.
-- Finding the browser is a full `/proc` walk, so it runs only while
+- Finding the browser is a full `/proc` walk, so in the pane it runs only while
   disconnected. Once the cast is up, the connection is the liveness signal.
+  The TUI walks too, once per refresh, for the reason below.
+- **The view opens itself when the agent opens a browser**, which is what the
+  toggle was standing in for. `cdp_port` was already the "a browser exists now"
+  signal; the only thing missing was someone asking while no pane was open, so
+  `auto_open_browser` asks on the TUI's one-second refresh and sets the same
+  flag `b` does — the pane stays derived from the flag, and nothing else moves.
+  Three things this settles:
+  - **Only the viewed conversation is checked.** The pane exists for that one
+    alone, so a flag set on a background conversation buys nothing visible, and
+    switching to a conversation whose browser is already up fires this on the
+    next tick anyway. That also keeps the walk at one per second, root pid
+    included, instead of one per live conversation.
+  - **Edge-triggered, not level-triggered**: the flag is set when a browser
+    *appears*, tracked in an in-memory `browser_seen` set. Level-triggering it
+    would reopen a view the user had closed by hand a second earlier, every
+    second, for as long as the browser lived — the toggle would look broken. The
+    set is only updated for the viewed conversation, so switching away and back
+    does not re-fire, and it is not persisted: a corc restart already re-derives
+    the pane from the flag.
+  - **A setup that cannot draw the view is skipped silently.** `sync_browser_pane`
+    reports its failure and clears the flag, which is right for a keypress and
+    wrong here — a wezterm user would get the same message once per browser the
+    agent opens. Auto-open therefore checks passthrough itself and does nothing
+    if it is off. Finding a CDP port already proves the Playwright config is
+    wired, so there is nothing else to pre-check.
 - **Only one conversation at a time can have a browser** unless Playwright runs
   with `--isolated`: it refuses to open a second browser against a user data
   directory already in use. The lock belongs to whichever Chromium is alive, so

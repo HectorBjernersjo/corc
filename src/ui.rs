@@ -25,7 +25,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -382,6 +382,9 @@ struct App {
     /// exists is derived from the viewed conversation's persisted `browser`
     /// flag by `sync_browser_pane` — never toggled directly.
     browser_pane: Option<String>,
+    /// Conversations already known to have a browser up, so `auto_open_browser`
+    /// fires on the browser appearing rather than on it merely being there.
+    browser_seen: HashSet<String>,
     /// Flat, status-driven panel above the project-grouped sidebar: indices
     /// into `state.conversations` whose status is Running, Question, or Unseen.
     attention: Vec<usize>,
@@ -470,6 +473,7 @@ pub fn run() -> Result<()> {
         placeholder_pane,
         viewed: None,
         browser_pane: None,
+        browser_seen: HashSet::new(),
         attention: Vec::new(),
         attention_sel: None,
         items: Vec::new(),
@@ -989,6 +993,12 @@ impl App {
                 )
             })
             .collect();
+
+        // The agent opening a browser turns the view on by itself (D24), before
+        // the sync below derives the pane from the flag.
+        if self.auto_open_browser() {
+            dirty = true;
+        }
 
         if dirty {
             let _ = self.state.save();
@@ -1825,6 +1835,48 @@ impl App {
         }
     }
 
+    /// Turn the view on for the viewed conversation when its agent opens a
+    /// browser (D24), so `b` is a way to keep the pane rather than the only way
+    /// to get it. Returns whether the flag changed, to fold into the caller's
+    /// save.
+    ///
+    /// Only the viewed conversation is checked: the pane exists for that one
+    /// alone, so a flag set on a background conversation buys nothing but a
+    /// change where the user cannot see it — and switching to a conversation
+    /// whose browser is already up fires this on the next tick anyway. It costs
+    /// one `/proc` walk per second, which is what `cdp_port` is.
+    fn auto_open_browser(&mut self) -> bool {
+        let state = &self.state;
+        self.browser_seen
+            .retain(|id| state.conversation(id).is_some());
+        let Some(id) = self.viewed.clone() else {
+            return false;
+        };
+        let port = self
+            .state
+            .conversation(&id)
+            .and_then(|c| c.pane_id.as_deref())
+            .and_then(tmux::pane_pid)
+            .and_then(browser::cdp_port);
+        if !browser_appeared(&mut self.browser_seen, &id, port.is_some()) {
+            return false;
+        }
+        // A setup that cannot draw the view is skipped silently rather than
+        // reported once per browser the agent opens; the manual toggle is where
+        // that error belongs. Finding a port already proves the Playwright
+        // config is wired, so passthrough is all that is left to check.
+        if !tmux::passthrough_enabled() {
+            return false;
+        }
+        match self.state.conversation_mut(&id) {
+            Some(conv) if !conv.browser => {
+                conv.browser = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Make the pane match the viewed conversation's `browser` flag (D24).
     /// Runs on every refresh and after a conversation switch, which is what
     /// makes the view follow the conversation rather than the content slot.
@@ -2439,12 +2491,27 @@ fn conversation_is_empty(
     })
 }
 
+/// Whether a browser the agent has open should turn the view on: only on the
+/// transition from absent to present, recorded in `seen`. Level-triggering it
+/// instead would reopen a view the user closed by hand while the browser was
+/// still up, one tick later, every tick.
+///
+/// `seen` is only ever updated for the conversation in view, so one switched
+/// away from stays "seen" and coming back to it does not re-fire.
+fn browser_appeared(seen: &mut HashSet<String>, id: &str, present: bool) -> bool {
+    if !present {
+        seen.remove(id);
+        return false;
+    }
+    seen.insert(id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HistoryWindow, IDLE_POLL, Item, PINNED_DOT, Panel, RenderKind, RenderSchedule,
         RepaintSchedule, adjacent_panel, attention_indices, attention_panel_height,
-        conversation_dot, conversation_is_empty, force_full_redraw,
+        browser_appeared, conversation_dot, conversation_is_empty, force_full_redraw,
         keep_first_conversation_context_visible, set_list_highlight,
     };
     use crate::discovery::Meta;
@@ -2457,6 +2524,7 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::text::Line;
     use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+    use std::collections::HashSet;
     use std::io;
     use std::time::{Duration, Instant};
 
@@ -2804,5 +2872,30 @@ mod tests {
 
         assert_eq!(state.selected(), None);
         assert_eq!(state.offset(), 8);
+    }
+
+    /// The whole life of an auto-opened browser view, in the order a user meets
+    /// it: the agent opens a browser, the user closes the view, comes back to
+    /// the conversation, and the agent later opens a second browser.
+    #[test]
+    fn the_view_opens_when_a_browser_appears_and_not_again_until_the_next_one() {
+        let mut seen = HashSet::new();
+
+        // The agent's first browser tool call: the view opens.
+        assert!(browser_appeared(&mut seen, "a", true));
+        // Every tick after that, the same browser is still there and must not
+        // reopen a view the user has since closed by hand.
+        assert!(!browser_appeared(&mut seen, "a", true));
+        assert!(!browser_appeared(&mut seen, "a", true));
+
+        // Switching to another conversation leaves "a" alone — only the viewed
+        // conversation is ever checked — so coming back does not re-fire.
+        assert!(browser_appeared(&mut seen, "b", true));
+        assert!(!browser_appeared(&mut seen, "a", true));
+
+        // The browser goes away, and the next one the agent opens is a fresh
+        // reason to show the view.
+        assert!(!browser_appeared(&mut seen, "a", false));
+        assert!(browser_appeared(&mut seen, "a", true));
     }
 }

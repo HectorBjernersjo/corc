@@ -48,13 +48,22 @@ const MAX_CAPTURE: (u32, u32) = (1600, 1200);
 /// a single space-joined blob, so arguments are matched against the flattened
 /// string rather than argv entries. Helper processes are skipped by their
 /// `--type=` flag, leaving the browser process itself.
+///
+/// A descendant whose flag leads nowhere is skipped rather than ending the
+/// search: matching a flattened command line means anything *mentioning*
+/// `--user-data-dir=` matches, and under an agent pane that includes the
+/// agent's own shell commands — a `grep '--user-data-dir='` looking for this
+/// very browser would otherwise hide it for as long as the grep ran.
 pub fn cdp_port(root_pid: u32) -> Option<u16> {
-    let data_dir = descendants(root_pid).into_iter().find_map(|pid| {
+    descendants(root_pid).into_iter().find_map(|pid| {
         let cmdline = cmdline(pid)?;
-        (!cmdline.contains("--type=")).then(|| user_data_dir(&cmdline))?
-    })?;
-    let contents = std::fs::read_to_string(data_dir.join("DevToolsActivePort")).ok()?;
-    contents.lines().next()?.trim().parse().ok()
+        if cmdline.contains("--type=") {
+            return None;
+        }
+        let port_file = user_data_dir(&cmdline)?.join("DevToolsActivePort");
+        let contents = std::fs::read_to_string(port_file).ok()?;
+        contents.lines().next()?.trim().parse().ok()
+    })
 }
 
 fn user_data_dir(cmdline: &str) -> Option<PathBuf> {

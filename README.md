@@ -161,6 +161,12 @@ structured interactive questions. An untouched Codex or OpenCode conversation st
 through Playwright. corc attaches to the browser Playwright already launched —
 it never starts one — so an agent that has not opened a browser simply says so.
 
+Mostly you do not press anything: **the view opens itself within a second of the
+agent opening a browser**, for the conversation you are viewing. Closing it
+still means closed — corc opens the view when a browser *appears*, not for as
+long as one is there — so the next browser the agent opens brings it back, and
+the one it already has does not.
+
 The view belongs to the conversation, not to the layout: `b` turns it on for
 the conversation under the cursor, the setting is remembered across restarts,
 and the pane appears whenever you view that conversation and disappears when
