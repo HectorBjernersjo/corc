@@ -40,6 +40,16 @@ pub struct Meta {
     pub title: Option<String>,
     /// First real user prompt, kept as a title stand-in until `title` exists.
     pub first_prompt: Option<String>,
+    /// First slash command that reached the model, as a last-resort title
+    /// stand-in: a conversation driven purely by commands (`/model`, then a
+    /// skill) contains no free-text prompt and often never gets a generated
+    /// title either.
+    pub first_command: Option<String>,
+    /// A just-seen command name, held until we know whether it ran locally
+    /// (a `<local-command-stdout>` record follows and withdraws it) or
+    /// reached the model (an assistant record follows and promotes it to
+    /// `first_command`). Only `display_title` should consume it.
+    pub command_candidate: Option<String>,
     /// Whether the conversation contains a real user/assistant exchange.
     /// Deliberately independent of `title`, which providers may generate late
     /// or fail to generate at all.
@@ -63,12 +73,15 @@ pub struct Meta {
 
 impl Meta {
     /// What the sidebar should show: an explicit rename, the generated title,
-    /// or the first user prompt while no title has been generated yet.
+    /// the first user prompt while no title has been generated yet, or — for
+    /// conversations driven purely by slash commands — the first command name.
     pub fn display_title(&self) -> Option<&str> {
         self.custom_title
             .as_deref()
             .or(self.title.as_deref())
             .or(self.first_prompt.as_deref())
+            .or(self.first_command.as_deref())
+            .or(self.command_candidate.as_deref())
     }
 }
 
@@ -101,6 +114,8 @@ impl Default for Meta {
             custom_title: None,
             title: None,
             first_prompt: None,
+            first_command: None,
+            command_candidate: None,
             has_content: false,
             turn_state: TurnState::Unknown,
             turn_started_at: None,
@@ -296,8 +311,31 @@ fn apply(meta: &mut Meta, v: &Value) {
                 }
             }
         }
+        // Slash-command transcripts (excluded from `first_prompt` above).
+        // Keep the command name as a title candidate so a conversation with
+        // no free-text prompt still shows something; a following
+        // `<local-command-stdout>` means the command ran locally and never
+        // reached the model, so it withdraws the candidate.
+        Some("user") if !sidechain && !v["isMeta"].as_bool().unwrap_or(false) => {
+            if let Some(content) = v["message"]["content"].as_str() {
+                if content.starts_with("<local-command-stdout>") {
+                    meta.command_candidate = None;
+                } else if meta.first_command.is_none()
+                    && meta.command_candidate.is_none()
+                    && let Some(name) = command_name(content)
+                {
+                    meta.command_candidate = Some(name);
+                }
+            }
+        }
         Some("assistant") if !sidechain => {
             meta.has_content = true;
+            // The model answered, so the pending command genuinely started
+            // the conversation — pin it against later local commands whose
+            // stdout would otherwise withdraw it.
+            if meta.first_command.is_none() {
+                meta.first_command = meta.command_candidate.take();
+            }
             if let Some(ts) = record_timestamp(v) {
                 meta.turn_progress_at = Some(ts);
             }
@@ -360,6 +398,15 @@ fn is_tool_result(v: &Value) -> bool {
     v["message"]["content"]
         .as_array()
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+}
+
+/// The command name of a slash-command transcript record: the text between
+/// `<command-name>` tags ("/user-story"), reduced to a title line. The tag is
+/// searched anywhere in the content — Claude Code varies the tag order.
+fn command_name(content: &str) -> Option<String> {
+    let start = content.find("<command-name>")? + "<command-name>".len();
+    let end = content[start..].find("</command-name>")? + start;
+    title_line(&content[start..end])
 }
 
 /// The prompt text of a user record, reduced to a one-line title stand-in.
@@ -592,7 +639,11 @@ mod tests {
                 "<command-message>improve-codebase-architecture</command-message>\n\
                  <command-name>/improve-codebase-architecture</command-name>"}}),
         );
-        assert_eq!(meta.display_title(), None);
+        // Until anything better exists the command name itself stands in.
+        assert_eq!(
+            meta.display_title(),
+            Some("/improve-codebase-architecture")
+        );
 
         apply(
             &mut meta,
@@ -606,6 +657,62 @@ mod tests {
             &json!({"type":"ai-title","aiTitle":"Generated architecture review"}),
         );
         assert_eq!(meta.display_title(), Some("platform api architecture"));
+    }
+
+    /// A conversation driven purely by slash commands has no free-text prompt
+    /// and often never gets a generated title; the first command that reached
+    /// the model stands in. Local commands (their `<local-command-stdout>`
+    /// follows immediately) never name the conversation.
+    #[test]
+    fn command_only_conversation_falls_back_to_the_command_name() {
+        let mut meta = Meta::default();
+
+        // /model runs locally: caveat, command, stdout.
+        apply(
+            &mut meta,
+            &json!({"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>…</local-command-caveat>"}}),
+        );
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":
+                "<command-name>/model</command-name>\n<command-args>fable</command-args>"}}),
+        );
+        assert_eq!(meta.display_title(), Some("/model"));
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"<local-command-stdout>Set model</local-command-stdout>"}}),
+        );
+        assert_eq!(meta.display_title(), None);
+
+        // /user-story goes to the model (tag order varies) and gets pinned by
+        // the assistant reply.
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":
+                "<command-message>user-story</command-message>\n<command-name>/user-story</command-name>"}}),
+        );
+        apply(
+            &mut meta,
+            &json!({"type":"assistant","message":{"stop_reason":"end_turn"},
+                    "timestamp":"2026-07-08T10:00:10Z"}),
+        );
+        assert_eq!(meta.display_title(), Some("/user-story"));
+        assert_eq!(meta.first_command.as_deref(), Some("/user-story"));
+
+        // A later local command must not withdraw the pinned name…
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"<local-command-stdout>usage</local-command-stdout>"}}),
+        );
+        assert_eq!(meta.display_title(), Some("/user-story"));
+
+        // …and a real prompt still outranks it.
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"actually, do this"},
+                    "timestamp":"2026-07-08T10:01:00Z"}),
+        );
+        assert_eq!(meta.display_title(), Some("actually, do this"));
     }
 
     /// A Ctrl+C interrupt is written as a user record (with an

@@ -174,11 +174,23 @@ const DISCARD_GRACE: Duration = Duration::from_secs(30);
 /// Most recent conversations shown per project before the rest are hidden
 /// (D13) — the all-time window reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
-/// How often corc force-repaints its whole pane, and the input poll timeout.
-/// corc gets no event when an *adjacent* pane scrolls — which is exactly what
-/// makes tmux/wezterm leave stale glyphs in corc's pane (D23) — so the only
-/// fix is a timed full repaint. 10 Hz on a 40-column pane is a few KB/s.
-const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// Timed damage repair (D23), currently off. corc gets no event when an
+/// *adjacent* pane scrolls, and those updates left stale glyphs in corc's
+/// pane, so the sidebar used to repaint itself fully at 10 Hz. Every repair
+/// frame costs more than it looks: tmux walks the hardware cursor out of the
+/// agent pane and back to draw the sidebar, ten times a second, which reads as
+/// a flickering cursor while you type into an idle agent. D23 was diagnosed
+/// against an older tmux, so the repair stays off until the stale-glyph bug is
+/// re-confirmed on tmux 3.6a. `CORC_REPAINT_MS=100` turns it back on for an
+/// A/B without a rebuild.
+fn repair_interval() -> Option<Duration> {
+    let millis: u64 = std::env::var("CORC_REPAINT_MS").ok()?.parse().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
+
+/// Input poll timeout when no repair clock sets one. It only wakes the event
+/// loop — nothing is drawn — so the once-a-second state refresh stays on time.
+const IDLE_POLL: Duration = Duration::from_millis(250);
 
 /// Caps repair frames independently of input activity. `event::poll` returns
 /// immediately while events are queued, so using its timeout as the repaint
@@ -223,14 +235,16 @@ enum RenderKind {
 /// expensive full-pane repairs. Key repeat may request many diff frames, but
 /// it can never advance the full-repair clock.
 struct RenderSchedule {
-    repair: RepaintSchedule,
+    /// None while timed damage repair is off; then only input and state
+    /// refreshes draw, and corc writes nothing at all when it is idle.
+    repair: Option<RepaintSchedule>,
     dirty: bool,
 }
 
 impl RenderSchedule {
-    fn new(now: Instant, repair_interval: Duration) -> Self {
+    fn new(now: Instant, repair_interval: Option<Duration>) -> Self {
         Self {
-            repair: RepaintSchedule::new(now, repair_interval),
+            repair: repair_interval.map(|interval| RepaintSchedule::new(now, interval)),
             dirty: true,
         }
     }
@@ -240,7 +254,7 @@ impl RenderSchedule {
     }
 
     fn take(&mut self, now: Instant) -> Option<RenderKind> {
-        if self.repair.take_due(now) {
+        if self.repair.as_mut().is_some_and(|r| r.take_due(now)) {
             self.dirty = false;
             return Some(RenderKind::Full);
         }
@@ -251,7 +265,7 @@ impl RenderSchedule {
     }
 
     fn wait(&self, now: Instant) -> Duration {
-        self.repair.wait(now)
+        self.repair.as_ref().map_or(IDLE_POLL, |r| r.wait(now))
     }
 }
 
@@ -469,13 +483,13 @@ impl App {
         &mut self,
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        let mut render = RenderSchedule::new(Instant::now(), REPAINT_INTERVAL);
+        let mut render = RenderSchedule::new(Instant::now(), repair_interval());
         loop {
             match render.take(Instant::now()) {
                 Some(RenderKind::Full) => {
-                    // corc gets no event when the adjacent content pane
-                    // scrolls, and those updates can leave stale glyphs in
-                    // the sidebar (D23). Full repair stays capped at 10 Hz.
+                    // Only reached when `CORC_REPAINT_MS` opts back into timed
+                    // repair of adjacent-pane damage (D23), capped at that
+                    // interval so key repeat can never accelerate it.
                     force_full_redraw(terminal);
                     terminal.draw(|f| self.draw(f))?;
                 }
@@ -2229,7 +2243,8 @@ fn conversation_is_empty(
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryWindow, Item, Panel, RenderKind, RenderSchedule, RepaintSchedule, adjacent_panel,
+        HistoryWindow, IDLE_POLL, Item, Panel, RenderKind, RenderSchedule, RepaintSchedule,
+        adjacent_panel,
         attention_panel_height, conversation_is_empty, force_full_redraw,
         keep_first_conversation_context_visible, project_display, set_list_highlight,
     };
@@ -2373,7 +2388,7 @@ mod tests {
     #[test]
     fn input_changes_draw_immediately_without_accelerating_full_repair() {
         let start = Instant::now();
-        let mut schedule = RenderSchedule::new(start, Duration::from_millis(100));
+        let mut schedule = RenderSchedule::new(start, Some(Duration::from_millis(100)));
 
         assert_eq!(schedule.take(start), Some(RenderKind::Full));
         schedule.mark_dirty();
@@ -2391,6 +2406,23 @@ mod tests {
             schedule.take(start + Duration::from_millis(100)),
             Some(RenderKind::Full)
         );
+    }
+
+    #[test]
+    fn without_repair_an_idle_sidebar_never_draws() {
+        let start = Instant::now();
+        let mut schedule = RenderSchedule::new(start, None);
+
+        // The first frame still paints the sidebar; after that only input and
+        // state refreshes do, so a still corc writes nothing to the terminal.
+        assert_eq!(schedule.take(start), Some(RenderKind::Diff));
+        assert_eq!(schedule.take(start + Duration::from_secs(10)), None);
+        schedule.mark_dirty();
+        assert_eq!(
+            schedule.take(start + Duration::from_secs(10)),
+            Some(RenderKind::Diff)
+        );
+        assert_eq!(schedule.wait(start + Duration::from_secs(10)), IDLE_POLL);
     }
 
     struct RecordingBackend {
