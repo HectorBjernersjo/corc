@@ -26,13 +26,27 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 enum Item {
     Header(String),
-    /// Index into `state.conversations`.
-    Conv(usize),
+    /// Conversation id. Deliberately not an index into `state.conversations`:
+    /// removing a conversation shifts every later index, so an index held by a
+    /// row from the previous frame silently starts naming a *different*
+    /// conversation — which used to fling the cursor onto an unrelated row when
+    /// one was deleted. An id either still resolves or does not.
+    Conv(String),
+}
+
+/// Row index of a conversation in the canonical list, or None when no row
+/// holds it — hidden by the history window or the per-project cap, or gone
+/// from state entirely. A miss leaves a cursor where it is; it must never
+/// resolve to some other conversation's row.
+fn item_pos(items: &[Item], id: &str) -> Option<usize> {
+    items
+        .iter()
+        .position(|item| matches!(item, Item::Conv(row) if row == id))
 }
 
 /// The three vertically stacked keyboard-navigation regions.
@@ -71,23 +85,35 @@ fn attention_panel_height(count: usize, content_height: u16) -> u16 {
     (count as u16 + 1).min(max)
 }
 
+/// Derived pane status per conversation id. Keyed rather than a Vec parallel
+/// to `state.conversations`: a parallel Vec has to be hand-patched on every
+/// removal to stay aligned, and one missed patch reports another
+/// conversation's status.
+type Statuses = HashMap<String, Status>;
+
+/// A conversation's status from the last derivation. An id the map has never
+/// seen is Dead: a row can outlive one refresh, and a conversation that is not
+/// there has no live pane by definition.
+fn status_of(statuses: &Statuses, id: &str) -> Status {
+    statuses.get(id).copied().unwrap_or(Status::Dead)
+}
+
 /// Build the top-panel rows. Pins are always included; rows then sort by dot
 /// color — blue (Question/Unseen) first, then yellow (Running), then the pink
 /// pins — and each group follows project order and newest-created-first order
 /// for a stable, predictable list.
-fn attention_indices(state: &State, statuses: &[Status]) -> Vec<usize> {
-    let mut indices: Vec<usize> = state
+fn attention_ids(state: &State, statuses: &Statuses) -> Vec<String> {
+    let status = |conversation: &state::Conversation| status_of(statuses, &conversation.id);
+    let mut rows: Vec<&state::Conversation> = state
         .conversations
         .iter()
-        .enumerate()
-        .filter(|(i, conversation)| {
+        .filter(|conversation| {
             conversation.pinned
                 || matches!(
-                    statuses.get(*i),
-                    Some(Status::Running | Status::Question | Status::Unseen)
+                    status(conversation),
+                    Status::Running | Status::Question | Status::Unseen
                 )
         })
-        .map(|(i, _)| i)
         .collect();
     let project_rank = |conversation: &state::Conversation| {
         state
@@ -97,22 +123,22 @@ fn attention_indices(state: &State, statuses: &[Status]) -> Vec<usize> {
             .unwrap_or(usize::MAX)
     };
     // Blue, then yellow, then pink — matching the dot colors the eye scans by.
-    let color_rank = |i: usize| match statuses.get(i) {
-        Some(Status::Question | Status::Unseen) => 0,
-        Some(Status::Running) => 1,
+    let color_rank = |conversation: &state::Conversation| match status(conversation) {
+        Status::Question | Status::Unseen => 0,
+        Status::Running => 1,
         _ => 2,
     };
-    indices.sort_by(|&a, &b| {
-        let ca = &state.conversations[a];
-        let cb = &state.conversations[b];
-        color_rank(a).cmp(&color_rank(b)).then_with(|| {
+    rows.sort_by(|ca, cb| {
+        color_rank(ca).cmp(&color_rank(cb)).then_with(|| {
             project_rank(ca)
                 .cmp(&project_rank(cb))
                 .then_with(|| cb.created_at.cmp(&ca.created_at))
                 .then_with(|| ca.id.cmp(&cb.id))
         })
     });
-    indices
+    rows.into_iter()
+        .map(|conversation| conversation.id.clone())
+        .collect()
 }
 
 /// When the cursor lands on a project's first conversation, keep that
@@ -212,8 +238,8 @@ impl HistoryWindow {
         }
     }
 
-    fn hides(self, status: Option<&Status>, age_secs: u64) -> bool {
-        status == Some(&Status::Dead)
+    fn hides(self, status: Status, age_secs: u64) -> bool {
+        status == Status::Dead
             && (self == Self::Active || self.cutoff_secs().is_some_and(|cutoff| age_secs > cutoff))
     }
 
@@ -232,6 +258,22 @@ const DISCARD_GRACE: Duration = Duration::from_secs(30);
 /// Most recent conversations shown per project before the rest are hidden
 /// (D13) — the all-time window reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
+
+/// Whether `project` is still a directory corc offers: present in the expanded
+/// directory list, or added to the machine-local list since that list was built.
+/// The local half is consulted live because the `N` picker records a directory
+/// just before spawning in it — a brand-new project must never read as stale —
+/// but only while the directory is really there: that list is append-only, so it
+/// goes on naming checkouts long after they are deleted. No list at all (`None`)
+/// means the question can't be answered, so every project passes.
+fn project_is_listed(listed: Option<&HashSet<String>>, local: &[String], project: &str) -> bool {
+    let Some(listed) = listed else {
+        return true;
+    };
+    listed.contains(project)
+        || (local.iter().any(|dir| dir == project) && Path::new(project).is_dir())
+}
+
 /// Timed damage repair (D23), currently off. corc gets no event when an
 /// *adjacent* pane scrolls, and those updates left stale glyphs in corc's
 /// pane, so the sidebar used to repaint itself fully at 10 Hz. Every repair
@@ -369,8 +411,8 @@ impl ProviderPicker {
 struct App {
     state: State,
     metas: MetaStore,
-    /// Pane statuses derived on refresh, parallel to `state.conversations`.
-    statuses: Vec<Status>,
+    /// Pane statuses derived on refresh, by conversation id.
+    statuses: Statuses,
     /// The pane corc runs in (left, fixed 40 columns).
     sidebar_pane: String,
     /// The plain-shell pane corc created on the right. While a conversation
@@ -385,9 +427,9 @@ struct App {
     /// Conversations already known to have a browser up, so `auto_open_browser`
     /// fires on the browser appearing rather than on it merely being there.
     browser_seen: HashSet<String>,
-    /// Flat, status-driven panel above the project-grouped sidebar: indices
-    /// into `state.conversations` whose status is Running, Question, or Unseen.
-    attention: Vec<usize>,
+    /// Flat, status-driven panel above the project-grouped sidebar: the ids of
+    /// the conversations whose status is Running, Question, or Unseen.
+    attention: Vec<String>,
     /// When Some, the cursor is in the attention panel at this row.
     attention_sel: Option<usize>,
     items: Vec<Item>,
@@ -411,6 +453,13 @@ struct App {
     history_window: HistoryWindow,
     /// How many conversations the current history window/list cap is hiding.
     hidden: usize,
+    /// The directories the pickers offer, expanded from `directories.txt` plus
+    /// the machine-local list. A project outside it is stale — a checkout that
+    /// was deleted, or a line dropped from the file — and stays out of the
+    /// sidebar unless something in it is still live. Built once at startup:
+    /// expanding walks the filesystem and asks git and jj about every repo,
+    /// which is far too much work for a repaint. None when it could not be read.
+    listed_dirs: Option<HashSet<String>>,
     /// The `s` provider-switch overlay, when open. The `N` directory picker
     /// (which now folds in the add-directory prompt) is no longer an inline
     /// overlay — it runs as a centered `tmux display-popup` process (D22).
@@ -465,10 +514,16 @@ pub fn run() -> Result<()> {
 
     let placeholder_pane = tmux::split_content_pane(&sidebar_pane)?;
 
+    // None when the list could not be read: then nothing counts as stale,
+    // rather than everything.
+    let listed_dirs: Option<HashSet<String>> = picker::list_directories(&state.directories)
+        .ok()
+        .map(|dirs| dirs.iter().map(|dir| dir.display().to_string()).collect());
+
     let mut app = App {
         state,
         metas: MetaStore::new()?,
-        statuses: Vec::new(),
+        statuses: Statuses::new(),
         sidebar_pane,
         placeholder_pane,
         viewed: None,
@@ -486,6 +541,7 @@ pub fn run() -> Result<()> {
         pending_kill: None,
         history_window: HistoryWindow::OneWeek,
         hidden: 0,
+        listed_dirs,
         provider_picker: None,
         move_mode: false,
         pending_discard: Vec::new(),
@@ -982,7 +1038,7 @@ impl App {
                     .as_deref()
                     .and_then(|pane| panes.as_ref()?.get(pane))
                     .and_then(|title| provider::by_id(&c.provider).runtime_hint(title));
-                status::derive_with_runtime(
+                let status = status::derive_with_runtime(
                     c.pane_id.is_some(),
                     runtime,
                     self.metas.meta(&c.id),
@@ -990,7 +1046,8 @@ impl App {
                     viewed.as_deref() == Some(c.id.as_str()),
                     now,
                     c.created_at,
-                )
+                );
+                (c.id.clone(), status)
             })
             .collect();
 
@@ -1008,21 +1065,16 @@ impl App {
         self.rebuild_keeping_selection();
     }
 
+    /// Rebuild the top panel, keeping its cursor on the same conversation. A
+    /// row that has left the panel gives the cursor up entirely rather than
+    /// keeping its position, which would be some other conversation's row.
     fn rebuild_attention(&mut self) {
         let keep = self
             .attention_sel
             .and_then(|pos| self.attention.get(pos))
-            .and_then(|i| self.state.conversations.get(*i))
-            .map(|c| c.id.clone());
-        self.attention = attention_indices(&self.state, &self.statuses);
-        if let Some(id) = keep {
-            self.attention_sel = self
-                .attention
-                .iter()
-                .position(|i| self.state.conversations[*i].id == id);
-        } else if self.attention.is_empty() {
-            self.attention_sel = None;
-        }
+            .cloned();
+        self.attention = attention_ids(&self.state, &self.statuses);
+        self.attention_sel = keep.and_then(|id| self.attention.iter().position(|row| *row == id));
     }
 
     fn rebuild_items(&mut self) {
@@ -1061,18 +1113,36 @@ impl App {
                     .then_with(|| ca.id.cmp(&cb.id))
             });
 
+            // A project whose directory has dropped out of both directory lists
+            // — a checkout that was deleted, or a line removed from
+            // directories.txt — is stale, and only its live conversations keep
+            // it on screen. `projects` is otherwise append-only, so without
+            // this every directory the user ever worked in lingers in the
+            // sidebar forever. The all-time window still reaches them, so
+            // nothing becomes unreachable.
+            if self.history_window != HistoryWindow::AllTime
+                && !project_is_listed(self.listed_dirs.as_ref(), &self.state.directories, project)
+                && !indices.iter().any(|&i| {
+                    status_of(&self.statuses, &self.state.conversations[i].id) != Status::Dead
+                })
+            {
+                self.hidden += indices.len();
+                continue;
+            }
+
             let name = labels[pi].clone();
             let mut kept = Vec::new();
             for i in indices {
+                let conv = &self.state.conversations[i];
                 // Dead conversations outside the selected history window stay
                 // out of the list (D12). The Active window hides all of them.
-                if self.statuses.get(i) == Some(&Status::Dead) {
-                    let conv = &self.state.conversations[i];
+                let status = status_of(&self.statuses, &conv.id);
+                if status == Status::Dead {
                     let age = now.saturating_sub(status::last_active_ts(
                         self.metas.meta(&conv.id),
                         conv.created_at,
                     ));
-                    if self.history_window.hides(self.statuses.get(i), age) {
+                    if self.history_window.hides(status, age) {
                         self.hidden += 1;
                         continue;
                     }
@@ -1080,7 +1150,7 @@ impl App {
                 if !filter.is_empty() {
                     let title = self
                         .metas
-                        .meta(&self.state.conversations[i].id)
+                        .meta(&conv.id)
                         .and_then(|m| m.display_title().map(str::to_string))
                         .unwrap_or_default();
                     let hay = format!("{name} {title}");
@@ -1117,7 +1187,8 @@ impl App {
             }
             self.items.push(Item::Header(name));
             for i in kept {
-                self.items.push(Item::Conv(i));
+                self.items
+                    .push(Item::Conv(self.state.conversations[i].id.clone()));
             }
         }
         self.clamp_selection();
@@ -1324,19 +1395,12 @@ impl App {
     }
 
     fn attention_selected_conv_id(&self) -> Option<String> {
-        let pos = self.attention_sel?;
-        let i = *self.attention.get(pos)?;
-        Some(self.state.conversations.get(i)?.id.clone())
+        Some(self.attention.get(self.attention_sel?)?.clone())
     }
 
     fn main_selected_conv_id(&self) -> Option<String> {
         match self.items.get(self.selected)? {
-            // `.get`, not `[*i]`: right after a conversation is removed from
-            // state the item list is briefly stale (rebuild_keeping_selection
-            // reads the old selection before rebuilding), so a stale index can
-            // outrun the shrunk Vec — indexing it would panic and take the TUI
-            // down. A miss just means "nothing to keep".
-            Item::Conv(i) => Some(self.state.conversations.get(*i)?.id.clone()),
+            Item::Conv(id) => Some(id.clone()),
             Item::Header(_) => None,
         }
     }
@@ -1348,17 +1412,12 @@ impl App {
         let id = self.selected_conv_id()?;
         self.attention_sel = None;
         self.menu_sel = None;
-        let mut pos = self
-            .items
-            .iter()
-            .position(|it| matches!(it, Item::Conv(i) if self.state.conversations[*i].id == id));
+        let mut pos = item_pos(&self.items, &id);
         if pos.is_none() {
             self.filter.clear();
             self.history_window = HistoryWindow::AllTime;
             self.rebuild_items();
-            pos = self.items.iter().position(
-                |it| matches!(it, Item::Conv(i) if self.state.conversations[*i].id == id),
-            );
+            pos = item_pos(&self.items, &id);
         }
         if let Some(pos) = pos {
             self.selected = pos;
@@ -1398,11 +1457,7 @@ impl App {
         else {
             return;
         };
-        if let Some(pos) = self
-            .items
-            .iter()
-            .position(|i| matches!(i, Item::Conv(idx) if self.state.conversations[*idx].id == id))
-        {
+        if let Some(pos) = item_pos(&self.items, &id) {
             self.selected = pos;
         }
         self.status_msg = self.view(&id).err().map(|e| e.to_string());
@@ -1613,15 +1668,9 @@ impl App {
         let Some(id) = self.selected_conv_id() else {
             return;
         };
-        let Some(idx) = self.state.conversations.iter().position(|c| c.id == id) else {
-            return;
-        };
-        match self.statuses.get(idx).copied().unwrap_or(Status::Dead) {
+        match status_of(&self.statuses, &id) {
             Status::Dead => {
-                self.state.conversations.remove(idx);
-                if idx < self.statuses.len() {
-                    self.statuses.remove(idx);
-                }
+                self.state.conversations.retain(|c| c.id != id);
                 self.state.prune_empty_projects();
                 self.status_msg = self.state.save().err().map(|e| e.to_string());
                 self.refresh();
@@ -1658,9 +1707,7 @@ impl App {
         if from_attention
             && !pinned
             && self.attention_sel.is_none()
-            && let Some(pos) = self.items.iter().position(
-                |item| matches!(item, Item::Conv(i) if self.state.conversations[*i].id == id),
-            )
+            && let Some(pos) = item_pos(&self.items, &id)
         {
             self.selected = pos;
         }
@@ -1802,9 +1849,7 @@ impl App {
             self.refresh();
             // Move the highlight onto the freshly created row so it looks
             // "hovered" immediately, rather than leaving it on the old row.
-            if let Some(pos) = self.items.iter().position(
-                |it| matches!(it, Item::Conv(idx) if self.state.conversations[*idx].id == id),
-            ) {
+            if let Some(pos) = item_pos(&self.items, &id) {
                 self.selected = pos;
             }
             self.view(&id)
@@ -1984,26 +2029,19 @@ impl App {
     }
 
     /// Rebuild the item list, keeping the selection on the same conversation
-    /// if it is still visible.
+    /// if it is still visible. The attention panel keeps its own cursor the
+    /// same way, inside `rebuild_attention`: the duplicated rows have
+    /// independent cursor memory, so merely browsing Attention must not move
+    /// the canonical list's selection on refresh.
     fn rebuild_keeping_selection(&mut self) {
-        // The duplicated rows have independent cursor memory. Merely browsing
-        // Attention must not move the canonical list's selection on refresh.
-        let keep_main = self.main_selected_conv_id();
-        let keep_attention = self.attention_selected_conv_id();
+        let keep = self.main_selected_conv_id();
         self.rebuild_items();
-        if let Some(id) = keep_main.as_ref()
-            && let Some(pos) = self
-                .items
-                .iter()
-                .position(|i| matches!(i, Item::Conv(c) if self.state.conversations[*c].id == *id))
-        {
+        // Follow the conversation, not the row number. A conversation that is
+        // gone leaves the cursor on whatever row now sits at this position
+        // (clamped by the rebuild) — never on an unrelated conversation
+        // dragged in by a shifted index.
+        if let Some(pos) = keep.and_then(|id| item_pos(&self.items, &id)) {
             self.selected = pos;
-        }
-        if let Some(id) = keep_attention {
-            self.attention_sel = self
-                .attention
-                .iter()
-                .position(|i| self.state.conversations[*i].id == id);
         }
     }
 
@@ -2233,15 +2271,19 @@ impl App {
     /// showing status like any other row.
     fn render_conv(
         &self,
-        i: usize,
+        id: &str,
         width: usize,
         now: u64,
         multi_provider: bool,
         selected: bool,
         show_project: bool,
     ) -> ListItem<'static> {
-        let conv = &self.state.conversations[i];
-        let status = self.statuses.get(i).copied().unwrap_or(Status::Dead);
+        // A row can outlive its conversation by at most the frame between a
+        // removal and the next rebuild. Blank beats bringing the TUI down.
+        let Some(conv) = self.state.conversation(id) else {
+            return ListItem::new("");
+        };
+        let status = status_of(&self.statuses, id);
         let (dot, dot_color) = conversation_dot(status, conv.pinned);
         let meta = self.metas.meta(&conv.id);
         let mut title = meta
@@ -2329,8 +2371,8 @@ impl App {
         let items: Vec<ListItem> = (0..self.items.len())
             .map(|idx| match &self.items[idx] {
                 Item::Header(name) => self.render_header(name, width),
-                Item::Conv(i) => self.render_conv(
-                    *i,
+                Item::Conv(id) => self.render_conv(
+                    id,
                     width,
                     now,
                     multi,
@@ -2374,8 +2416,8 @@ impl App {
             .attention
             .iter()
             .enumerate()
-            .map(|(pos, i)| {
-                self.render_conv(*i, width, now, multi, self.attention_sel == Some(pos), true)
+            .map(|(pos, id)| {
+                self.render_conv(id, width, now, multi, self.attention_sel == Some(pos), true)
             })
             .collect();
         self.attention_area = rows[0];
@@ -2510,9 +2552,9 @@ fn browser_appeared(seen: &mut HashSet<String>, id: &str, present: bool) -> bool
 mod tests {
     use super::{
         HistoryWindow, IDLE_POLL, Item, PINNED_DOT, Panel, RenderKind, RenderSchedule,
-        RepaintSchedule, adjacent_panel, attention_indices, attention_panel_height,
-        browser_appeared, conversation_dot, conversation_is_empty, force_full_redraw,
-        keep_first_conversation_context_visible, set_list_highlight,
+        RepaintSchedule, Statuses, adjacent_panel, attention_ids, attention_panel_height,
+        browser_appeared, conversation_dot, conversation_is_empty, force_full_redraw, item_pos,
+        keep_first_conversation_context_visible, project_is_listed, set_list_highlight,
     };
     use crate::discovery::Meta;
     use crate::state::Conversation;
@@ -2544,13 +2586,45 @@ mod tests {
     #[test]
     fn history_window_only_hides_dead_conversations_past_its_cutoff() {
         let three_hours = HistoryWindow::ThreeHours;
-        assert!(!three_hours.hides(Some(&Status::Dead), 3 * 3600));
-        assert!(three_hours.hides(Some(&Status::Dead), 3 * 3600 + 1));
-        assert!(!three_hours.hides(Some(&Status::Idle), 3 * 3600 + 1));
-        assert!(!HistoryWindow::AllTime.hides(Some(&Status::Dead), u64::MAX));
-        assert!(HistoryWindow::Active.hides(Some(&Status::Dead), 0));
-        assert!(!HistoryWindow::Active.hides(Some(&Status::Idle), u64::MAX));
+        assert!(!three_hours.hides(Status::Dead, 3 * 3600));
+        assert!(three_hours.hides(Status::Dead, 3 * 3600 + 1));
+        assert!(!three_hours.hides(Status::Idle, 3 * 3600 + 1));
+        assert!(!HistoryWindow::AllTime.hides(Status::Dead, u64::MAX));
+        assert!(HistoryWindow::Active.hides(Status::Dead, 0));
+        assert!(!HistoryWindow::Active.hides(Status::Idle, u64::MAX));
         assert!(HistoryWindow::Active.is_uncapped());
+    }
+
+    /// A project counts as listed while the expanded list holds it, or while the
+    /// machine-local list names it *and* it is still on disk. Nothing names a
+    /// deleted checkout back into the sidebar, and with no list to check against
+    /// every project passes — a failed read can never empty the sidebar.
+    #[test]
+    fn stale_projects_are_the_ones_no_directory_list_names() {
+        let listed: HashSet<String> = ["/home/h/projects/corc".to_string()].into();
+        // A directory that really exists stands in for one just added through
+        // the picker, which records it before the expanded list is rebuilt.
+        let fresh = std::env::temp_dir().display().to_string();
+        let local = [fresh.clone(), "/home/h/work/forgotten".to_string()];
+
+        assert!(project_is_listed(
+            Some(&listed),
+            &local,
+            "/home/h/projects/corc"
+        ));
+        assert!(project_is_listed(Some(&listed), &local, &fresh));
+        // Named by the append-only local list, but long gone from disk.
+        assert!(!project_is_listed(
+            Some(&listed),
+            &local,
+            "/home/h/work/forgotten"
+        ));
+        assert!(!project_is_listed(
+            Some(&listed),
+            &local,
+            "/home/h/projects/never-listed"
+        ));
+        assert!(project_is_listed(None, &local, "/home/h/work/forgotten"));
     }
 
     #[test]
@@ -2642,15 +2716,40 @@ mod tests {
             conversations: vec![running, pinned, unseen, question, idle],
             ..Default::default()
         };
-        let statuses = [
-            Status::Running,
-            Status::Dead,
-            Status::Unseen,
-            Status::Question,
-            Status::Idle,
+        let statuses: Statuses = [
+            ("running".to_string(), Status::Running),
+            ("pinned".to_string(), Status::Dead),
+            ("unseen".to_string(), Status::Unseen),
+            ("question".to_string(), Status::Question),
+            ("idle".to_string(), Status::Idle),
+        ]
+        .into();
+
+        assert_eq!(
+            attention_ids(&state, &statuses),
+            ["question", "unseen", "running", "pinned"]
+        );
+    }
+
+    /// The property that keeps the cursor sane when a conversation is deleted:
+    /// a row is found by the conversation it holds, and a conversation that no
+    /// longer has a row is simply a miss. It must never resolve to the row of
+    /// whichever conversation moved into the deleted one's place — the old
+    /// index-carrying rows did exactly that, flinging the cursor across the
+    /// sidebar on every `x`.
+    #[test]
+    fn rows_are_found_by_conversation_not_by_position() {
+        let items = vec![
+            Item::Header("one".into()),
+            Item::Conv("a".into()),
+            Item::Conv("b".into()),
+            Item::Header("two".into()),
+            Item::Conv("c".into()),
         ];
 
-        assert_eq!(attention_indices(&state, &statuses), [3, 2, 0, 1]);
+        assert_eq!(item_pos(&items, "a"), Some(1));
+        assert_eq!(item_pos(&items, "c"), Some(4));
+        assert_eq!(item_pos(&items, "deleted"), None);
     }
 
     #[test]
@@ -2832,10 +2931,10 @@ mod tests {
     fn first_conversation_keeps_project_header_and_spacer_visible() {
         let items = vec![
             Item::Header("one".into()),
-            Item::Conv(0),
-            Item::Conv(1),
+            Item::Conv("a".into()),
+            Item::Conv("b".into()),
             Item::Header("two".into()),
-            Item::Conv(2),
+            Item::Conv("c".into()),
         ];
         // Reproduce a list that previously scrolled with the selected first
         // conversation as its first visible item, clipping both header rows.
