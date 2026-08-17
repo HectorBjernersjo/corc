@@ -83,6 +83,17 @@ in the sidebar, `Ctrl+b` anywhere in the **corc session**, or `corc browser`
 from inside the agent pane.
 _Avoid_: preview pane, screenshot pane
 
+**Browser profile**:
+The Chromium user data directory one **Conversation**'s browser runs on,
+`~/.cache/corc/browsers/<conversation>`, handed to the agent pane as
+`PLAYWRIGHT_MCP_USER_DATA_DIR`. One per conversation because Chromium locks a
+profile while it lives and Playwright would otherwise key it by working
+directory, leaving two conversations in one repo unable to both have a browser.
+Cache, not **State file**: logins persist for as long as the conversation does,
+resumes included, and profiles of conversations corc has forgotten are swept at
+startup.
+_Avoid_: user data dir (Chromium's word for it), session
+
 **State file**:
 corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
 

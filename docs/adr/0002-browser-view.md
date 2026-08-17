@@ -20,7 +20,9 @@ assumed:
 
 So the whole integration is one flag in the user's Playwright MCP config
 (`--config ~/.config/corc/playwright.json`, which `corc doctor` writes and
-tells them to wire up). Everything else corc discovers.
+tells them to wire up). Everything else corc discovers — except *which profile*
+each browser uses, which corc has to decide, because Playwright's own answer
+makes two conversations in one repo fight over one browser.
 
 ## Considered Options
 
@@ -36,6 +38,17 @@ tells them to wire up). Everything else corc discovers.
   config. Rejected once `--remote-debugging-port=0` proved to work: the kernel
   assigns, so there is nothing to allocate, no collisions to avoid, and one
   static config file serves every conversation.
+- **`--isolated` in the shipped config**, to stop two conversations colliding
+  over one profile. Rejected: it keeps the profile in memory, so every login the
+  agent performs dies with the browser — and since `ensure_config` never
+  overwrites, existing installs would go on colliding until they deleted the file
+  by hand. A profile per conversation removes the same collision and keeps logins
+  for as long as the conversation exists. The two are mutually exclusive anyway:
+  Playwright rejects a `userDataDir` in isolated mode.
+- **A Playwright config file per conversation**, with `--config` pointing at it.
+  Rejected: the MCP args live in the user's own agent config as one entry shared
+  by every conversation, so the path cannot vary per conversation — the same
+  reason the profile has to arrive as environment rather than as a flag.
 - **`corc browser` writing the flag straight into `state.json`.** Rejected:
   the TUI owns that file and rewrites it wholesale from its in-memory copy, so
   a second process editing a conversation's flag there is overwritten on the
@@ -128,14 +141,27 @@ tells them to wire up). Everything else corc discovers.
     agent opens. Auto-open therefore checks passthrough itself and does nothing
     if it is off. Finding a CDP port already proves the Playwright config is
     wired, so there is nothing else to pre-check.
-- **Only one conversation at a time can have a browser** unless Playwright runs
-  with `--isolated`: it refuses to open a second browser against a user data
-  directory already in use. The lock belongs to whichever Chromium is alive, so
-  a browser left running by an old conversation blocks every other one,
-  including brand-new conversations — the fix is to close it, not to start
-  another. This is a pre-existing Playwright limitation, not one corc
-  introduces, and corc deliberately does not add `--isolated` to the shipped
-  config — that would silently stop the user's logins from persisting.
+- **Every conversation gets its own browser profile**,
+  `~/.cache/corc/browsers/<conversation>`, handed to the agent pane as
+  `PLAYWRIGHT_MCP_USER_DATA_DIR`. Left alone, Playwright names the profile after
+  a hash of the agent's working directory, and Chromium holds an exclusive lock
+  on a profile while it lives — so two conversations in one repo, which is the
+  normal case, fight over one browser and the second to open just fails. A
+  browser left behind by a conversation nobody is looking at blocks new ones the
+  same way.
+
+  The pane's environment is the only per-conversation channel corc already owns,
+  and it reaches all the way down: agent → MCP server → browser. The MCP args
+  cannot serve here, being one entry in the user's config shared by every
+  conversation. Playwright merges config file → environment → command line, which
+  puts corc exactly where it should be: overriding the profile Playwright would
+  have picked, losing to a `--user-data-dir` the user set deliberately.
+
+  Profiles are cache — a lost one costs a fresh login — and the ones belonging to
+  conversations corc no longer knows about are swept at startup. A sweep rather
+  than a delete beside every place a conversation is forgotten, because
+  conversations also vanish when corc is killed outright, and `state.json` is the
+  only authority on which ones are still real.
 - Requires a terminal that draws kitty graphics (ghostty, kitty, rio) and
   `allow-passthrough` in tmux. `corc doctor` checks both. rio 0.5.25 is the
   Windows-native one, verified end to end through WSL and tmux — but only with

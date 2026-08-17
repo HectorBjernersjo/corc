@@ -214,13 +214,18 @@ It needs three things, all checked by `corc doctor`:
    free port that corc then finds on its own. Nothing else about your
    Playwright setup changes.
 
-Note that Playwright refuses to open a second browser against a profile already
-in use, so only one conversation at a time can have one. The lock is held by
-whichever Chromium is still alive, so a browser left behind by a conversation
-you have moved on from will block the next one too — close it rather than
-starting over. To run two at once, pass `--isolated` as well, which keeps the
-profile in memory and so drops any logins you rely on persisting. That tradeoff
-is yours to make; corc does not make it for you.
+Every conversation gets its own browser, and its own profile to go with it, in
+`~/.cache/corc/browsers/<conversation>`. That is not cosmetic: Chromium locks a
+profile while it lives, and Playwright's own choice of profile is keyed by
+working directory — so without this, two conversations in one repo would fight
+over one browser and the second to open would simply fail. corc sets
+`PLAYWRIGHT_MCP_USER_DATA_DIR` on the agent's pane, which every process below it
+inherits. Nothing is asked of your Playwright config beyond the port above, and
+an explicit `--user-data-dir` in the MCP args still wins if you want one profile
+for everything.
+
+Logins therefore persist per conversation, resumes included, and the profiles of
+conversations you have removed are deleted the next time corc starts.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`

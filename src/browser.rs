@@ -11,12 +11,18 @@
 //! Chromium writes the chosen port into `DevToolsActivePort` in its user data
 //! directory, and corc finds both by walking down from the agent pane's pid.
 //!
+//! The one thing corc does own is *which profile* each conversation's browser
+//! uses, because Playwright's default would make two conversations fight over
+//! one — see `profile_dir`. That is an environment variable on the agent pane,
+//! not a second thing asked of the user's config.
+//!
 //! From there corc is a pipe. CDP's `Page.startScreencast` delivers PNG frames
 //! already base64-encoded, which is exactly the encoding the kitty graphics
 //! protocol accepts, and Chromium does the scaling. No image is ever decoded.
 
 use crate::{kitty, state, tmux, ws};
 use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -42,6 +48,27 @@ const MAX_CAPTURE: (u32, u32) = (1600, 1200);
 // ---------------------------------------------------------------------------
 
 /// The CDP port of the Chromium running under `root_pid`, if there is one.
+pub fn cdp_port(root_pid: u32) -> Option<u16> {
+    port_under(&child_map(), root_pid)
+}
+
+/// Which of `panes` — pane id → the pid of the process that pane started —
+/// have a browser somewhere under them.
+///
+/// One `/proc` pass serves the whole list, which is what makes this cheap
+/// enough for the sidebar to ask about every live conversation once a second.
+/// Pane subtrees are disjoint, so walking each one from a shared child map
+/// costs about what walking a single pane used to.
+pub fn panes_with_browser(panes: &HashMap<String, u32>) -> HashSet<String> {
+    let children = child_map();
+    panes
+        .iter()
+        .filter(|(_, pid)| port_under(&children, **pid).is_some())
+        .map(|(pane, _)| pane.clone())
+        .collect()
+}
+
+/// The CDP port of the Chromium below `root`, if there is one.
 ///
 /// The chain is agent → MCP server → Chromium, at whatever depth, so this
 /// walks every descendant. Chromium rewrites its own `/proc/pid/cmdline` into
@@ -54,8 +81,8 @@ const MAX_CAPTURE: (u32, u32) = (1600, 1200);
 /// `--user-data-dir=` matches, and under an agent pane that includes the
 /// agent's own shell commands — a `grep '--user-data-dir='` looking for this
 /// very browser would otherwise hide it for as long as the grep ran.
-pub fn cdp_port(root_pid: u32) -> Option<u16> {
-    descendants(root_pid).into_iter().find_map(|pid| {
+fn port_under(children: &ChildMap, root: u32) -> Option<u16> {
+    descendants(children, root).into_iter().find_map(|pid| {
         let cmdline = cmdline(pid)?;
         if cmdline.contains("--type=") {
             return None;
@@ -77,12 +104,14 @@ fn cmdline(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&raw).replace('\0', " "))
 }
 
-/// Every process below `root`, breadth unbounded. One pass over `/proc` builds
-/// the child lists; the walk is then pure memory.
-fn descendants(root: u32) -> Vec<u32> {
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+/// Every process's children, from one pass over `/proc`. Built once per
+/// question rather than per pane, so a walk itself is pure memory.
+type ChildMap = HashMap<u32, Vec<u32>>;
+
+fn child_map() -> ChildMap {
+    let mut children = ChildMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+        return children;
     };
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -92,6 +121,11 @@ fn descendants(root: u32) -> Vec<u32> {
             children.entry(parent).or_default().push(pid);
         }
     }
+    children
+}
+
+/// Every process below `root`, breadth unbounded.
+fn descendants(children: &ChildMap, root: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let mut queue = vec![root];
     while let Some(pid) = queue.pop() {
@@ -688,6 +722,85 @@ fn current_conversation(state: &state::State) -> Option<&state::Conversation> {
 }
 
 // ---------------------------------------------------------------------------
+// One profile per conversation
+// ---------------------------------------------------------------------------
+
+/// The environment variable Playwright MCP reads its profile directory from.
+///
+/// Every one of its command-line flags has an environment twin, and the three
+/// sources are merged config file → environment → command line. Sitting in the
+/// middle is exactly right for corc: this overrides the profile Playwright
+/// would have picked on its own, and still loses to a `--user-data-dir` the
+/// user put in the MCP args themselves.
+const PROFILE_ENV: &str = "PLAYWRIGHT_MCP_USER_DATA_DIR";
+
+/// Where a conversation's browser profile lives.
+///
+/// Left to itself, Playwright names the profile after a hash of the agent's
+/// working directory. Chromium holds an exclusive lock on a profile for as long
+/// as it lives, so two conversations in one repo — the normal case — end up
+/// fighting over one directory, and the second browser to open simply fails.
+/// Keying the profile by conversation instead removes the collision.
+///
+/// `--isolated` would too, by keeping the profile in memory, but it throws away
+/// every login the agent ever performs. A directory per conversation keeps them
+/// for as long as the conversation exists, resumes included, since a resumed
+/// conversation keeps its id.
+///
+/// Cache rather than state: a lost profile costs a fresh login, nothing here is
+/// worth backing up, and `prune_profiles` is free to delete.
+fn profile_dir(id: &str) -> Result<PathBuf> {
+    Ok(profiles_root()?.join(id))
+}
+
+fn profiles_root() -> Result<PathBuf> {
+    let base = match std::env::var("XDG_CACHE_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".cache"),
+    };
+    Ok(base.join("corc/browsers"))
+}
+
+/// `NAME=value` for the agent pane's environment, which every process below it
+/// inherits — the agent, its Playwright MCP server, and so the browser.
+///
+/// `None` when the cache directory cannot be resolved, in which case the pane
+/// is spawned without it and Playwright falls back to its shared profile: the
+/// old behaviour, collision included, rather than no conversation at all. The
+/// directory is left to Playwright to create, which it does with mode 0700.
+pub fn profile_env(id: &str) -> Option<String> {
+    Some(format!("{PROFILE_ENV}={}", profile_dir(id).ok()?.display()))
+}
+
+/// Delete the profiles of conversations corc no longer knows about.
+///
+/// A sweep at startup rather than a delete beside every place a conversation is
+/// forgotten: conversations also vanish when corc is killed outright, and the
+/// state file is the only authority on which ones are still real. Best-effort
+/// throughout — an undeletable profile is a few megabytes of cache, and losing
+/// a live conversation's browser to a failed guess would cost much more.
+pub fn prune_profiles(state: &state::State) {
+    if let Ok(root) = profiles_root() {
+        prune_profiles_in(&root, state);
+    }
+}
+
+fn prune_profiles_in(root: &std::path::Path, state: &state::State) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else {
+            continue;
+        };
+        if state.conversation(id).is_none() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -749,6 +862,100 @@ pub fn check_ready() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    /// A Playwright MCP server driven over stdio, the way the agent drives it —
+    /// what the two end-to-end tests below talk to.
+    struct Mcp {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+        next_id: u32,
+    }
+
+    impl Mcp {
+        /// Start a server the way a corc agent pane does: corc's config file
+        /// supplies the debugging port, the pane environment supplies the
+        /// profile. Returns once the server is initialized — Chromium has not
+        /// launched yet, and will not until the first browser tool call.
+        ///
+        /// The variable is cleared rather than merely left unset when no profile
+        /// is asked for: `cargo test` run from inside a corc pane inherits one,
+        /// which would quietly make "Playwright's own choice" mean corc's.
+        fn start(profile: Option<&std::path::Path>) -> Self {
+            let config = ensure_config().expect("writing the config");
+            let mut command = Command::new("npx");
+            command
+                .args(["-y", "@playwright/mcp@latest", "--headless"])
+                .arg("--config")
+                .arg(&config);
+            match profile {
+                Some(dir) => command.env(PROFILE_ENV, dir),
+                None => command.env_remove(PROFILE_ENV),
+            };
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("starting the playwright MCP server");
+            let stdin = child.stdin.take().unwrap();
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut mcp = Self {
+                child,
+                stdin,
+                stdout,
+                next_id: 1,
+            };
+            mcp.request(
+                r#""initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"corc","version":"1"}}"#,
+            );
+            writeln!(
+                mcp.stdin,
+                r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+            )
+            .unwrap();
+            mcp
+        }
+
+        /// Send one request and return the line that answers it.
+        fn request(&mut self, method_and_params: &str) -> String {
+            let id = self.next_id;
+            self.next_id += 1;
+            writeln!(
+                self.stdin,
+                r#"{{"jsonrpc":"2.0","id":{id},"method":{method_and_params}}}"#
+            )
+            .unwrap();
+            let mut response = String::new();
+            self.stdout.read_line(&mut response).unwrap();
+            response
+        }
+
+        /// The agent's first browser tool call, which is what launches Chromium.
+        fn navigate(&mut self, url: &str) -> String {
+            self.request(&format!(
+                r#""tools/call","params":{{"name":"browser_navigate","arguments":{{"url":"{url}"}}}}"#
+            ))
+        }
+
+        /// The port corc's own discovery finds under this server, once there is
+        /// one to find.
+        fn cdp_port(&self) -> Option<u16> {
+            wait_for(|| cdp_port(self.child.id()))
+        }
+    }
+
+    /// Kill the server on the way out, panic or not. A leaked Chromium keeps
+    /// its profile locked, which is precisely the failure these tests are
+    /// about — and it would outlive the test run to block a real conversation.
+    impl Drop for Mcp {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 
     #[test]
     fn the_user_data_dir_is_extracted_from_chromiums_flattened_cmdline() {
@@ -776,7 +983,19 @@ mod tests {
     fn the_current_process_is_its_own_ancestors_descendant() {
         let me = std::process::id();
         let parent = parent_pid(me).expect("own ppid is readable");
-        assert!(descendants(parent).contains(&me));
+        assert!(descendants(&child_map(), parent).contains(&me));
+    }
+
+    /// The sidebar's question, asked about a pane tree that is really there
+    /// (this test process) and one that is not. No browser runs under `cargo
+    /// test`, so the honest answer for both is "no".
+    #[test]
+    fn panes_without_a_browser_under_them_are_not_reported() {
+        let panes = HashMap::from([
+            ("%1".to_string(), std::process::id()),
+            ("%2".to_string(), u32::MAX),
+        ]);
+        assert!(panes_with_browser(&panes).is_empty());
     }
 
     #[test]
@@ -797,57 +1016,21 @@ mod tests {
     #[test]
     #[ignore = "needs npx, chromium and network"]
     fn a_real_playwright_browser_is_discovered_and_streamed() {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
-
-        let config = ensure_config().expect("writing the config");
-        // `--isolated` gives this run its own profile. Playwright refuses to
-        // open a second browser against a profile already in use, so without
-        // it the test collides with any live agent's browser — and, more to
-        // the point, so do two conversations (see README).
-        let mut mcp = Command::new("npx")
-            .args(["-y", "@playwright/mcp@latest", "--headless", "--isolated"])
-            .arg("--config")
-            .arg(&config)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("starting the playwright MCP server");
-        let mut stdin = mcp.stdin.take().unwrap();
-        let mut stdout = BufReader::new(mcp.stdout.take().unwrap());
-
-        let mut request = |stdin: &mut std::process::ChildStdin, line: &str| {
-            writeln!(stdin, "{line}").unwrap();
-            let mut response = String::new();
-            stdout.read_line(&mut response).unwrap();
-            response
-        };
-        request(
-            &mut stdin,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"corc","version":"1"}}}"#,
-        );
-        writeln!(
-            stdin,
-            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
-        )
-        .unwrap();
+        let profile = scratch_profiles("stream").join("only");
+        let mut mcp = Mcp::start(Some(&profile));
         // Nothing has launched yet — this is the lazy start corc relies on.
         assert!(
-            cdp_port(mcp.id()).is_none(),
+            cdp_port(mcp.child.id()).is_none(),
             "chromium should not exist before the first browser tool call"
         );
 
-        let navigate = request(
-            &mut stdin,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com"}}}"#,
-        );
+        let navigate = mcp.navigate("https://example.com");
         assert!(
             !navigate.contains("\"isError\":true"),
             "navigate: {navigate}"
         );
 
-        let port = wait_for(|| cdp_port(mcp.id())).expect("chromium's CDP port");
+        let port = mcp.cdp_port().expect("chromium's CDP port");
         let mut cast = Screencast::start(port, (800, 600)).expect("starting the screencast");
         assert!(cast.url.contains("example.com"), "url was {}", cast.url);
 
@@ -868,10 +1051,7 @@ mod tests {
         // nothing about where the page is, so this rides on the navigation
         // events instead — the part that is easy to get wrong and impossible
         // to notice, since a stale url still looks like a url.
-        let navigate = request(
-            &mut stdin,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com/#history"}}}"#,
-        );
+        let navigate = mcp.navigate("https://example.com/#history");
         assert!(
             !navigate.contains("\"isError\":true"),
             "navigate: {navigate}"
@@ -881,9 +1061,55 @@ mod tests {
             cast.url.ends_with("#history").then_some(())
         })
         .unwrap_or_else(|| panic!("url did not follow the navigation, still {}", cast.url));
+    }
 
-        let _ = mcp.kill();
-        let _ = mcp.wait();
+    /// The collision the profile exists to prevent, from both sides: two agents
+    /// in one directory each open a browser and get one, and pointing two at the
+    /// *same* profile still fails — which is what makes the first half a fix
+    /// rather than a coincidence.
+    ///
+    /// `about:blank` is enough: the browser launches on the first tool call
+    /// whatever the url, and the lock is taken by the launch.
+    #[test]
+    #[ignore = "needs npx and chromium"]
+    fn two_agents_in_one_directory_each_get_their_own_browser() {
+        let profiles = scratch_profiles("collision");
+
+        let mut first = Mcp::start(Some(&profiles.join("one")));
+        let mut second = Mcp::start(Some(&profiles.join("two")));
+        let opened = first.navigate("about:blank");
+        assert!(!opened.contains("\"isError\":true"), "first: {opened}");
+        let opened = second.navigate("about:blank");
+        assert!(!opened.contains("\"isError\":true"), "second: {opened}");
+
+        let one = first.cdp_port().expect("the first browser's CDP port");
+        let two = second.cdp_port().expect("the second browser's CDP port");
+        // Two browsers, and corc tells them apart by process tree — the port
+        // being different is what keeps two browser panes from mirroring the
+        // same page.
+        assert_ne!(one, two, "both agents were handed the same browser");
+
+        // The same profile twice, which is what Playwright's own default does
+        // to two conversations in one directory.
+        let shared = profiles.join("shared");
+        let mut third = Mcp::start(Some(&shared));
+        let mut fourth = Mcp::start(Some(&shared));
+        let opened = third.navigate("about:blank");
+        assert!(!opened.contains("\"isError\":true"), "third: {opened}");
+        third.cdp_port().expect("the third browser's CDP port");
+        let refused = fourth.navigate("about:blank");
+        assert!(
+            refused.contains("already in use"),
+            "a second browser on one profile should have been refused: {refused}"
+        );
+    }
+
+    /// A directory per test, under the scratch space rather than the real cache,
+    /// so a run never touches a live conversation's profile.
+    fn scratch_profiles(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corc-profiles-{}-{what}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     /// Poll `f` for up to five seconds. Browser startup and the first paint
@@ -955,6 +1181,45 @@ mod tests {
         assert_eq!(pending(&path, "one"), Some(Request::Off));
         assert_eq!(pending(&path, "two"), None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The profile is keyed by conversation, and handed to the pane in the form
+    /// tmux takes. The cache root itself is the machine's, so this asserts the
+    /// shape rather than a path.
+    #[test]
+    fn a_conversations_profile_is_named_after_it_and_passed_as_pane_environment() {
+        let id = "6f1c9e8a-0000-4000-8000-000000000001";
+        let dir = profile_dir(id).expect("resolving the profile dir");
+        assert!(
+            dir.ends_with(format!("corc/browsers/{id}")),
+            "profile was {}",
+            dir.display()
+        );
+        assert_eq!(
+            profile_env(id).as_deref(),
+            Some(format!("PLAYWRIGHT_MCP_USER_DATA_DIR={}", dir.display()).as_str())
+        );
+    }
+
+    /// Startup housekeeping: a profile whose conversation corc still knows about
+    /// survives, one left over from a conversation that is gone does not, and
+    /// stray files nobody put there are left alone rather than guessed at.
+    #[test]
+    fn profiles_of_forgotten_conversations_are_swept_and_live_ones_are_kept() {
+        let root = scratch_profiles("prune");
+        std::fs::create_dir_all(root.join("live/Default")).unwrap();
+        std::fs::create_dir_all(root.join("forgotten/Default")).unwrap();
+
+        let mut state = state::State::default();
+        state.add_conversation("live".into(), "/tmp".into(), "%1".into(), "claude".into());
+        prune_profiles_in(&root, &state);
+
+        assert!(root.join("live/Default").exists());
+        assert!(!root.join("forgotten").exists());
+        // A root that was never created is not an error worth reporting: no
+        // conversation has opened a browser yet.
+        prune_profiles_in(&root.join("nothing-here"), &state);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

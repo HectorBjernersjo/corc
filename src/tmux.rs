@@ -325,6 +325,14 @@ pub fn spawn_conversation(
     };
     let mut args = base;
     args.extend(["-n", id, "-c", &dir_str, "-P", "-F", "#{pane_id}"]);
+    // The pane environment is the only thing that varies per conversation all
+    // the way down into the agent's own tool calls, which is what gives each
+    // conversation its own browser profile (D24). The login shell passes it on
+    // untouched, so it reaches the Playwright MCP server the agent starts.
+    let profile = crate::browser::profile_env(id);
+    if let Some(profile) = profile.as_deref() {
+        args.extend(["-e", profile]);
+    }
     args.extend(command.iter().map(String::as_str));
     let pane_id = tmux(&args)?;
     if args[0] == "new-window" {
@@ -364,19 +372,35 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_keeps_ids_and_terminal_titles() {
+    fn pane_snapshot_keeps_ids_titles_and_pids() {
         let panes = parse_panes(
-            "%32\t✳ Review backup restore plan status\n\
-             %43\t⠂ platform-restore-cleanup-runbook\n",
+            "%32\t4711\t✳ Review backup restore plan status\n\
+             %43\t4712\t⠂ platform-restore-cleanup-runbook\n\
+             %44\t4713\t\n",
         );
 
         assert_eq!(
-            panes.get("%32").map(String::as_str),
-            Some("✳ Review backup restore plan status")
+            panes.get("%32"),
+            Some(&Pane {
+                title: "✳ Review backup restore plan status".into(),
+                pid: 4711,
+            })
         );
         assert_eq!(
-            panes.get("%43").map(String::as_str),
-            Some("⠂ platform-restore-cleanup-runbook")
+            panes.get("%43"),
+            Some(&Pane {
+                title: "⠂ platform-restore-cleanup-runbook".into(),
+                pid: 4712,
+            })
+        );
+        // A pane with no title is still a pane — dropping it would read as a
+        // dead conversation.
+        assert_eq!(
+            panes.get("%44"),
+            Some(&Pane {
+                title: String::new(),
+                pid: 4713,
+            })
         );
     }
 
@@ -573,21 +597,41 @@ pub fn pane_exists(pane_id: &str) -> bool {
 /// Snapshot every pane currently known to tmux, including the terminal title
 /// set by the process inside it. Callers use one snapshot for both liveness and
 /// provider-specific runtime hints instead of spawning per-pane tmux queries.
-pub fn all_panes() -> Result<HashMap<String, String>> {
+pub fn all_panes() -> Result<HashMap<String, Pane>> {
     Ok(parse_panes(&tmux(&[
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{pane_title}",
+        "#{pane_id}\t#{pane_pid}\t#{pane_title}",
     ])?))
 }
 
-fn parse_panes(output: &str) -> HashMap<String, String> {
+/// A live pane: the terminal title corc reads agent state out of, and the pid
+/// of the process the pane started — the root of the tree a browser hides in.
+/// Both come from the one `list-panes` call every refresh already makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pane {
+    pub title: String,
+    pub pid: u32,
+}
+
+fn parse_panes(output: &str) -> HashMap<String, Pane> {
     output
         .lines()
         .filter_map(|line| {
-            let (id, title) = line.split_once('\t')?;
-            Some((id.to_string(), title.to_string()))
+            // The title goes last and is the only field that can contain a
+            // tab, so it takes whatever remains.
+            let mut fields = line.splitn(3, '\t');
+            let id = fields.next()?;
+            let pid = fields.next()?.trim().parse().ok()?;
+            let title = fields.next()?;
+            Some((
+                id.to_string(),
+                Pane {
+                    title: title.to_string(),
+                    pid,
+                },
+            ))
         })
         .collect()
 }

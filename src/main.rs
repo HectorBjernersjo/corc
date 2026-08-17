@@ -299,10 +299,10 @@ fn list() -> Result<()> {
         }
         println!("\n{}", display_dir(project));
         for conv in convs {
-            let pane_title = conv.pane_id.as_deref().and_then(|pane| panes.get(pane));
-            let alive = pane_title.is_some();
-            let runtime =
-                pane_title.and_then(|title| provider::by_id(&conv.provider).runtime_hint(title));
+            let live_pane = conv.pane_id.as_deref().and_then(|pane| panes.get(pane));
+            let alive = live_pane.is_some();
+            let runtime = live_pane
+                .and_then(|pane| provider::by_id(&conv.provider).runtime_hint(&pane.title));
             let meta = store.meta(&conv.id);
             let s = status::derive_with_runtime(
                 alive,

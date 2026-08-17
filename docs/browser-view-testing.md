@@ -54,10 +54,10 @@ technique is the part worth keeping — query the terminal instead of reading
 pixels, and use XTVERSION as the control that proves the read-back channel
 works, so silence on a graphics query means the protocol and not the plumbing.
 
-`cargo test -- --ignored` runs
-`browser::tests::a_real_playwright_browser_is_discovered_and_streamed`, which
-starts a real Playwright MCP server, makes real tool calls, and drives corc's
-own code end to end:
+`cargo test -- --ignored` runs two tests against real Playwright MCP servers,
+making real tool calls and driving corc's own code end to end.
+
+`a_real_playwright_browser_is_discovered_and_streamed` covers the pipe:
 
 - Chromium does not exist before the first browser tool call (lazy launch).
 - corc finds it by walking down from the agent pane's pid, reads
@@ -70,8 +70,17 @@ own code end to end:
   a screencast frame carries only geometry, so the url rides on `Page`'s
   navigation events, and a stale url still looks like a url.
 
-It needs `npx`, Chromium and network, which is why it is `#[ignore]`d. Run it
-after touching `browser.rs`, `ws.rs` or `kitty.rs`.
+`two_agents_in_one_directory_each_get_their_own_browser` covers the profile, from
+both sides: two servers in one working directory with a profile each both launch
+and land on different CDP ports, and two servers pointed at the *same* profile
+still fail with `already in use` — which is what makes the first half a fix
+rather than a coincidence. Both use scratch profiles under `/tmp`, so a run never
+touches a live conversation's.
+
+They need `npx` and Chromium (and the network, for the streaming one), which is
+why they are `#[ignore]`d. Run them after touching `browser.rs`, `ws.rs` or
+`kitty.rs`. Nothing leaks on failure: the test harness kills each server on drop,
+and Chromium dies with the pipe.
 
 So if the pane misbehaves, discovery and streaming are the least likely
 suspects. Diagnose from the bottom of the stack up.
@@ -82,6 +91,7 @@ suspects. Diagnose from the bottom of the stack up.
 |---|---|
 | `~/.config/corc/playwright.json` | written; adds only `--remote-debugging-port=0` |
 | `~/.claude.json` | `--config …/corc/playwright.json` added to the playwright MCP args |
+| `~/.cache/corc/browsers/<conversation>` | one profile per conversation, set as `PLAYWRIGHT_MCP_USER_DATA_DIR` on the agent pane |
 | Backup of the above | `~/.claude.json.corc-backup-20260816-174844` |
 | `~/.cargo/bin/corc` | built from this tree with `cargo install --path .` |
 | Terminal / tmux | ghostty 1.3.1, tmux 3.6b, `allow-passthrough on` |
@@ -91,9 +101,10 @@ suspects. Diagnose from the bottom of the stack up.
 
 ## The test
 
-1. **Close any Chromium left over from an earlier agent.** One live browser
-   holds Playwright's shared profile and blocks every other conversation,
-   new ones included — see the first failure mode below. Check with:
+1. **Check what is already running**, so a stale browser is not mistaken for a
+   new one. Conversations spawned before profiles existed share Playwright's
+   `mcp-chrome-…` profile and still block each other — see the first failure mode
+   below.
 
    ```sh
    pgrep -af 'ms-playwright-mcp' | grep -v 'type=' | head
@@ -161,10 +172,26 @@ the port from `/tmp/corc-browser-test/DevToolsActivePort`.
 
 **The agent's browser tool call fails with `Browser is already in use for
 …/mcp-chrome-…, use --isolated`.**
-Another Chromium holds the shared user data directory. It does not have to
-belong to a *running* conversation — a browser outliving its agent keeps the
-lock, and then even a brand-new, correctly configured conversation cannot
-launch one. Find the squatter and what it belongs to:
+The agent is not using a corc profile. A `mcp-chrome-…` path is Playwright's own
+choice — keyed by a hash of the working directory, so every conversation in that
+directory shares it and Chromium's lock lets only the first one in. corc's own
+profiles are `~/.cache/corc/browsers/<conversation>`, one per conversation.
+
+Almost always this means the agent predates the change: its pane was spawned
+without `PLAYWRIGHT_MCP_USER_DATA_DIR`, and an already-running MCP server never
+sees a new environment. Restart corc and start a fresh conversation. Check what
+the pane actually has:
+
+```sh
+tmux show-environment -t <pane> PLAYWRIGHT_MCP_USER_DATA_DIR
+tr '\0' '\n' < /proc/<agent pid>/environ | grep PLAYWRIGHT_MCP
+```
+
+If the variable is there and the path is still `mcp-chrome-…`, something is
+overriding it — a `--user-data-dir` in the MCP args beats the environment, by
+design.
+
+To find the squatter and what it belongs to:
 
 ```sh
 pgrep -af 'ms-playwright-mcp' | grep -v 'type=' | head -1
@@ -173,10 +200,6 @@ ps -o ppid= -p <that pid>     # walk up: chromium → MCP server → agent
 
 A leftover with `--remote-debugging-pipe` and no `--remote-debugging-port` also
 tells you its agent predates the config edit. Closing it frees the profile.
-
-`--isolated` in the MCP args is the real fix for running two at once, and corc
-deliberately does **not** add it for the user: it keeps the profile in memory
-and would silently drop their persisted logins. Mention it, do not add it.
 
 **Pane says `no browser — the agent has not opened one`.**
 The agent has not made a browser tool call yet, or its MCP server predates the

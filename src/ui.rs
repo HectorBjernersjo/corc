@@ -378,6 +378,12 @@ const VIEWED_BG: Color = Color::Rgb(38, 50, 71);
 /// color, keeping the row geometry and background exactly as before.
 const PINNED_DOT: Color = Color::Rgb(218, 112, 214);
 
+/// Marker a row carries while its agent has a browser open (D24), sitting just
+/// left of the time column with a space to separate it. White because it says
+/// something about the agent rather than about the conversation's status, which
+/// the dot on the left already owns every other color of.
+const BROWSER_MARK: &str = "◆ ";
+
 /// Activity is more urgent than organization: Running stays yellow and
 /// Question/Unseen stay blue even when pinned. The pin color is the fallback
 /// for quiet Idle/Dead conversations, preserving Dead's hollow circle.
@@ -427,6 +433,12 @@ struct App {
     /// Conversations already known to have a browser up, so `auto_open_browser`
     /// fires on the browser appearing rather than on it merely being there.
     browser_seen: HashSet<String>,
+    /// Agent panes with a live browser under them (D24), refreshed once a
+    /// second from one `/proc` pass. Keyed by pane rather than conversation
+    /// because that is what the pass answers about; a conversation without a
+    /// pane cannot have a browser anyway. Both the row marker and
+    /// `auto_open_browser` read it, so neither walks `/proc` on its own.
+    browser_panes: HashSet<String>,
     /// Flat, status-driven panel above the project-grouped sidebar: the ids of
     /// the conversations whose status is Running, Question, or Unseen.
     attention: Vec<String>,
@@ -529,6 +541,7 @@ pub fn run() -> Result<()> {
         viewed: None,
         browser_pane: None,
         browser_seen: HashSet::new(),
+        browser_panes: HashSet::new(),
         attention: Vec::new(),
         attention_sel: None,
         items: Vec::new(),
@@ -602,9 +615,11 @@ pub fn run() -> Result<()> {
 }
 
 /// Startup reconciliation (D16): drop pane ids that no longer exist (the
-/// conversation is Dead) and park Claude panes stranded outside the hidden
-/// session (corc crashed mid-view) back into uuid-named hidden windows.
+/// conversation is Dead), park Claude panes stranded outside the hidden
+/// session (corc crashed mid-view) back into uuid-named hidden windows, and
+/// delete browser profiles left behind by conversations that are gone (D24).
 fn reconcile(state: &mut State) -> Result<()> {
+    browser::prune_profiles(state);
     for conv in &mut state.conversations {
         let Some(pane_id) = conv.pane_id.clone() else {
             continue;
@@ -1037,7 +1052,7 @@ impl App {
                     .pane_id
                     .as_deref()
                     .and_then(|pane| panes.as_ref()?.get(pane))
-                    .and_then(|title| provider::by_id(&c.provider).runtime_hint(title));
+                    .and_then(|pane| provider::by_id(&c.provider).runtime_hint(&pane.title));
                 let status = status::derive_with_runtime(
                     c.pane_id.is_some(),
                     runtime,
@@ -1050,6 +1065,14 @@ impl App {
                 (c.id.clone(), status)
             })
             .collect();
+
+        // Which agent panes have a browser under them (D24). A tmux query that
+        // failed keeps the last answer rather than claiming every browser
+        // closed, exactly as pane liveness above does.
+        if let Some(panes) = &panes {
+            self.browser_panes =
+                browser::panes_with_browser(&live_pane_pids(&self.state.conversations, panes));
+        }
 
         // The agent opening a browser turns the view on by itself (D24), before
         // the sync below derives the pane from the flag.
@@ -1885,11 +1908,11 @@ impl App {
     /// to get it. Returns whether the flag changed, to fold into the caller's
     /// save.
     ///
-    /// Only the viewed conversation is checked: the pane exists for that one
+    /// Only the viewed conversation is turned on: the pane exists for that one
     /// alone, so a flag set on a background conversation buys nothing but a
     /// change where the user cannot see it — and switching to a conversation
-    /// whose browser is already up fires this on the next tick anyway. It costs
-    /// one `/proc` walk per second, which is what `cdp_port` is.
+    /// whose browser is already up fires this on the next tick anyway. The row
+    /// marker is what carries the news about the others.
     fn auto_open_browser(&mut self) -> bool {
         let state = &self.state;
         self.browser_seen
@@ -1897,18 +1920,17 @@ impl App {
         let Some(id) = self.viewed.clone() else {
             return false;
         };
-        let port = self
+        let present = self
             .state
             .conversation(&id)
             .and_then(|c| c.pane_id.as_deref())
-            .and_then(tmux::pane_pid)
-            .and_then(browser::cdp_port);
-        if !browser_appeared(&mut self.browser_seen, &id, port.is_some()) {
+            .is_some_and(|pane| self.browser_panes.contains(pane));
+        if !browser_appeared(&mut self.browser_seen, &id, present) {
             return false;
         }
         // A setup that cannot draw the view is skipped silently rather than
         // reported once per browser the agent opens; the manual toggle is where
-        // that error belongs. Finding a port already proves the Playwright
+        // that error belongs. Finding a browser already proves the Playwright
         // config is wired, so passthrough is all that is left to check.
         if !tmux::passthrough_enabled() {
             return false;
@@ -2329,14 +2351,21 @@ impl App {
         };
         let time_w = time.chars().count();
         let gap = if time_w > 0 { 1 } else { 0 };
-        let t = truncate(&title, width.saturating_sub(3 + time_w + gap));
-        let pad = width.saturating_sub(3 + t.chars().count() + time_w);
+        // The marker takes its columns from the title, not from the time.
+        let mark = match conv.pane_id.as_deref() {
+            Some(pane) if self.browser_panes.contains(pane) => BROWSER_MARK,
+            _ => "",
+        };
+        let mark_w = mark.chars().count();
+        let t = truncate(&title, width.saturating_sub(3 + mark_w + time_w + gap));
+        let pad = width.saturating_sub(3 + t.chars().count() + mark_w + time_w);
         let item = ListItem::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(dot, Style::default().fg(dot_color)),
             Span::raw(" "),
             Span::styled(t, title_style),
             Span::raw(" ".repeat(pad)),
+            Span::styled(mark, Style::default().fg(Color::White)),
             Span::styled(time, time_style),
         ]));
         // The row background marks the active conversation. When it is also
@@ -2540,6 +2569,24 @@ fn conversation_is_empty(
 ///
 /// `seen` is only ever updated for the conversation in view, so one switched
 /// away from stays "seen" and coming back to it does not re-fire.
+/// The agent panes of `conversations` that tmux still knows about, with the pid
+/// of the process each one started — the roots `browser::panes_with_browser`
+/// searches. A conversation whose pane is gone is left out: it is Dead, and its
+/// stale pid could name some unrelated process by now.
+fn live_pane_pids(
+    conversations: &[state::Conversation],
+    panes: &HashMap<String, tmux::Pane>,
+) -> HashMap<String, u32> {
+    conversations
+        .iter()
+        .filter_map(|c| {
+            let pane_id = c.pane_id.clone()?;
+            let pid = panes.get(&pane_id)?.pid;
+            Some((pane_id, pid))
+        })
+        .collect()
+}
+
 fn browser_appeared(seen: &mut HashSet<String>, id: &str, present: bool) -> bool {
     if !present {
         seen.remove(id);
