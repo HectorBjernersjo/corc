@@ -1,14 +1,16 @@
 //! Directory source for the `N` picker and the `corc projects` sessionizer
 //! (D14, D20). Two sources are merged: the hand-curated, dotfile-synced list
 //! in `~/.config/corc/directories.txt`, and the machine-local list kept in
-//! `state.json`. Each entry is expanded with its repo's
-//! `git worktree list --porcelain`, deduped in order. The picker shows
-//! directories only; multiple conversations per project is normal.
+//! `state.json`. An entry ending in `/*` is a scan root and stands for every
+//! checkout under it (`repo::scan_checkouts`); any other entry is one directory
+//! plus its repo's other checkouts (`repo::Expansions`). Everything is deduped
+//! in order. The picker shows directories only; multiple conversations per
+//! project is normal.
 
+use crate::repo;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Path to the shared, hand-curated directory list (dotfile-synced, D20).
 fn config_directories_file() -> Result<PathBuf> {
@@ -16,8 +18,9 @@ fn config_directories_file() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/corc/directories.txt"))
 }
 
-/// The lines of the shared directory list. A missing file is treated as empty
-/// rather than an error — the local list may be enough.
+/// The lines of the shared directory list, minus blanks and `#` comments. A
+/// missing file is treated as empty rather than an error — the local list may
+/// be enough.
 fn config_directories() -> Vec<String> {
     let text = config_directories_file()
         .ok()
@@ -25,7 +28,7 @@ fn config_directories() -> Vec<String> {
         .unwrap_or_default();
     text.lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_string)
         .collect()
 }
@@ -83,20 +86,33 @@ fn split_parent_prefix(s: &str) -> (PathBuf, String) {
 }
 
 /// The candidate directories: the shared list (D20) followed by the
-/// machine-local `local` entries, in order, each entry followed by its git
-/// worktrees, deduped, `/.git/` internals dropped, non-directories dropped.
+/// machine-local `local` entries, in order. A `~/dir/*` entry expands to every
+/// checkout under it, most recently modified first; any other entry is itself
+/// plus its other checkouts — git worktrees and jj workspaces. Deduped,
+/// `/.git/` internals dropped, non-directories dropped.
 pub fn list_directories(local: &[String]) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    // One VCS expansion per repo for the whole listing, not one per entry.
+    let mut expansions = repo::Expansions::default();
     for dir in config_directories().iter().chain(local) {
-        let dir = dir.trim();
+        let dir = expand_tilde(dir.trim());
         if dir.is_empty() {
             continue;
         }
-        let mut candidates = vec![dir.to_string()];
-        if let Some(root) = repo_root(dir) {
-            candidates.extend(worktrees(&root));
-        }
+        let candidates = match dir.strip_suffix("/*") {
+            // A scanned checkout needs no VCS expansion: its siblings live
+            // under the same root and the walk reaches them on its own.
+            Some(root) => repo::scan_checkouts(Path::new(root))
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            None => {
+                let mut candidates = vec![dir.clone()];
+                candidates.extend(expansions.checkouts(&dir));
+                candidates
+            }
+        };
         for cand in candidates {
             // new.sh: grep -v '/\.git/' — drop worktree entries inside .git.
             if cand.contains("/.git/") {
@@ -181,48 +197,6 @@ pub fn fuzzy_match(query: &str, hay: &str) -> Option<FuzzyMatch> {
         score: score - (lower.len() as i32) / 32,
         indices,
     })
-}
-
-/// The repo root to expand worktrees from: `rev-parse --show-toplevel` for a
-/// normal checkout, or the directory itself when it is a bare repo — matching
-/// new.sh's worktree handling. None outside a repo.
-fn repo_root(dir: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", dir, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !root.is_empty() {
-            return Some(root);
-        }
-    }
-    // A bare repo has no working tree, so --show-toplevel fails; expand its
-    // worktrees from the bare directory itself (new.sh rad 21-23).
-    let bare = Command::new("git")
-        .args(["-C", dir, "rev-parse", "--is-bare-repository"])
-        .output()
-        .ok()?;
-    (bare.status.success() && String::from_utf8_lossy(&bare.stdout).trim() == "true")
-        .then(|| dir.to_string())
-}
-
-/// The `worktree <path>` lines of `git worktree list --porcelain`.
-fn worktrees(repo_root: &str) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .args(["-C", repo_root, "worktree", "list", "--porcelain"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix("worktree "))
-        .map(str::to_string)
-        .collect()
 }
 
 #[cfg(test)]

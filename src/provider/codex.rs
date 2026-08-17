@@ -193,6 +193,15 @@ fn apply(meta: &mut Meta, v: &Value) {
                 meta.first_prompt = discovery::title_line(text);
             }
         }
+        Some("item_completed") if p["item"]["type"].as_str() == Some("UserMessage") => {
+            if meta.first_prompt.is_none()
+                && let Some(text) = p["item"]["content"]
+                    .as_array()
+                    .and_then(|content| content.iter().find_map(|part| part["text"].as_str()))
+            {
+                meta.first_prompt = discovery::title_line(text);
+            }
+        }
         Some("task_complete") => {
             meta.turn_state = TurnState::Complete;
             meta.turn_completed_at = p["completed_at"].as_u64().or_else(|| line_timestamp(v));
@@ -432,6 +441,34 @@ mod tests {
                     "payload":{"type":"message","role":"user"}}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
+    }
+
+    /// Newer Codex rollouts wrap user input in an item_completed event rather
+    /// than the older flat user_message event. It must still provide the
+    /// conversation's title stand-in.
+    #[test]
+    fn item_completed_user_message_becomes_title() {
+        let mut meta = Meta::default();
+        apply(
+            &mut meta,
+            &json!({
+                "timestamp": "2026-08-08T13:46:04.989Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            {"type": "image", "url": "attachment.png"},
+                            {"type": "text", "text": "Fix the history title\nand add a test"}
+                        ]
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(meta.first_prompt.as_deref(), Some("Fix the history title"));
+        assert_eq!(meta.display_title(), Some("Fix the history title"));
     }
 
     #[test]

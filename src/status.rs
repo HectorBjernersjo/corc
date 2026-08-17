@@ -3,14 +3,15 @@
 //! Runtime hints answer only whether the agent is working right now; the
 //! transcript remains authoritative for timing and Unseen state.
 //!
-//! The four states and their time columns (PLAN.md D6):
+//! The five states and their time columns (PLAN.md D6):
 //!
 //! | State   | Condition                                | Time column            |
 //! |---------|------------------------------------------|------------------------|
-//! | Running | pane alive, turn in flight               | elapsed since turn start |
-//! | Unseen  | pane alive, turn completed after viewing | completed turn's duration |
-//! | Idle    | pane alive, turn complete, viewed since  | age since last active  |
-//! | Dead    | no pane                                  | age since last active  |
+//! | Running  | pane alive, turn in flight                | elapsed since turn start |
+//! | Question | pane alive, waiting for the user's answer | age of active question |
+//! | Unseen   | pane alive, turn completed after viewing  | completed turn's duration |
+//! | Idle     | pane alive, turn complete, viewed since   | age since last active  |
+//! | Dead     | no pane                                   | age since last active  |
 //!
 //! Every time column is a single largest unit — `9s`, `4m`, `2h`, `3d`, `5w`
 //! — so the column stays narrow. Idle/Dead always show how long since the
@@ -23,6 +24,8 @@ use std::time::SystemTime;
 pub enum Status {
     /// Pane alive, turn in flight.
     Running,
+    /// Pane alive, agent blocked on an active question for the user.
+    Question,
     /// Pane alive, turn completed after the user last viewed it.
     Unseen,
     /// Pane alive, turn complete, viewed since completion.
@@ -43,6 +46,7 @@ impl Status {
     pub fn label(&self) -> &'static str {
         match self {
             Status::Running => "running",
+            Status::Question => "question",
             Status::Unseen => "unseen",
             Status::Idle => "idle",
             Status::Dead => "dead",
@@ -73,6 +77,12 @@ pub fn derive_with_runtime(
 ) -> Status {
     if !pane_alive {
         return Status::Dead;
+    }
+    // An unanswered provider question is an attention state even when the
+    // conversation is currently viewed. Claude uses its ordinary idle pane
+    // title here, so transcript evidence must win over that runtime hint.
+    if meta.is_some_and(|m| m.active_question) {
+        return Status::Question;
     }
     if runtime == Some(RuntimeHint::Working) {
         return Status::Running;
@@ -106,6 +116,10 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
         Status::Running => meta
             .and_then(|m| m.turn_started_at)
             .map(|start| fmt_duration(now.saturating_sub(start)))
+            .unwrap_or_default(),
+        Status::Question => meta
+            .and_then(|m| m.question_asked_at)
+            .map(|asked| age(now.saturating_sub(asked)))
             .unwrap_or_default(),
         Status::Unseen => meta
             .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
@@ -218,12 +232,24 @@ mod tests {
         let now = 1000;
 
         // No pane ⇒ Dead, whatever the jsonl says.
-        assert_eq!(derive(false, Some(&running), 0, false, now, 0), Status::Dead);
+        assert_eq!(
+            derive(false, Some(&running), 0, false, now, 0),
+            Status::Dead
+        );
         // Turn in flight ⇒ Running, even while viewed.
-        assert_eq!(derive(true, Some(&running), 0, false, now, 0), Status::Running);
-        assert_eq!(derive(true, Some(&running), 0, true, now, 0), Status::Running);
+        assert_eq!(
+            derive(true, Some(&running), 0, false, now, 0),
+            Status::Running
+        );
+        assert_eq!(
+            derive(true, Some(&running), 0, true, now, 0),
+            Status::Running
+        );
         // Completed after last_viewed ⇒ Unseen…
-        assert_eq!(derive(true, Some(&done), 200, false, now, 0), Status::Unseen);
+        assert_eq!(
+            derive(true, Some(&done), 200, false, now, 0),
+            Status::Unseen
+        );
         // …but the viewed conversation counts as continuously viewed.
         assert_eq!(derive(true, Some(&done), 200, true, now, 0), Status::Idle);
         // Viewed since completion ⇒ Idle.
@@ -328,6 +354,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn active_question_is_always_blue_attention_state() {
+        let mut question = meta(TurnState::Mid, Some(100), None);
+        question.active_question = true;
+        question.question_asked_at = Some(700);
+
+        // The question wins over Claude's ordinary idle title, a stale
+        // working title, and continuous-view semantics.
+        for runtime in [Some(RuntimeHint::Idle), Some(RuntimeHint::Working), None] {
+            assert_eq!(
+                derive_with_runtime(true, runtime, Some(&question), 900, true, 1000, 0),
+                Status::Question
+            );
+        }
+        assert_eq!(
+            time_column(Status::Question, Some(&question), 0, 1000),
+            "5m"
+        );
+    }
+
     /// Time column per state; seconds never appear.
     #[test]
     fn time_columns() {
@@ -350,8 +396,14 @@ mod tests {
             mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime),
             ..Meta::default()
         };
-        assert_eq!(time_column(Status::Idle, Some(&idle(now - 30)), 0, now), "<1m");
-        assert_eq!(time_column(Status::Idle, Some(&idle(now - 300)), 0, now), "5m");
+        assert_eq!(
+            time_column(Status::Idle, Some(&idle(now - 30)), 0, now),
+            "<1m"
+        );
+        assert_eq!(
+            time_column(Status::Idle, Some(&idle(now - 300)), 0, now),
+            "5m"
+        );
         assert_eq!(
             time_column(Status::Idle, Some(&idle(now - 5 * 3600)), 0, now),
             "5h"

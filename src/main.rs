@@ -1,14 +1,19 @@
+mod base64;
+mod browser;
 mod discovery;
 mod doctor;
+mod kitty;
 mod picker;
 mod projects;
 mod provider;
+mod repo;
 mod state;
 mod status;
 mod tmux;
 mod ui;
 mod usage;
 mod widget;
+mod ws;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -38,6 +43,10 @@ fn main() -> Result<()> {
         Some("open") => open(),
         Some("list") => list(),
         Some("doctor") => doctor::run(),
+        // Reachable from inside an agent pane, which is the point: it toggles
+        // the browser view for the conversation you are talking to without a
+        // trip to the sidebar (D24).
+        Some("browser") => browser::command(args.get(1).map(String::as_str)),
         Some("-h" | "--help" | "help") => {
             print_help();
             Ok(())
@@ -46,6 +55,12 @@ fn main() -> Result<()> {
         // corc session. Keeping this explicit means public startup never
         // depends on guessing its role from the surrounding tmux session.
         Some("__tui") => ui::run(),
+        // Private entry point for the browser view pane (D24). Like `__tui`,
+        // explicit rather than inferred from its surroundings.
+        Some("__browser") => browser::run(),
+        // What `Ctrl+b` runs. Private because it differs from `corc browser`
+        // only in where it puts an error — see `browser::key_toggle`.
+        Some("__browser-toggle") => browser::key_toggle(),
         Some("projects") => projects::run(),
         Some("pick-dir") => pick_dir(&args),
         Some("jump") => jump(&args),
@@ -63,12 +78,16 @@ Usage:
   corc [COMMAND]
 
 Commands:
-  open    Open corc, or toggle back when already there
-  list    List every conversation corc owns
-  doctor  Check tmux, agents, PATH, and state access
-  help    Print this help
+  open     Open corc, or toggle back when already there
+  list     List every conversation corc owns
+  browser  Toggle this conversation's browser view [on|off]
+  doctor   Check tmux, agents, PATH, and state access
+  help     Print this help
 
-Running corc without a command is the same as `corc open`."
+Running corc without a command is the same as `corc open`.
+`corc browser` is the toggle Ctrl+b does inside corc; it can also be typed at
+an agent (in Claude Code, `!corc browser`) or run from any shell, where it
+applies to the conversation you are viewing."
     );
 }
 
@@ -129,7 +148,8 @@ fn jump(args: &[String]) -> Result<()> {
     let Some(conv) = viewed_conversation(&state) else {
         return Ok(()); // nothing spawned yet — nowhere to jump
     };
-    tmux::jump_to_window(&conv.cwd, n)
+    let label = repo::label_for(&conv.cwd.to_string_lossy(), &state.projects);
+    tmux::jump_to_window(&conv.cwd, n, &label)
 }
 
 /// The conversation whose agent pane is currently swapped into corc's content
@@ -139,7 +159,7 @@ fn jump(args: &[String]) -> Result<()> {
 /// this agent pane belongs to" — where a `last_viewed` guess could be stale
 /// and point at whichever project the user last switched to. Falls back to the
 /// most recently viewed when nothing is swapped in (placeholder showing).
-fn viewed_conversation(state: &state::State) -> Option<&state::Conversation> {
+pub fn viewed_conversation(state: &state::State) -> Option<&state::Conversation> {
     let corc_panes = tmux::session_pane_ids(tmux::TUI_SESSION);
     state
         .conversations
@@ -180,13 +200,19 @@ fn shortcuts() -> Result<()> {
     section("Conversations");
     row("Enter · click", "view (resumes it if dead)");
     row("n", "new conversation in the selected directory");
-    row("N", "new conversation via the directory picker (add or create one from there)");
+    row(
+        "N",
+        "new conversation via the directory picker (add or create one from there)",
+    );
+    row("p", "pin / unpin the selected conversation at the top");
     row("s", "switch which agent new conversations use");
     row("x", "kill a live conversation / remove a dead one");
 
     section("Layout & misc");
+    row("b", "browser view on/off for the selected conversation");
+    row("Ctrl+b", "the same toggle, from anywhere inside corc");
     row("V, then K/J", "move mode: reorder projects");
-    row("a", "cycle history: 3h / 1D / 3D / 1W / all time");
+    row("a", "cycle history: active / 3h / 1D / 3D / 1W / all time");
     row("r", "refresh now");
     row("?", "this help");
     row("Ctrl+C", "quit corc");
@@ -222,7 +248,10 @@ fn open() -> Result<()> {
     if in_tmux && tmux::current_session().ok().as_deref() == Some(tmux::TUI_SESSION) {
         let state = state::State::load()?;
         return match viewed_conversation(&state) {
-            Some(conv) => tmux::jump_to_session(&conv.cwd),
+            Some(conv) => {
+                let label = repo::label_for(&conv.cwd.to_string_lossy(), &state.projects);
+                tmux::jump_to_session(&conv.cwd, &label)
+            }
             None => tmux::switch_to_last(),
         };
     }
@@ -303,6 +332,7 @@ fn list() -> Result<()> {
 pub fn status_icon(status: status::Status) -> &'static str {
     match status {
         status::Status::Running => "\x1b[33m●\x1b[0m",
+        status::Status::Question => "\x1b[34m●\x1b[0m",
         status::Status::Unseen => "\x1b[34m●\x1b[0m",
         status::Status::Idle => "\x1b[90m●\x1b[0m",
         status::Status::Dead => "\x1b[90m○\x1b[0m",

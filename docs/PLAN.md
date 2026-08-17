@@ -82,6 +82,7 @@ or deleted**.
 | State | Condition | Look | Time column |
 |---|---|---|---|
 | **Running** | pane alive, runtime working hint or turn in flight | yellow ● | elapsed since turn start (`4m`, `1h12m`) |
+| **Question** | pane alive, unanswered provider question | blue ● | age of the active question |
 | **Unseen** | pane alive, turn completed after `last_viewed` | blue ● | duration the completed turn ran |
 | **Idle** | pane alive, turn complete, viewed since | gray ● | empty if < 1h old, else coarse age (`5h`) |
 | **Dead** | no pane | hollow ○ | coarse age (`5h`, `3d`), never finer than hours |
@@ -106,9 +107,22 @@ turn complete = the `end_turn`/`turn_duration` record. Running shows
 
 ### D8 — Project naming (features 1, 2)
 
-Group headers show the directory **basename only**. A git worktree (detected
-by `.git` being a *file* with a `gitdir:` pointer) shows as
-`{repo}/{worktree}`, e.g. `corc/fix-ui`. Branches are never shown.
+**The path is the identity; the name is only a label.** State groups
+conversations by exact cwd, and a tmux project session is found by its
+directory (`#{session_path}`), never by its name. Nothing downstream depends
+on what a project is called, which is what makes the label free to change.
+
+A label is the directory **basename, grown one directory to the left at a time
+until it is unique among the projects corc knows** (`repo::labels`).
+`~/projects/corc` stays `corc`; a lone `main` stays `main`; two repos' `main`
+worktrees become `gbandit/main` and `work/main`. Git worktrees and jj
+workspaces need no detection at all — what actually tells two checkouts with
+the same basename apart is where they are.
+
+Because a label depends on the whole set, adding a project can lengthen
+another's. `tmux::ensure_session` therefore **renames** a session whose label
+has moved rather than creating a second one in the same directory. Branches
+and jj workspace names are never shown.
 
 ### D9 — Fixed, user-managed project order (feature 4)
 
@@ -146,7 +160,8 @@ selection.
 - `x` on a live conversation kills its Claude and window (`y/n` confirm if
   Running); `x` on a Dead one removes it from the state file and the list.
 - Dead conversations outside the selected history window are hidden; `a`
-  cycles 3h / 1D / 3D / 1W / all time (default 1W).
+  cycles active / 3h / 1D / 3D / 1W / all time (default 1W). Active shows
+  every conversation backed by a live tmux pane and no dead conversations.
 
 ### D13 — Digit jump (feature 11)
 
@@ -203,7 +218,7 @@ into a uuid-named hidden window.
 | `x` | kill live / remove dead (confirm when Running) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `1`–`9` | digit jump to real session window N |
-| `a` | cycle visible history (3h / 1D / 3D / 1W / all time) |
+| `a` | cycle visible history (active / 3h / 1D / 3D / 1W / all time) |
 | `/` | filter |
 | `q` | quit (swap home, remove content pane) |
 
@@ -247,15 +262,15 @@ survives corc restart (reconciliation), and quitting restores everything.
 
 - `discovery.rs`: track `turn_started_at` / `turn_completed_at` per
   conversation (D7).
-- `status.rs` rewritten: derive Running/Unseen/Idle/Dead from window
+- `status.rs` rewritten: derive Running/Question/Unseen/Idle/Dead from window
   existence + turn state + `last_viewed` (D6).
 - Sidebar rows: the four looks (yellow/blue/gray/hollow) and the per-state
   time column; `last_viewed` maintained for the viewed conversation and
   persisted on swap/quit.
 - Fixed within-project ordering by creation time, newest first (D9).
 
-**Done when:** a finished run turns blue until swapped in, the viewed
-conversation never turns blue, and no seconds appear anywhere.
+**Done when:** a finished run turns blue until swapped in, only an active
+question remains blue while viewed, and no seconds appear anywhere.
 
 ### Step 3 — Lifecycle
 

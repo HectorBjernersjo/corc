@@ -25,8 +25,10 @@ they exit or you reboot.
     resumes with `opencode --session <id>`. OpenCode creates its session when
     the first prompt is sent, after which corc adopts its `ses_...` id.
   - Switch which one new conversations use with `s` (see below).
-- **git** (optional) — only used to detect git worktrees for the project
-  labels and the directory picker.
+- **git** / **jj** (both optional) — only used to expand a repo into its other
+  checkouts (git worktrees, jj workspaces) for the directory picker. Project
+  labels and session names detect a checkout straight from the filesystem, so
+  they work without either binary.
 
 ## Install
 
@@ -81,13 +83,29 @@ first use. Reload with `tmux source-file ~/.tmux.conf`.
 ### Optional: the directory picker
 
 The `N` key opens a picker to start a new conversation in a directory. It reads
-`~/.config/corc/directories.txt` (one directory path per line), merges it with
-machine-local directories stored in corc's state, and expands each git repo's
-worktrees. The `p` key adds a directory to the machine-local list in
-`~/.local/state/corc/state.json` (with `Tab` completion, prefilled from
-`$HOME`) and immediately starts a conversation there. Use `directories.txt`
-for a hand-curated list you want to sync between machines, and `p` for local
-additions.
+`~/.config/corc/directories.txt` (one directory path per line, `~` expanded,
+`#` comments ignored), merges it with machine-local directories stored in corc's
+state, and expands each repo into its other checkouts — git worktrees and jj
+workspaces alike. A secondary checkout is labelled `{repo}/{checkout}`, which is
+also the name of the tmux session it gets.
+
+A line ending in `/*` is a **scan root**: every checkout up to three levels
+below it is listed on its own, most recently modified first, without being
+named in the file. Containers are looked through, checkouts are never descended
+into, and dotted directories and symlinks are skipped:
+
+```
+~/projects/*
+~/work/*
+~/some/one-off-repo
+```
+
+That covers new worktrees and workspaces the moment they exist, and costs no
+`git`/`jj` process at all — a checkout is recognised straight from disk.
+
+The picker's “+ add directory…” row switches to path completion and can save
+a new machine-local directory in `~/.local/state/corc/state.json`. Use
+`directories.txt` for a hand-curated list you want to sync between machines.
 
 ## Usage
 
@@ -101,22 +119,26 @@ Launch with `corc` (or `Ctrl+q` if you bound it). Inside the TUI:
 | `Enter` / click | view the conversation (resumes it if dead) |
 | `n` | new conversation in the selected conversation's directory |
 | `N` | directory picker → new conversation in a listed directory |
-| `p` | add a machine-local directory (Tab-complete) → new conversation there |
+| `p` | pin / unpin the selected conversation at the top |
 | `s` | switch which agent new conversations use |
 | `x` | kill a live conversation / remove a dead one (confirms if running) |
+| `b` | browser view on/off for the selected conversation |
+| `Ctrl+b` | the same toggle, from anywhere inside corc (agent pane included) |
 | `V`, then `K`/`J` | move mode: reorder projects |
 | `Alt+1`–`Alt+9` | jump to window N of the project's normal tmux session |
-| `a` | cycle visible history: `3h` / `1D` / `3D` / `1W` / `all time` |
+| `a` | cycle visible history: `active` / `3h` / `1D` / `3D` / `1W` / `all time` |
 | `/` | filter the list |
 
-The history window applies to dead conversations; live conversations always
-remain visible. It starts at `1W` each time corc launches.
+The `active` history view shows every conversation with a live tmux pane and
+no dead conversations. The age windows add recent dead conversations; live
+ones always remain visible. History starts at `1W` each time corc launches.
 
-Running (yellow) and unseen (blue) conversations are also collected in an
-unlabelled status panel at the top. `j`/`k` cross into adjacent panels at their
-boundaries, while `Ctrl+j`/`Ctrl+k` jump directly between panels. Selecting an
-status row opens it and moves the selection to its normal project-grouped
-row in the sidebar.
+Pinned conversations (pink-purple while idle or dead), running conversations
+(yellow), active questions (blue), and unseen conversations (blue) are collected in an
+unlabelled panel at the top, with pinned rows first. Pins remain there across restarts and regardless of the
+history window. `j`/`k` cross into adjacent panels at their boundaries, while
+`Ctrl+j`/`Ctrl+k` jump directly between panels. Selecting a top-panel row opens
+it and moves the selection to its normal project-grouped row in the sidebar.
 
 On Linux this also works with stock `vim-tmux-navigator` configuration. corc
 identifies its sidebar process as `corc/view`, consumes `Ctrl+j`/`Ctrl+k` while
@@ -129,8 +151,70 @@ conversations you start afterwards; it's persisted, so the choice survives
 restarts. Provider metadata is read from each CLI's local, read-only history:
 Claude and Codex JSONL transcripts, Cursor's chat stores, and OpenCode's SQLite
 database. This drives titles and the same Running, Unseen, Idle, and Dead
-states across providers. An untouched Codex or OpenCode conversation stays
+states across providers, plus a blue Question state where the provider exposes
+structured interactive questions. An untouched Codex or OpenCode conversation stays
 `(untitled)` until the CLI creates its real session on the first prompt.
+
+### Browser view
+
+`b` opens a pane beside the agent showing, live, whatever page it is driving
+through Playwright. corc attaches to the browser Playwright already launched —
+it never starts one — so an agent that has not opened a browser simply says so.
+
+The view belongs to the conversation, not to the layout: `b` turns it on for
+the conversation under the cursor, the setting is remembered across restarts,
+and the pane appears whenever you view that conversation and disappears when
+you leave it. Closing the pane yourself turns the setting off.
+
+You do not have to go to the sidebar to toggle it: **`Ctrl+b` works anywhere
+inside corc**, the agent pane included. corc binds the key at runtime, scoped
+to its own session — in every other session the key passes straight through as
+before — and unbinds it again on exit, so your tmux config is never touched.
+tmux resolves the prefix before the root table, so if your prefix *is* `C-b`
+the key stays your prefix and the toggle is simply unavailable; `corc doctor`
+tells you.
+
+The same toggle is a command, which is what the key runs:
+
+```
+corc browser          # toggle; !corc browser types it at Claude Code
+corc browser on|off   # the explicit forms
+```
+
+Run inside an agent pane it applies to that conversation, anywhere else to the
+one you are viewing.
+
+It needs three things, all checked by `corc doctor`:
+
+1. A terminal that draws kitty graphics *with unicode placeholders*: ghostty,
+   kitty or rio. Not wezterm — it draws kitty images but ignores `U=1`, leaving
+   the placeholder cells on screen as literal glyphs.
+
+   On Windows, rio is the one that works, with one extra step: copy `conpty.dll`
+   and `OpenConsole.exe` next to `rio.exe`. Without them rio uses the system
+   ConPTY, which swallows the image escapes on the way out of WSL and leaves the
+   pane blank — verified on Windows 11 25H2 (26200), so being up to date is not
+   enough. Both files ship with Windows Terminal and with wezterm.
+2. `set -g allow-passthrough on` in your tmux config.
+3. Playwright launching Chromium with a debugging port. `corc doctor` writes
+   `~/.config/corc/playwright.json` for you; add it to the Playwright MCP
+   server's arguments and restart the agent:
+
+   ```
+   --config ~/.config/corc/playwright.json
+   ```
+
+   The file only adds `--remote-debugging-port=0`, letting the kernel pick a
+   free port that corc then finds on its own. Nothing else about your
+   Playwright setup changes.
+
+Note that Playwright refuses to open a second browser against a profile already
+in use, so only one conversation at a time can have one. The lock is held by
+whichever Chromium is still alive, so a browser left behind by a conversation
+you have moved on from will block the next one too — close it rather than
+starting over. To run two at once, pass `--isolated` as well, which keeps the
+profile in memory and so drops any logins you rely on persisting. That tradeoff
+is yours to make; corc does not make it for you.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`
@@ -141,8 +225,10 @@ still exits if you need a hard escape hatch.
 - `corc` — create or enter the corc session.
 - `corc open` — the explicit form of `corc` (bind this to a key).
 - `corc list` — print every conversation corc owns, grouped by project.
-- `corc doctor` — check tmux compatibility, agent binaries, `PATH`, and state
-  file permissions.
+- `corc browser [on|off]` — toggle the browser view for the conversation the
+  command runs in; meant for `!corc browser` from inside the agent.
+- `corc doctor` — check tmux compatibility, agent binaries, `PATH`, state file
+  permissions, and the browser view's prerequisites.
 - `corc --help` — show command-line help.
 
 ## How it works

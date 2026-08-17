@@ -40,15 +40,15 @@ pub struct Meta {
     pub title: Option<String>,
     /// First real user prompt, kept as a title stand-in until `title` exists.
     pub first_prompt: Option<String>,
-    /// First slash command that reached the model, as a last-resort title
-    /// stand-in: a conversation driven purely by commands (`/model`, then a
-    /// skill) contains no free-text prompt and often never gets a generated
-    /// title either.
+    /// The slash command a conversation was started with (`/impeccable teach`)
+    /// and that reached the model, for conversations that have no real prompt
+    /// at all. Ranked below `first_prompt` — the command is the weakest of the
+    /// stand-ins, but it beats `(untitled)`.
     pub first_command: Option<String>,
-    /// A just-seen command name, held until we know whether it ran locally
-    /// (a `<local-command-stdout>` record follows and withdraws it) or
-    /// reached the model (an assistant record follows and promotes it to
-    /// `first_command`). Only `display_title` should consume it.
+    /// A just-seen command, held until we know whether it ran locally (a
+    /// `<local-command-stdout>` record follows and withdraws it) or reached the
+    /// model (an assistant record follows and promotes it to `first_command`).
+    /// Only `display_title` should consume it.
     pub command_candidate: Option<String>,
     /// Whether the conversation contains a real user/assistant exchange.
     /// Deliberately independent of `title`, which providers may generate late
@@ -66,6 +66,16 @@ pub struct Meta {
     /// the jsonl mtime this ignores background title/checkpoint writes, so it
     /// can safely be used to detect an abandoned in-flight turn.
     pub turn_progress_at: Option<u64>,
+    /// Claude Code has emitted an `AskUserQuestion` tool call that has not
+    /// received its matching tool result yet. This is distinct from ordinary
+    /// Mid-turn work: the agent is blocked on the user, so the conversation
+    /// needs attention rather than a Running/Idle signal.
+    pub active_question: bool,
+    /// When the currently active question was asked, for its age column.
+    pub question_asked_at: Option<u64>,
+    /// Tool-use id used to distinguish the question's answer from unrelated
+    /// tool results in the same turn.
+    pub(crate) active_question_tool_id: Option<String>,
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
@@ -73,8 +83,8 @@ pub struct Meta {
 
 impl Meta {
     /// What the sidebar should show: an explicit rename, the generated title,
-    /// the first user prompt while no title has been generated yet, or — for
-    /// conversations driven purely by slash commands — the first command name.
+    /// the first user prompt while no title has been generated yet, or — for a
+    /// conversation opened with a slash command and nothing else — the command.
     pub fn display_title(&self) -> Option<&str> {
         self.custom_title
             .as_deref()
@@ -121,6 +131,9 @@ impl Default for Meta {
             turn_started_at: None,
             turn_completed_at: None,
             turn_progress_at: None,
+            active_question: false,
+            question_asked_at: None,
+            active_question_tool_id: None,
             mtime: SystemTime::UNIX_EPOCH,
         }
     }
@@ -219,7 +232,8 @@ impl Store {
                 }
             }
         }
-        self.files.retain(|id, _| known.iter().any(|(k, _)| k == id));
+        self.files
+            .retain(|id, _| known.iter().any(|(k, _)| k == id));
         Ok(())
     }
 
@@ -281,6 +295,19 @@ fn parse_from(
 
 fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
+
+    // AskUserQuestion stays open in Claude's transcript until its matching
+    // tool result is written. Track that structured lifecycle instead of
+    // scraping the terminal UI, whose pane title is identical to normal idle.
+    if !sidechain
+        && v["type"] == "user"
+        && question_was_answered(v, meta.active_question_tool_id.as_deref())
+    {
+        meta.active_question = false;
+        meta.question_asked_at = None;
+        meta.active_question_tool_id = None;
+    }
+
     match v["type"].as_str() {
         Some("user") if !sidechain && !is_meta_user(v) => {
             meta.has_content = true;
@@ -311,20 +338,18 @@ fn apply(meta: &mut Meta, v: &Value) {
                 }
             }
         }
-        // Slash-command transcripts (excluded from `first_prompt` above).
-        // Keep the command name as a title candidate so a conversation with
-        // no free-text prompt still shows something; a following
-        // `<local-command-stdout>` means the command ran locally and never
-        // reached the model, so it withdraws the candidate.
+        // Slash-command transcripts. They are meta — excluded from
+        // `first_prompt` by the arm above — but they are the only trace of what
+        // a conversation is about until a real prompt or a generated title
+        // shows up. Keep the command as a title candidate; a following
+        // `<local-command-stdout>` means it ran locally and never reached the
+        // model, so it withdraws the candidate.
         Some("user") if !sidechain && !v["isMeta"].as_bool().unwrap_or(false) => {
             if let Some(content) = v["message"]["content"].as_str() {
                 if content.starts_with("<local-command-stdout>") {
                     meta.command_candidate = None;
-                } else if meta.first_command.is_none()
-                    && meta.command_candidate.is_none()
-                    && let Some(name) = command_name(content)
-                {
-                    meta.command_candidate = Some(name);
+                } else if meta.first_command.is_none() && meta.command_candidate.is_none() {
+                    meta.command_candidate = slash_command(v);
                 }
             }
         }
@@ -338,6 +363,11 @@ fn apply(meta: &mut Meta, v: &Value) {
             }
             if let Some(ts) = record_timestamp(v) {
                 meta.turn_progress_at = Some(ts);
+            }
+            if let Some(id) = ask_user_question_id(v) {
+                meta.active_question = true;
+                meta.question_asked_at = record_timestamp(v);
+                meta.active_question_tool_id = Some(id.to_string());
             }
             match v["message"]["stop_reason"].as_str() {
                 Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
@@ -389,6 +419,25 @@ fn is_meta_user(v: &Value) -> bool {
     )
 }
 
+/// The invocation a `<command-…>` user record stands for, rendered the way it
+/// was typed: `/impeccable teach`. Only the name is required; a command with no
+/// arguments writes an empty (or missing) `<command-args>`.
+fn slash_command(v: &Value) -> Option<String> {
+    let content = v["message"]["content"].as_str()?;
+    let name = tagged(content, "command-name")?;
+    let line = match tagged(content, "command-args") {
+        Some(args) if !args.is_empty() => format!("{name} {args}"),
+        _ => name.to_string(),
+    };
+    title_line(&line)
+}
+
+/// The text between `<tag>` and `</tag>`, trimmed.
+fn tagged<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let rest = text.split_once(&format!("<{tag}>"))?.1;
+    Some(rest.split_once(&format!("</{tag}>"))?.0.trim())
+}
+
 /// Tool results come back as user records with a `toolUseResult` key (and
 /// `tool_result` content blocks).
 fn is_tool_result(v: &Value) -> bool {
@@ -400,13 +449,32 @@ fn is_tool_result(v: &Value) -> bool {
         .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
 }
 
-/// The command name of a slash-command transcript record: the text between
-/// `<command-name>` tags ("/user-story"), reduced to a title line. The tag is
-/// searched anywhere in the content — Claude Code varies the tag order.
-fn command_name(content: &str) -> Option<String> {
-    let start = content.find("<command-name>")? + "<command-name>".len();
-    let end = content[start..].find("</command-name>")? + start;
-    title_line(&content[start..end])
+/// The id of an AskUserQuestion tool call in an assistant record.
+fn ask_user_question_id(v: &Value) -> Option<&str> {
+    v["message"]["content"]
+        .as_array()?
+        .iter()
+        .find_map(|block| {
+            (block["type"] == "tool_use" && block["name"] == "AskUserQuestion")
+                .then(|| block["id"].as_str())?
+        })
+}
+
+/// Whether a user record answers the currently open AskUserQuestion. A real
+/// prompt also clears it as recovery for transcript versions that represent
+/// a cancelled question without a matching tool-result block.
+fn question_was_answered(v: &Value, question_id: Option<&str>) -> bool {
+    let Some(question_id) = question_id else {
+        return false;
+    };
+    if !is_tool_result(v) {
+        return !is_meta_user(v);
+    }
+    v["message"]["content"].as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block["type"] == "tool_result" && block["tool_use_id"].as_str() == Some(question_id)
+        })
+    })
 }
 
 /// The prompt text of a user record, reduced to a one-line title stand-in.
@@ -414,7 +482,9 @@ fn prompt_text(v: &Value) -> Option<String> {
     let content = &v["message"]["content"];
     let text = content.as_str().map(str::to_string).or_else(|| {
         content.as_array()?.iter().find_map(|b| {
-            (b["type"] == "text").then(|| b["text"].as_str())?.map(str::to_string)
+            (b["type"] == "text")
+                .then(|| b["text"].as_str())?
+                .map(str::to_string)
         })
     })?;
     title_line(&text)
@@ -443,9 +513,7 @@ pub(crate) fn parse_iso8601(s: &str) -> Option<u64> {
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;
     }
-    let num = |range: std::ops::Range<usize>| -> Option<i64> {
-        s.get(range)?.parse().ok()
-    };
+    let num = |range: std::ops::Range<usize>| -> Option<i64> { s.get(range)?.parse().ok() };
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
 
@@ -574,10 +642,7 @@ mod tests {
         );
         assert_eq!(meta.turn_state, TurnState::Mid);
         assert_eq!(meta.turn_started_at, start);
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:03:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:03:00Z"));
 
         // The turn_duration record completes the turn.
         apply(
@@ -600,10 +665,7 @@ mod tests {
                     "timestamp":"2026-07-08T10:06:00Z"}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:05:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
 
         // Claude's background records can touch the jsonl but are not turn
         // progress and must not extend the Running timeout.
@@ -612,10 +674,7 @@ mod tests {
             &json!({"type":"system","subtype":"away_summary",
                     "timestamp":"2026-07-08T10:07:00Z"}),
         );
-        assert_eq!(
-            meta.turn_progress_at,
-            parse_iso8601("2026-07-08T10:05:00Z")
-        );
+        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
 
         // The next prompt starts a fresh turn.
         apply(
@@ -629,21 +688,52 @@ mod tests {
         assert_eq!(meta.turn_progress_at, meta.turn_started_at);
     }
 
+    /// A conversation opened with a slash command has no prompt to fall back
+    /// on, so the command itself names it — but it is the weakest stand-in:
+    /// a real prompt, a generated title and a rename all outrank it.
     #[test]
-    fn custom_title_names_a_slash_command_conversation_and_wins_over_generated_titles() {
+    fn slash_command_names_a_conversation_until_something_better_arrives() {
         let mut meta = Meta::default();
 
         apply(
             &mut meta,
             &json!({"type":"user","message":{"content":
-                "<command-message>improve-codebase-architecture</command-message>\n\
-                 <command-name>/improve-codebase-architecture</command-name>"}}),
+                "<command-message>impeccable</command-message>\n\
+                 <command-name>/impeccable</command-name>\n\
+                 <command-args>teach</command-args>"}}),
         );
-        // Until anything better exists the command name itself stands in.
-        assert_eq!(
-            meta.display_title(),
-            Some("/improve-codebase-architecture")
+        assert_eq!(meta.display_title(), Some("/impeccable teach"));
+        // Still meta: the command neither counts as content nor starts a turn.
+        assert!(!meta.has_content);
+        assert_eq!(meta.turn_state, TurnState::Unknown);
+
+        // The skill's own injected text is meta too, and a later command does
+        // not rename the conversation.
+        apply(
+            &mut meta,
+            &json!({"type":"user","isMeta":true,"message":{"content":
+                [{"type":"text","text":"Base directory for this skill: …"}]}}),
         );
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":
+                "<command-name>/clear</command-name>"}}),
+        );
+        assert_eq!(meta.display_title(), Some("/impeccable teach"));
+
+        // A real prompt is more descriptive than the command that opened the
+        // conversation, so it takes over.
+        apply(
+            &mut meta,
+            &json!({"type":"user","message":{"content":"look for sloppy frontend bits"},
+                    "timestamp":"2026-08-16T17:40:00Z"}),
+        );
+        assert_eq!(meta.display_title(), Some("look for sloppy frontend bits"));
+    }
+
+    #[test]
+    fn custom_title_wins_over_generated_titles() {
+        let mut meta = Meta::default();
 
         apply(
             &mut meta,
@@ -664,7 +754,7 @@ mod tests {
     /// the model stands in. Local commands (their `<local-command-stdout>`
     /// follows immediately) never name the conversation.
     #[test]
-    fn command_only_conversation_falls_back_to_the_command_name() {
+    fn command_only_conversation_falls_back_to_the_command_that_reached_the_model() {
         let mut meta = Meta::default();
 
         // /model runs locally: caveat, command, stdout.
@@ -677,7 +767,7 @@ mod tests {
             &json!({"type":"user","message":{"content":
                 "<command-name>/model</command-name>\n<command-args>fable</command-args>"}}),
         );
-        assert_eq!(meta.display_title(), Some("/model"));
+        assert_eq!(meta.display_title(), Some("/model fable"));
         apply(
             &mut meta,
             &json!({"type":"user","message":{"content":"<local-command-stdout>Set model</local-command-stdout>"}}),
@@ -744,8 +834,67 @@ mod tests {
                     "timestamp":"2026-07-08T10:02:00Z"}),
         );
         assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(meta.turn_completed_at, parse_iso8601("2026-07-08T10:02:00Z"));
+        assert_eq!(
+            meta.turn_completed_at,
+            parse_iso8601("2026-07-08T10:02:00Z")
+        );
         // The interrupt is not a prompt: it never becomes the title stand-in.
         assert_eq!(meta.first_prompt.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn ask_user_question_stays_active_until_its_matching_answer() {
+        let mut meta = Meta::default();
+
+        apply(
+            &mut meta,
+            &json!({
+                "type":"assistant",
+                "message":{
+                    "stop_reason":"tool_use",
+                    "content":[{
+                        "type":"tool_use",
+                        "id":"question-1",
+                        "name":"AskUserQuestion",
+                        "input":{"questions":[]}
+                    }]
+                },
+                "timestamp":"2026-07-08T10:02:00Z"
+            }),
+        );
+        assert!(meta.active_question);
+        assert_eq!(
+            meta.question_asked_at,
+            parse_iso8601("2026-07-08T10:02:00Z")
+        );
+
+        // An unrelated tool result must not dismiss the question.
+        apply(
+            &mut meta,
+            &json!({
+                "type":"user",
+                "toolUseResult":{},
+                "message":{"content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"some-other-tool"
+                }]}
+            }),
+        );
+        assert!(meta.active_question);
+
+        apply(
+            &mut meta,
+            &json!({
+                "type":"user",
+                "toolUseResult":{},
+                "message":{"content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"question-1",
+                    "content":"selected option 1"
+                }]}
+            }),
+        );
+        assert!(!meta.active_question);
+        assert_eq!(meta.question_asked_at, None);
     }
 }

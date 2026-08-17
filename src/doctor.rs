@@ -2,7 +2,7 @@
 //! It checks tmux compatibility, agent binaries, PATH visibility and whether
 //! the persistent state can be read and written.
 
-use crate::{provider, state, tmux};
+use crate::{picker, provider, state, tmux};
 use anyhow::{Result, bail};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,8 @@ pub fn run() -> Result<()> {
     check_path(&mut errors, &mut warnings);
     check_providers(&mut errors, &mut warnings);
     check_state(&mut errors);
+    check_directories(&mut warnings);
+    check_browser_view(&mut warnings);
 
     println!();
     if errors > 0 {
@@ -36,6 +38,78 @@ pub fn run() -> Result<()> {
         println!("[ok] all checks passed");
     }
     Ok(())
+}
+
+/// The browser view (D24) has three external requirements, none of which corc
+/// can fix on the user's behalf: a terminal that draws images, tmux forwarding
+/// the escapes, and Playwright launching Chromium with a debugging port. All
+/// three are warnings — corc works fine without the view — and the config file
+/// is written here so the remedy is a single line to paste.
+fn check_browser_view(warnings: &mut usize) {
+    let terminal = tmux::client_terminal();
+    if terminal.is_unknown() {
+        warn(
+            "browser view",
+            "no attached tmux client to ask about graphics",
+        );
+        *warnings += 1;
+    } else if terminal.draws_graphics() {
+        ok("browser view", &format!("{terminal} draws kitty graphics"));
+    } else {
+        warn(
+            "browser view",
+            &format!("{terminal} has no image support; the view will stay blank"),
+        );
+        *warnings += 1;
+    }
+
+    if tmux::passthrough_enabled() {
+        ok("browser view", "tmux allow-passthrough is on");
+    } else {
+        warn(
+            "browser view",
+            "tmux allow-passthrough is off; add `set -g allow-passthrough on` to tmux.conf",
+        );
+        *warnings += 1;
+    }
+
+    // tmux resolves the prefix before the root table, so a C-b prefix quietly
+    // swallows the in-corc toggle. Nothing is broken by it — the sidebar's `b`
+    // and `corc browser` still work — so this only says what to expect.
+    if tmux::browser_key_is_reachable() {
+        ok("browser view", "Ctrl+b toggles the view inside corc");
+    } else {
+        warn(
+            "browser view",
+            "your tmux prefix is C-b, which shadows corc's Ctrl+b toggle; \
+             use `b` in the sidebar or `!corc browser` in the agent",
+        );
+        *warnings += 1;
+    }
+
+    match crate::browser::ensure_config() {
+        Ok(path) if crate::browser::config_is_wired() => {
+            ok(
+                "browser view",
+                &format!("playwright loads {}", path.display()),
+            );
+        }
+        Ok(path) => {
+            warn(
+                "browser view",
+                &format!(
+                    "playwright is not exposing a debugging port — add `--config {}` \
+                     to its MCP server args",
+                    path.display()
+                ),
+            );
+            *warnings += 1;
+        }
+        Err(e) => {
+            warn("browser view", &format!("could not write the config: {e}"));
+            *warnings += 1;
+        }
+    }
 }
 
 fn check_tmux(errors: &mut usize) {
@@ -196,6 +270,60 @@ fn check_state(errors: &mut usize) {
             error("state write", &format!("{}: {e}", path.display()));
             *errors += 1;
         }
+    }
+}
+
+/// What the `N` picker and `corc projects` would list, and which machine-local
+/// entries have gone stale — a moved or deleted directory is silently dropped
+/// from the list, so this is the only place it shows up. Purely informational:
+/// a stale entry costs nothing but noise in `state.json`.
+fn check_directories(warnings: &mut usize) {
+    let Ok(state) = state::State::load() else {
+        return; // check_state already reported it.
+    };
+    let Ok(dirs) = picker::list_directories(&state.directories) else {
+        return;
+    };
+    ok(
+        "directories",
+        &format!(
+            "{} directories from {} local entr{}",
+            dirs.len(),
+            state.directories.len(),
+            if state.directories.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ),
+    );
+
+    let stale: Vec<&String> = state
+        .directories
+        .iter()
+        .filter(|dir| {
+            let expanded = picker::expand_tilde(dir.trim());
+            let root = expanded.strip_suffix("/*").unwrap_or(&expanded);
+            !Path::new(root).is_dir()
+        })
+        .collect();
+    if !stale.is_empty() {
+        let sample: Vec<&str> = stale.iter().take(3).map(|d| d.as_str()).collect();
+        warn(
+            "directories",
+            &format!(
+                "{} local entr{} no longer exist and are skipped: {}{}",
+                stale.len(),
+                if stale.len() == 1 { "y" } else { "ies" },
+                sample.join(", "),
+                if stale.len() > sample.len() {
+                    ", …"
+                } else {
+                    ""
+                }
+            ),
+        );
+        *warnings += 1;
     }
 }
 

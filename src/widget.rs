@@ -101,7 +101,10 @@ fn highlight_row(row: &Row, width: usize) -> Line<'static> {
         buf.push(c);
     }
     if !buf.is_empty() {
-        spans.push(Span::styled(buf, if buf_hl { hl } else { Style::default() }));
+        spans.push(Span::styled(
+            buf,
+            if buf_hl { hl } else { Style::default() },
+        ));
     }
     if truncated {
         spans.push(Span::raw("…"));
@@ -181,7 +184,10 @@ fn create_target(input: &str) -> Option<PathBuf> {
     let expanded = expand_tilde(input.trim_end());
     // components() drops a trailing `/`, so the recorded path matches how the
     // directory lists spell it.
-    let path = PathBuf::from(&expanded).components().as_path().to_path_buf();
+    let path = PathBuf::from(&expanded)
+        .components()
+        .as_path()
+        .to_path_buf();
     (expanded.starts_with('/') && !path.exists()).then_some(path)
 }
 
