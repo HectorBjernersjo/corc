@@ -14,11 +14,19 @@ are deliberately decoupled:
   when the turn ends (documented Claude Code behavior), so delivery never
   waits for idle.
 - **Bookkeeping**: `Conversation.cwd` is never updated optimistically. Every
-  transcript record stamps the cwd it was written under; `discovery` folds it
-  into `Meta.cwd` (last record wins) and the refresh re-homes the row when it
-  differs. The transcript is the authority on where a conversation lives —
-  so a `/cd` the user typed by hand is followed too, and a `/cd` that never
-  ran (declined trust prompt, typo) changes nothing anywhere.
+  transcript record stamps the *shell* cwd it was written under — which
+  follows every Bash `cd` the agent makes into subdirectories, so a record
+  cwd on its own says where the shell stood, not where the session lives.
+  What `/cd` uniquely moves is the transcript file itself, so a record cwd
+  counts only when the file's location vouches for it: its mangled form must
+  name the directory the file sits in. `discovery` folds the latest
+  *confirmed* cwd into `Meta.cwd` and the refresh re-homes the row when it
+  differs. A `/cd` the user typed by hand is followed too; a `/cd` that
+  never ran (declined trust prompt, typo) changes nothing anywhere; and a
+  `Conversation.cwd` that somehow drifted wrong self-repairs, because the
+  confirmed cwd keeps naming the real home whatever state says.
+  (The first version trusted record cwds unconditionally and scattered
+  conversations into the subdirectories their agents had `cd`:d into.)
 
 Verified against Claude Code v2.1.235: `/cd` (v2.1.169+) relocates the
 session's transcript into the new directory's project storage and loads its

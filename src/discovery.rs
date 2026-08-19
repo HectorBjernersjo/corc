@@ -79,12 +79,19 @@ pub struct Meta {
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
-    /// Working directory of the latest transcript record. `/cd` relocates a
-    /// session mid-flight, and the transcript is the authority on where a
-    /// conversation lives now — `Conversation.cwd` follows this rather than
-    /// pinning the spawn directory (ADR-0003). None until a record carries a
-    /// cwd, or for providers that never report one.
+    /// Where the conversation lives now: the latest record cwd that is
+    /// *confirmed by the transcript file's own location* (ADR-0003). A
+    /// record's cwd follows every Bash `cd` the agent makes, so on its own it
+    /// says where the shell stood, not where the session lives — but `/cd` is
+    /// the only thing that moves the transcript file, so a record cwd counts
+    /// only when its mangled form names the directory the file sits in.
+    /// None until a matching record exists, or for providers that never
+    /// report one.
     pub cwd: Option<PathBuf>,
+    /// Name of the directory the transcript file sits in (the mangled
+    /// session cwd), set by `Store` before parsing — what record cwds are
+    /// confirmed against.
+    pub(crate) project_dir_name: Option<String>,
 }
 
 impl Meta {
@@ -142,6 +149,7 @@ impl Default for Meta {
             active_question_tool_id: None,
             mtime: SystemTime::UNIX_EPOCH,
             cwd: None,
+            project_dir_name: None,
         }
     }
 }
@@ -223,6 +231,13 @@ impl Store {
                     // New file, or it shrank (rewritten) — parse from scratch.
                     let mut meta = Meta {
                         mtime,
+                        // The directory the file sits in vouches for record
+                        // cwds (ADR-0003); a relocated file gets re-inserted
+                        // here, so this always names its current home.
+                        project_dir_name: path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned()),
                         ..Meta::default()
                     };
                     let offset = parse_from(&path, 0, &mut meta, apply)?;
@@ -254,12 +269,9 @@ impl Store {
 /// fall back to a one-level scan of the project directories (naming scheme
 /// insurance, not discovery — the uuid is already known).
 fn locate_jsonl(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
-    let escaped: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let candidate = root.join(escaped).join(format!("{id}.jsonl"));
+    let candidate = root
+        .join(mangled(&cwd.to_string_lossy()))
+        .join(format!("{id}.jsonl"));
     if candidate.is_file() {
         return Some(candidate);
     }
@@ -270,6 +282,16 @@ fn locate_jsonl(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A path the way Claude Code names its per-project transcript directories:
+/// every non-alphanumeric character replaced by '-'. Lossy one way, exact as
+/// a check: a record cwd is confirmed by the transcript's location when its
+/// mangled form equals the directory name the file sits in.
+fn mangled(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Parse complete lines starting at `offset`, folding each into `meta` with
@@ -303,9 +325,15 @@ fn parse_from(
 fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
 
-    // Every real record stamps the cwd it was written under; the latest one
-    // is where the conversation lives now (ADR-0003).
-    if let Some(cwd) = v["cwd"].as_str() {
+    // Every record stamps the shell cwd it was written under — which follows
+    // Bash `cd` into subdirectories, so it only counts as "the conversation
+    // lives here" when the transcript file's location vouches for it: `/cd`
+    // is the only thing that moves the file (ADR-0003). This also repairs a
+    // Conversation.cwd that drifted: the latest *confirmed* cwd is the real
+    // session directory, wherever the shell has wandered since.
+    if let Some(cwd) = v["cwd"].as_str()
+        && meta.project_dir_name.as_deref() == Some(mangled(cwd).as_str())
+    {
         meta.cwd = Some(PathBuf::from(cwd));
     }
 
@@ -818,35 +846,112 @@ mod tests {
         assert_eq!(meta.display_title(), Some("actually, do this"));
     }
 
-    /// ADR-0003: the transcript is the authority on where a conversation
-    /// lives. Every record's cwd is folded in, last one wins — so a `/cd`
-    /// mid-conversation moves the reported cwd, and records without one
-    /// (title, snapshot) never erase it.
+    /// ADR-0003: a record's cwd follows every Bash `cd` the agent makes, so
+    /// it only counts when the transcript file's location vouches for it —
+    /// the mangled cwd must name the directory the file sits in. Anything
+    /// else (a shell standing in a subdirectory) must not move the
+    /// conversation.
     #[test]
-    fn cwd_follows_the_latest_record() {
-        let mut meta = Meta::default();
-        assert_eq!(meta.cwd, None);
+    fn cwd_counts_only_when_the_files_location_vouches_for_it() {
+        let mut meta = Meta {
+            project_dir_name: Some(mangled("/work/HRM/benchmark")),
+            ..Meta::default()
+        };
 
         apply(
             &mut meta,
-            &json!({"type":"user","cwd":"/work/HRM/master",
+            &json!({"type":"user","cwd":"/work/HRM/benchmark",
                     "message":{"content":"start"},
                     "timestamp":"2026-07-08T10:00:00Z"}),
         );
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/master")));
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
 
-        // A record with no cwd (generated title) leaves it untouched.
-        apply(&mut meta, &json!({"type":"ai-title","aiTitle":"a title"}));
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/master")));
-
-        // After a /cd, subsequent records carry the new directory.
+        // The agent cd:s into a subdirectory to build — records now stamp
+        // the subdir, but the transcript file has not moved: not a
+        // relocation. This was the bug that scattered benchmark
+        // conversations across their .NET project folders.
         apply(
             &mut meta,
-            &json!({"type":"assistant","cwd":"/work/HRM/feature",
+            &json!({"type":"assistant","cwd":"/work/HRM/benchmark/Flex.Net",
                     "message":{"stop_reason":"end_turn"},
                     "timestamp":"2026-07-08T10:01:00Z"}),
         );
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/feature")));
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
+
+        // A record with no cwd (generated title) leaves it untouched.
+        apply(&mut meta, &json!({"type":"ai-title","aiTitle":"a title"}));
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
+    }
+
+    /// The whole relocation story against real files: a Bash `cd` into a
+    /// subdirectory never moves the conversation, a real `/cd` (the
+    /// transcript file moves and new records match its new home) does, and a
+    /// Conversation.cwd that drifted wrong self-repairs — the Store keeps
+    /// reporting the confirmed directory whatever cwd it is refreshed with.
+    #[test]
+    fn relocation_follows_the_file_and_repairs_drift() {
+        let root = std::env::temp_dir().join("corc-test-relocation-store");
+        let _ = std::fs::remove_dir_all(&root);
+        let record = |cwd: &str, ts: &str| {
+            json!({"type":"user","cwd":cwd,"message":{"content":"x"},
+                   "timestamp":ts})
+            .to_string()
+        };
+
+        let id = "conv-1";
+        let home = "/work/HRM/benchmark";
+        let sub = "/work/HRM/benchmark/Flex.Net";
+        let dir = root.join(mangled(home));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                record(home, "2026-07-08T10:00:00Z"),
+                record(sub, "2026-07-08T10:01:00Z"),
+            ),
+        )
+        .unwrap();
+
+        let mut store = Store::with(root.clone(), locate_jsonl, apply);
+        let known = vec![(id.to_string(), PathBuf::from(home))];
+        store.refresh(&known).unwrap();
+        // The shell stood in the subdir, but the conversation lives at home.
+        assert_eq!(store.meta(id).unwrap().cwd.as_deref(), Some(Path::new(home)));
+
+        // Even asked with a drifted cwd (state damaged by the old bug), the
+        // uuid fallback finds the file and the confirmed cwd repairs it.
+        let mut drifted = Store::with(root.clone(), locate_jsonl, apply);
+        drifted
+            .refresh(&[(id.to_string(), PathBuf::from(sub))])
+            .unwrap();
+        assert_eq!(
+            drifted.meta(id).unwrap().cwd.as_deref(),
+            Some(Path::new(home))
+        );
+
+        // A real /cd: the file moves and new records stamp the new home.
+        let new_home = "/work/HRM/feature-x";
+        let new_dir = root.join(mangled(new_home));
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let new_path = new_dir.join(format!("{id}.jsonl"));
+        std::fs::rename(dir.join(format!("{id}.jsonl")), &new_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&new_path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(file, "{}", record(new_home, "2026-07-08T10:02:00Z")).unwrap();
+
+        // First refresh notices the old path vanished, the next re-locates.
+        store.refresh(&known).unwrap();
+        store.refresh(&known).unwrap();
+        assert_eq!(
+            store.meta(id).unwrap().cwd.as_deref(),
+            Some(Path::new(new_home))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A Ctrl+C interrupt is written as a user record (with an

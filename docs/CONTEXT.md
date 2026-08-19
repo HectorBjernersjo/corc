@@ -15,9 +15,10 @@ _Avoid_: chat, task
 A conversation moving to another directory. The agent runs `corc cd <dir>`
 from its own pane; the TUI types the provider's relocation command (Claude
 Code's `/cd`) into that pane. `Conversation.cwd` is never updated
-optimistically — the transcript stamps each record's cwd, and the sidebar
-re-homes the row once the recorded cwd actually changes, which also follows
-a `/cd` the user typed by hand.
+optimistically — it follows the latest record cwd that the transcript
+file's own location vouches for (record cwds alone track Bash `cd` into
+subdirectories; only `/cd` moves the file). This also follows a `/cd` the
+user typed by hand, and self-repairs a drifted `Conversation.cwd`.
 _Avoid_: move (ambiguous with Move mode)
 
 **Hidden session** (`_corc-sessions`):
