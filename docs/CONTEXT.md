@@ -11,6 +11,15 @@ A provider-owned agent session — its persisted history plus, when live, its
 process and pane. Every conversation remembers which provider created it.
 _Avoid_: chat, task
 
+**Relocation** (`corc cd`, ADR-0003):
+A conversation moving to another directory. The agent runs `corc cd <dir>`
+from its own pane; the TUI types the provider's relocation command (Claude
+Code's `/cd`) into that pane. `Conversation.cwd` is never updated
+optimistically — the transcript stamps each record's cwd, and the sidebar
+re-homes the row once the recorded cwd actually changes, which also follows
+a `/cd` the user typed by hand.
+_Avoid_: move (ambiguous with Move mode)
+
 **Hidden session** (`_corc-sessions`):
 The single global tmux session where corc keeps every agent pane it owns;
 filtered out of the user's session picker (`new.sh`).

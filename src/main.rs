@@ -1,5 +1,6 @@
 mod base64;
 mod browser;
+mod cd;
 mod discovery;
 mod doctor;
 mod kitty;
@@ -47,6 +48,10 @@ fn main() -> Result<()> {
         // the browser view for the conversation you are talking to without a
         // trip to the sidebar (D24).
         Some("browser") => browser::command(args.get(1).map(String::as_str)),
+        // Also reachable from inside an agent pane: the agent prepares a new
+        // workspace and asks corc to move its own conversation there
+        // (ADR-0003) — corc's TUI types the provider's `/cd` into the pane.
+        Some("cd") => cd::command(args.get(1).map(String::as_str)),
         Some("-h" | "--help" | "help") => {
             print_help();
             Ok(())
@@ -81,6 +86,7 @@ Commands:
   open     Open corc, or toggle back when already there
   list     List every conversation corc owns
   browser  Toggle this conversation's browser view [on|off]
+  cd DIR   Move this conversation to DIR (corc types the agent's /cd for you)
   doctor   Check tmux, agents, PATH, and state access
   help     Print this help
 

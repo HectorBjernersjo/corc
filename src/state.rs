@@ -204,6 +204,27 @@ impl State {
         });
     }
 
+    /// Re-home a conversation whose transcript says it has moved — a `/cd`,
+    /// typed by the user or by corc for `corc cd` (ADR-0003): update its cwd,
+    /// append the new project to the display order if it is new, and drop the
+    /// old project if this was its last conversation. Returns whether
+    /// anything changed.
+    pub fn relocate(&mut self, id: &str, cwd: &Path) -> bool {
+        let Some(conv) = self.conversation_mut(id) else {
+            return false;
+        };
+        if conv.cwd == cwd {
+            return false;
+        }
+        conv.cwd = cwd.to_path_buf();
+        let project = cwd.display().to_string();
+        if !self.projects.contains(&project) {
+            self.projects.push(project);
+        }
+        self.prune_empty_projects();
+        true
+    }
+
     /// Toggle a conversation's persisted pin and return its new state.
     pub fn toggle_pin(&mut self, id: &str) -> Option<bool> {
         let conversation = self.conversation_mut(id)?;
@@ -272,6 +293,42 @@ mod tests {
         assert!(!conversation.content_seen);
         assert!(!conversation.pinned);
         assert!(!conversation.browser);
+    }
+
+    /// ADR-0003: relocation re-homes the row and keeps the project list in
+    /// step — the new project appears, the old one survives while a sibling
+    /// conversation still lives there and is pruned with the last one.
+    #[test]
+    fn relocation_rehomes_conversation_and_project_list() {
+        let mut state = State::default();
+        for id in ["a", "b"] {
+            state.conversations.push(Conversation {
+                id: id.into(),
+                cwd: "/work/old".into(),
+                pane_id: None,
+                last_viewed: 1,
+                created_at: 1,
+                provider: "claude".into(),
+                turn_started_at: None,
+                content_seen: true,
+                pinned: false,
+                browser: false,
+            });
+        }
+        state.projects.push("/work/old".into());
+
+        use std::path::Path;
+        assert!(state.relocate("a", Path::new("/work/new")));
+        assert_eq!(state.conversation("a").unwrap().cwd, Path::new("/work/new"));
+        assert_eq!(state.projects, vec!["/work/old", "/work/new"]);
+
+        // Same cwd again is a no-op; an unknown id changes nothing.
+        assert!(!state.relocate("a", Path::new("/work/new")));
+        assert!(!state.relocate("missing", Path::new("/anywhere")));
+
+        // The last conversation leaving prunes the old project.
+        assert!(state.relocate("b", Path::new("/work/new")));
+        assert_eq!(state.projects, vec!["/work/new"]);
     }
 
     #[test]

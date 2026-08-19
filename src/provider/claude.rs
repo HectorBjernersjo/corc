@@ -52,6 +52,13 @@ impl Provider for Claude {
         }
     }
 
+    /// `/cd` (v2.1.169+) relocates the session: transcript, `--resume` lookup
+    /// and CLAUDE.md all follow the new directory. It is user-only inside the
+    /// agent, which is exactly why corc types it (ADR-0003).
+    fn cd_command(&self, dir: &Path) -> Option<String> {
+        Some(format!("/cd {}", dir.display()))
+    }
+
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
         Ok(Box::new(Store::new()?))
     }
@@ -158,6 +165,14 @@ mod tests {
         assert_eq!(Claude.runtime_hint("Claude Code"), None);
         assert_eq!(Claude.runtime_hint("custom terminal title"), None);
         assert_eq!(Claude.runtime_hint(""), None);
+    }
+
+    #[test]
+    fn cd_command_types_the_slash_command() {
+        assert_eq!(
+            Claude.cd_command(std::path::Path::new("/work/HRM/feature x")),
+            Some("/cd /work/HRM/feature x".to_string())
+        );
     }
 
     #[test]

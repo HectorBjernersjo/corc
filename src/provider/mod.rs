@@ -72,6 +72,13 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// The line to type into a live pane to relocate the conversation's
+    /// primary working directory (ADR-0003), for agent CLIs that support it
+    /// (Claude Code's `/cd`). None makes `corc cd` refuse for this provider.
+    fn cd_command(&self, _dir: &Path) -> Option<String> {
+        None
+    }
+
     /// This provider's metadata reader for the sidebar.
     fn meta_source(&self) -> Result<Box<dyn MetaSource>>;
 

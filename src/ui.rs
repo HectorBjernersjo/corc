@@ -7,7 +7,7 @@ use crate::provider::{self, MetaStore};
 use crate::repo;
 use crate::state::{self, State};
 use crate::status::{self, Status};
-use crate::{browser, picker, tmux, truncate, usage};
+use crate::{browser, cd, picker, tmux, truncate, usage};
 use anyhow::{Context, Result};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
@@ -937,6 +937,14 @@ impl App {
             dirty = true;
         }
 
+        // Relocation requests from `corc cd`, run from inside an agent pane:
+        // type the provider's `/cd` into that pane (ADR-0003). State is not
+        // touched here — the cwd follows the transcript below, once the move
+        // has actually happened.
+        if let Some(msg) = cd::apply_requests(&self.state) {
+            self.status_msg = Some(msg);
+        }
+
         // Take one tmux snapshot for every liveness check in this refresh.
         // Spawning `tmux list-panes` once per live conversation blocked input
         // for a noticeable fraction of a second on larger lists.
@@ -1018,6 +1026,26 @@ impl App {
                 .flatten();
             if conv.turn_started_at != started {
                 conv.turn_started_at = started;
+                dirty = true;
+            }
+        }
+
+        // A conversation whose transcript says it has moved — a `/cd`, typed
+        // by the user or by corc for `corc cd` — is re-homed to its new
+        // project (ADR-0003). The transcript is the authority on where a
+        // conversation lives; the sidebar, digit jump and real session all
+        // follow the recorded cwd.
+        let moves: Vec<(String, PathBuf)> = self
+            .state
+            .conversations
+            .iter()
+            .filter_map(|c| {
+                let cwd = self.metas.meta(&c.id)?.cwd.clone()?;
+                (cwd != c.cwd).then(|| (c.id.clone(), cwd))
+            })
+            .collect();
+        for (id, cwd) in moves {
+            if self.state.relocate(&id, &cwd) {
                 dirty = true;
             }
         }

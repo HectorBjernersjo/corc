@@ -636,6 +636,16 @@ fn parse_panes(output: &str) -> HashMap<String, Pane> {
         .collect()
 }
 
+/// Type a line + Enter into a specific pane, literally (`-l`) so the text is
+/// never interpreted as tmux key names. Used to hand a provider's relocation
+/// command (`/cd …`, ADR-0003) to the agent in that pane; agents queue input
+/// typed mid-turn, so this is safe whether the conversation is idle or busy.
+pub fn type_into_pane(pane_id: &str, line: &str) -> Result<()> {
+    tmux(&["send-keys", "-t", pane_id, "-l", line])?;
+    tmux(&["send-keys", "-t", pane_id, "Enter"])?;
+    Ok(())
+}
+
 /// Which session a pane currently lives in.
 pub fn pane_session(pane_id: &str) -> Result<String> {
     let out = tmux(&["display-message", "-p", "-t", pane_id, "#{session_name}"])?;

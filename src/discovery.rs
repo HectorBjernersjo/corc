@@ -79,6 +79,12 @@ pub struct Meta {
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
+    /// Working directory of the latest transcript record. `/cd` relocates a
+    /// session mid-flight, and the transcript is the authority on where a
+    /// conversation lives now — `Conversation.cwd` follows this rather than
+    /// pinning the spawn directory (ADR-0003). None until a record carries a
+    /// cwd, or for providers that never report one.
+    pub cwd: Option<PathBuf>,
 }
 
 impl Meta {
@@ -135,6 +141,7 @@ impl Default for Meta {
             question_asked_at: None,
             active_question_tool_id: None,
             mtime: SystemTime::UNIX_EPOCH,
+            cwd: None,
         }
     }
 }
@@ -295,6 +302,12 @@ fn parse_from(
 
 fn apply(meta: &mut Meta, v: &Value) {
     let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
+
+    // Every real record stamps the cwd it was written under; the latest one
+    // is where the conversation lives now (ADR-0003).
+    if let Some(cwd) = v["cwd"].as_str() {
+        meta.cwd = Some(PathBuf::from(cwd));
+    }
 
     // AskUserQuestion stays open in Claude's transcript until its matching
     // tool result is written. Track that structured lifecycle instead of
@@ -803,6 +816,37 @@ mod tests {
                     "timestamp":"2026-07-08T10:01:00Z"}),
         );
         assert_eq!(meta.display_title(), Some("actually, do this"));
+    }
+
+    /// ADR-0003: the transcript is the authority on where a conversation
+    /// lives. Every record's cwd is folded in, last one wins — so a `/cd`
+    /// mid-conversation moves the reported cwd, and records without one
+    /// (title, snapshot) never erase it.
+    #[test]
+    fn cwd_follows_the_latest_record() {
+        let mut meta = Meta::default();
+        assert_eq!(meta.cwd, None);
+
+        apply(
+            &mut meta,
+            &json!({"type":"user","cwd":"/work/HRM/master",
+                    "message":{"content":"start"},
+                    "timestamp":"2026-07-08T10:00:00Z"}),
+        );
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/master")));
+
+        // A record with no cwd (generated title) leaves it untouched.
+        apply(&mut meta, &json!({"type":"ai-title","aiTitle":"a title"}));
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/master")));
+
+        // After a /cd, subsequent records carry the new directory.
+        apply(
+            &mut meta,
+            &json!({"type":"assistant","cwd":"/work/HRM/feature",
+                    "message":{"stop_reason":"end_turn"},
+                    "timestamp":"2026-07-08T10:01:00Z"}),
+        );
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/feature")));
     }
 
     /// A Ctrl+C interrupt is written as a user record (with an
