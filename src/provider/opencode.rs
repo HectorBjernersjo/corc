@@ -12,7 +12,7 @@
 //! simply leaves the last good sidebar snapshot in place.
 
 use super::Provider;
-use crate::discovery::{self, Meta, MetaSource, TurnState};
+use crate::discovery::{self, Known, Meta, MetaSource, TurnState};
 use crate::state;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -137,13 +137,24 @@ pub struct OpenCodeStore {
 }
 
 impl MetaSource for OpenCodeStore {
-    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()> {
+    fn refresh(&mut self, known: &[Known]) -> Result<()> {
         let Some(conn) = open_read_only(&self.database) else {
             return Ok(());
         };
 
-        for (id, _, persisted_start) in known {
+        for Known {
+            id,
+            turn_started_at: persisted_start,
+            visible,
+            ..
+        } in known
+        {
             if id.starts_with(PENDING_PREFIX) {
+                continue;
+            }
+            // A session nothing is known about yet and that the sidebar is
+            // hiding is left unread until the history window reaches it.
+            if !visible && !self.cache.contains_key(id) {
                 continue;
             }
             match read_meta(&conn, id, *persisted_start) {
@@ -158,8 +169,7 @@ impl MetaSource for OpenCodeStore {
                 Err(_) => {}
             }
         }
-        self.cache
-            .retain(|id, _| known.iter().any(|(known_id, _, _)| known_id == id));
+        self.cache.retain(|id, _| known.iter().any(|k| k.id == *id));
         Ok(())
     }
 
@@ -356,7 +366,7 @@ fn millis_to_system_time(value: i64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::MetaSource;
+    use crate::discovery::{Known, MetaSource};
     use rusqlite::{Connection, params};
     use serde_json::json;
 
@@ -532,7 +542,7 @@ mod tests {
             database: path,
             cache: HashMap::new(),
         };
-        let known = [(session.to_string(), PathBuf::from("/work/app"), None)];
+        let known = [Known::shown(session, "/work/app")];
         store.refresh(&known).unwrap();
         let meta = store.meta(session).unwrap();
         assert!(meta.has_content);
@@ -604,7 +614,7 @@ mod tests {
             cache: HashMap::new(),
         };
         store
-            .refresh(&[("ses_empty".to_string(), PathBuf::from("/work/app"), None)])
+            .refresh(&[Known::shown("ses_empty", "/work/app")])
             .unwrap();
         let meta = store.meta("ses_empty").unwrap();
         assert!(!meta.has_content);
@@ -623,7 +633,7 @@ mod tests {
             cache: HashMap::new(),
         };
         absent
-            .refresh(&[("ses_missing".to_string(), PathBuf::from("/work/app"), None)])
+            .refresh(&[Known::shown("ses_missing", "/work/app")])
             .unwrap();
         assert!(absent.meta("ses_missing").is_none());
 
@@ -651,7 +661,7 @@ mod tests {
             "ses_cached",
             json!({"type":"text","text":"hello"}),
         );
-        let known = [("ses_cached".to_string(), PathBuf::from("/work/app"), None)];
+        let known = [Known::shown("ses_cached", "/work/app")];
         let mut store = OpenCodeStore {
             database: path,
             cache: HashMap::new(),

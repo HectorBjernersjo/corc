@@ -83,7 +83,7 @@ impl Provider for Claude {
     }
 
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
-        Ok(Box::new(Store::new()?))
+        Ok(Box::new(Store::new()?.cached_as("claude")))
     }
 
     /// Plan usage from the OAuth usage endpoint, with the token Claude Code
@@ -242,7 +242,10 @@ mod tests {
         // No prompt on screen (dialogs, partial redraws): unknown, so status
         // falls back to the transcript instead of guessing.
         assert_eq!(Claude.content_hint(""), None);
-        assert_eq!(Claude.content_hint("Do you want to proceed?\n  1. Yes\n"), None);
+        assert_eq!(
+            Claude.content_hint("Do you want to proceed?\n  1. Yes\n"),
+            None
+        );
     }
 
     #[test]

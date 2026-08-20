@@ -81,11 +81,9 @@ impl Provider for Codex {
     }
 
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
-        Ok(Box::new(Store::with(
-            sessions_root()?,
-            locate_rollout,
-            apply,
-        )))
+        Ok(Box::new(
+            Store::with(sessions_root()?, locate_rollout, apply).cached_as("codex"),
+        ))
     }
 
     /// Plan usage from the ChatGPT backend's usage endpoint, with the OAuth

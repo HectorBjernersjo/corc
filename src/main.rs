@@ -274,19 +274,23 @@ fn open() -> Result<()> {
 fn list() -> Result<()> {
     let state = state::State::load()?;
     let mut store = provider::MetaStore::new()?;
-    let known: Vec<(String, PathBuf, &'static str, Option<u64>)> = state
+    // `list` prints every conversation, so every one of them is worth reading.
+    let known: Vec<(discovery::Known, &'static str)> = state
         .conversations
         .iter()
         .map(|c| {
             (
-                c.id.clone(),
-                c.cwd.clone(),
+                discovery::Known {
+                    turn_started_at: c.turn_started_at,
+                    ..discovery::Known::shown(&c.id, c.cwd.clone())
+                },
                 provider::by_id(&c.provider).id(),
-                c.turn_started_at,
             )
         })
         .collect();
     store.refresh(&known)?;
+    // Leave the parse behind for the TUI (and the next `list`) to reuse.
+    store.save_cache();
 
     if state.conversations.is_empty() {
         println!("no conversations");

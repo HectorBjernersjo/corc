@@ -13,7 +13,7 @@
 //! corc persists it while running and falls back to the store's activity time.
 
 use super::Provider;
-use crate::discovery::{Meta, MetaSource, TurnState};
+use crate::discovery::{Known, Meta, MetaSource, TurnState};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
@@ -166,10 +166,19 @@ impl CursorStore {
 }
 
 impl MetaSource for CursorStore {
-    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()> {
-        for (id, cwd, persisted_start) in known {
+    fn refresh(&mut self, known: &[Known]) -> Result<()> {
+        for Known {
+            id,
+            cwd,
+            turn_started_at: persisted_start,
+            visible,
+        } in known
+        {
             let dir = match self.dirs.get(id) {
                 Some(d) if d.is_dir() => d.clone(),
+                // A chat nothing is known about yet and that the sidebar is
+                // hiding is not worth opening its store for.
+                _ if !visible => continue,
                 _ => match locate(&self.chats_root, id) {
                     Some(d) => {
                         self.dirs.insert(id.clone(), d.clone());
@@ -249,14 +258,12 @@ impl MetaSource for CursorStore {
                 },
             );
         }
-        self.cache
-            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
-        self.dirs
-            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+        self.cache.retain(|id, _| known.iter().any(|k| k.id == *id));
+        self.dirs.retain(|id, _| known.iter().any(|k| k.id == *id));
         self.transcript_paths
-            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+            .retain(|id, _| known.iter().any(|k| k.id == *id));
         self.transcripts
-            .retain(|id, _| known.iter().any(|(k, _, _)| k == id));
+            .retain(|id, _| known.iter().any(|k| k.id == *id));
         Ok(())
     }
 
@@ -693,7 +700,7 @@ mod tests {
         hex_decode, last_root_message_id, message_has_content, parse_cursor_timestamp,
         read_meta_json, user_prompt_timestamp,
     };
-    use crate::discovery::MetaSource;
+    use crate::discovery::{Known, MetaSource};
     use rusqlite::{Connection, params};
     use serde_json::json;
     use std::path::PathBuf;
@@ -959,9 +966,7 @@ mod tests {
             transcripts: Default::default(),
             cache: Default::default(),
         };
-        store
-            .refresh(&[(id.to_string(), PathBuf::from("/tmp"), None)])
-            .unwrap();
+        store.refresh(&[Known::shown(id, "/tmp")]).unwrap();
         let meta = store.meta(id).unwrap();
         assert!(meta.has_content);
         assert_eq!(meta.display_title(), None);

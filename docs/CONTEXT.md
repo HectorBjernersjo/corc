@@ -107,6 +107,17 @@ _Avoid_: user data dir (Chromium's word for it), session
 **State file**:
 corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
 
+**Metadata cache**:
+What a provider's metadata reader parsed, kept beside the **State file** as
+`~/.local/state/corc/meta-<provider>.json` so a corc start reuses it instead of
+re-reading every transcript. An entry counts only while its file still has the
+size and mtime it had when parsed, and a file that has grown since is picked up
+from the recorded offset, so a cache left by a crash or written by a second
+corc is never wrong, only incomplete. Derived data: deleting it costs one slow
+start. Conversations the history window hides are not parsed at all until the
+window reaches them.
+_Avoid_: index, database
+
 ### Conversation states
 
 **Running** (yellow ●):

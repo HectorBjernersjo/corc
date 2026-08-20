@@ -8,13 +8,13 @@ mod codex;
 mod cursor;
 mod opencode;
 
-use crate::discovery::{Meta, MetaSource, TurnState};
+use crate::discovery::{Known, Meta, MetaSource, TurnState};
 use crate::status::RuntimeHint;
 use crate::tmux;
 use anyhow::Result;
 use ratatui::style::Color;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 /// Everything corc needs to know about one agent CLI.
@@ -178,21 +178,25 @@ impl MetaStore {
         Ok(Self { sources })
     }
 
-    /// Refresh every source with its subset of known conversations. The final
-    /// field carries a persisted in-flight turn start across corc restarts.
-    pub fn refresh(
-        &mut self,
-        known: &[(String, PathBuf, &'static str, Option<u64>)],
-    ) -> Result<()> {
+    /// Refresh every source with its subset of known conversations, paired
+    /// with the provider that owns each.
+    pub fn refresh(&mut self, known: &[(Known, &'static str)]) -> Result<()> {
         for (pid, source) in self.sources.iter_mut() {
-            let subset: Vec<(String, PathBuf, Option<u64>)> = known
+            let subset: Vec<Known> = known
                 .iter()
-                .filter(|(_, _, p, _)| p == pid)
-                .map(|(id, cwd, _, started)| (id.clone(), cwd.clone(), *started))
+                .filter(|(_, p)| p == pid)
+                .map(|(conv, _)| conv.clone())
                 .collect();
             source.refresh(&subset)?;
         }
         Ok(())
+    }
+
+    /// Let every source persist what it parsed, for the next corc start.
+    pub fn save_cache(&mut self) {
+        for source in self.sources.values_mut() {
+            source.save_cache();
+        }
     }
 
     pub fn meta(&self, id: &str) -> Option<&Meta> {

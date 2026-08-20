@@ -261,7 +261,9 @@ pub fn new_uuid() -> Result<String> {
     ))
 }
 
-pub fn state_file() -> Result<PathBuf> {
+/// Where corc keeps everything machine-local: `state.json` and the provider
+/// metadata caches beside it.
+pub fn state_dir() -> Result<PathBuf> {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
@@ -269,7 +271,11 @@ pub fn state_file() -> Result<PathBuf> {
             Path::new(&home).join(".local/state")
         }
     };
-    Ok(base.join("corc/state.json"))
+    Ok(base.join("corc"))
+}
+
+pub fn state_file() -> Result<PathBuf> {
+    Ok(state_dir()?.join("state.json"))
 }
 
 #[cfg(test)]

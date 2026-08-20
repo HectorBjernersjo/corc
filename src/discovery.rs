@@ -9,8 +9,14 @@
 //! line-reader function so jsonl-based providers share it: `Store::new()`
 //! reads Claude Code's transcripts under ~/.claude/projects, Codex plugs in
 //! its own pair over ~/.codex/sessions (`Store::with`).
+//!
+//! The same incrementality carries across restarts (`cached_as`), and a
+//! conversation the sidebar is currently hiding is not read at all
+//! (`Known::visible`). Without those two, every corc start parsed every
+//! transcript of every conversation it had ever spawned.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Where the last non-sidechain message left the conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnState {
     /// A user prompt or tool call is in flight — Claude has work to do.
     Mid,
@@ -29,7 +35,11 @@ pub enum TurnState {
 }
 
 /// What the jsonl tells us about a conversation.
-#[derive(Debug, Clone)]
+///
+/// Serializable because a `Store` persists what it parsed (see `cached_as`):
+/// change a field's shape and last run's cache stops deserializing, which is
+/// the point — it is thrown away and re-parsed rather than believed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     /// User-assigned Claude Code title (`custom-title` records). This stays
     /// separate so a later generated title can never overwrite an explicit
@@ -108,26 +118,61 @@ impl Meta {
     }
 }
 
+/// One conversation handed to a `MetaSource` on refresh.
+#[derive(Debug, Clone)]
+pub struct Known {
+    pub id: String,
+    pub cwd: PathBuf,
+    /// Start of an in-flight turn as recorded in state.json, which carries an
+    /// elapsed clock across a corc restart for providers that cannot recover
+    /// it from their own store.
+    pub turn_started_at: Option<u64>,
+    /// Whether the sidebar could put this conversation on screen right now.
+    /// A row the history window hides is not worth reading a transcript for,
+    /// and reading them all is what made startup slow: parsing every
+    /// conversation corc has ever spawned means hundreds of megabytes of jsonl
+    /// on a list where a week's worth is a fraction of that. Metadata already
+    /// held (this run or from the on-disk cache) keeps being updated whatever
+    /// this says, since that only costs a `stat`.
+    pub visible: bool,
+}
+
+impl Known {
+    /// A conversation whose metadata is wanted whatever it costs, for callers
+    /// that show everything (`corc list`) and for tests.
+    pub fn shown(id: &str, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            id: id.to_string(),
+            cwd: cwd.into(),
+            turn_started_at: None,
+            visible: true,
+        }
+    }
+}
+
 /// A per-provider source of conversation metadata (title, turn state, activity
 /// time). Each provider ships its own implementation — Claude parses jsonl
 /// transcripts (`Store`), Cursor reads its SQLite chat stores — so adding a
-/// provider never touches the sidebar. `refresh` is handed only the (id, cwd)
-/// pairs belonging to that provider.
+/// provider never touches the sidebar. `refresh` is handed only the
+/// conversations belonging to that provider.
 pub trait MetaSource: Send {
-    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()>;
+    fn refresh(&mut self, known: &[Known]) -> Result<()>;
     fn meta(&self, id: &str) -> Option<&Meta>;
+    /// Persist what has been parsed so the next corc start reuses it instead
+    /// of reading every transcript again. No-op for sources whose reads are
+    /// cheap enough not to need one.
+    fn save_cache(&mut self) {}
 }
 
 impl MetaSource for Store {
-    fn refresh(&mut self, known: &[(String, PathBuf, Option<u64>)]) -> Result<()> {
-        let conversations: Vec<(String, PathBuf)> = known
-            .iter()
-            .map(|(id, cwd, _)| (id.clone(), cwd.clone()))
-            .collect();
-        Store::refresh(self, &conversations)
+    fn refresh(&mut self, known: &[Known]) -> Result<()> {
+        Store::refresh(self, known)
     }
     fn meta(&self, id: &str) -> Option<&Meta> {
         Store::meta(self, id)
+    }
+    fn save_cache(&mut self) {
+        Store::save_cache(self);
     }
 }
 
@@ -154,6 +199,7 @@ impl Default for Meta {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileState {
     path: PathBuf,
     offset: u64,
@@ -161,6 +207,19 @@ struct FileState {
     mtime: SystemTime,
     meta: Meta,
 }
+
+/// The on-disk form of a `Store`, written to `meta-<name>.json` beside
+/// state.json. `version` guards against a stale cache being read back into a
+/// `Meta` whose fields still deserialize but no longer mean the same thing;
+/// bump it when that happens. A shape change needs no bump, since serde
+/// rejects the old file on its own.
+#[derive(Serialize, Deserialize)]
+struct Cache {
+    version: u32,
+    files: HashMap<String, FileState>,
+}
+
+const CACHE_VERSION: u32 = 1;
 
 /// Incrementally parsed metadata for the conversations corc owns.
 pub struct Store {
@@ -170,6 +229,11 @@ pub struct Store {
     locate: fn(&Path, &Path, &str) -> Option<PathBuf>,
     /// Fold one parsed jsonl line into the metadata.
     apply: fn(&mut Meta, &Value),
+    /// Name of the on-disk cache, when this store keeps one. None for a store
+    /// that touches no user files, which is what tests want.
+    cache_name: Option<&'static str>,
+    /// Whether anything has been parsed since the cache was last written.
+    dirty: bool,
 }
 
 impl Store {
@@ -195,15 +259,51 @@ impl Store {
             files: HashMap::new(),
             locate,
             apply,
+            cache_name: None,
+            dirty: false,
         }
     }
 
-    /// Refresh metadata for the given (uuid, cwd) pairs, parsing only new
-    /// bytes of files that grew since the last call.
-    pub fn refresh(&mut self, known: &[(String, PathBuf)]) -> Result<()> {
-        for (id, cwd) in known {
+    /// Back this store with the on-disk cache called `name`, loading whatever
+    /// the last run left there.
+    ///
+    /// Parsing a transcript from scratch is the one expensive thing a store
+    /// does, and it used to happen on every corc start for every conversation.
+    /// A cached entry is trusted only while the file it describes still has
+    /// the size and mtime it had when parsed; a transcript that has grown
+    /// since is picked up from its recorded offset, exactly as it is while
+    /// corc runs. So the cache can be stale, or written by a second corc, or
+    /// left behind by a crash, without ever being wrong.
+    pub fn cached_as(mut self, name: &'static str) -> Self {
+        self.cache_name = Some(name);
+        self.files = load_cache(name);
+        self
+    }
+
+    /// Write the cache, if this store keeps one and has parsed anything since
+    /// the last write. Best-effort: a cache that cannot be written just costs
+    /// the next start its parse.
+    pub fn save_cache(&mut self) {
+        let Some(name) = self.cache_name.filter(|_| self.dirty) else {
+            return;
+        };
+        if write_cache(name, &self.files).is_ok() {
+            self.dirty = false;
+        }
+    }
+
+    /// Refresh metadata for the given conversations, parsing only new bytes of
+    /// files that grew since the last call. A conversation nothing is known
+    /// about yet and that the sidebar is hiding anyway is skipped entirely:
+    /// its transcript is neither located nor read.
+    pub fn refresh(&mut self, known: &[Known]) -> Result<()> {
+        for Known {
+            id, cwd, visible, ..
+        } in known
+        {
             let path = match self.files.get(id) {
                 Some(state) => state.path.clone(),
+                None if !visible => continue,
                 None => match (self.locate)(&self.root, cwd, id) {
                     Some(p) => p,
                     // Freshly spawned conversations have no transcript yet.
@@ -226,6 +326,7 @@ impl Store {
                     state.size = size;
                     state.mtime = mtime;
                     state.meta.mtime = mtime;
+                    self.dirty = true;
                 }
                 _ => {
                     // New file, or it shrank (rewritten) — parse from scratch.
@@ -251,17 +352,56 @@ impl Store {
                             meta,
                         },
                     );
+                    self.dirty = true;
                 }
             }
         }
-        self.files
-            .retain(|id, _| known.iter().any(|(k, _)| k == id));
+        // Keyed on every conversation corc still owns, not on the visible
+        // ones: a row that scrolls out of the history window keeps the
+        // metadata it already has, in memory and in the cache.
+        self.files.retain(|id, _| known.iter().any(|k| k.id == *id));
         Ok(())
     }
 
     pub fn meta(&self, id: &str) -> Option<&Meta> {
         self.files.get(id).map(|s| &s.meta)
     }
+}
+
+/// Path of the named cache. It sits beside state.json rather than in a cache
+/// directory of its own: it is machine-local derived data with the same
+/// lifetime as the conversations it describes.
+fn cache_file(name: &str) -> Result<PathBuf> {
+    Ok(crate::state::state_dir()?.join(format!("meta-{name}.json")))
+}
+
+/// The named cache, or an empty one when it is missing, unreadable, written by
+/// an older corc, or no longer matches `Meta`. Every one of those means the
+/// same thing: parse the transcripts again.
+fn load_cache(name: &str) -> HashMap<String, FileState> {
+    let cached = cache_file(name)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Cache>(&text).ok())
+        .filter(|cache| cache.version == CACHE_VERSION);
+    cached.map(|cache| cache.files).unwrap_or_default()
+}
+
+/// Atomic write, so a corc reading the cache while another writes it sees one
+/// version or the other and never half of one.
+fn write_cache(name: &str, files: &HashMap<String, FileState>) -> Result<()> {
+    let path = cache_file(name)?;
+    let dir = path.parent().context("cache file has no parent dir")?;
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("meta-{name}.json.tmp"));
+    let cache = Cache {
+        version: CACHE_VERSION,
+        files: files.clone(),
+    };
+    fs::write(&tmp, serde_json::to_string(&cache)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming into place {}", path.display()))?;
+    Ok(())
 }
 
 /// Claude Code stores transcripts under a directory named after the cwd with
@@ -883,6 +1023,96 @@ mod tests {
         assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
     }
 
+    /// The two things that keep startup off the transcripts: a conversation
+    /// the sidebar is hiding is never read, and what has been read once is
+    /// read back from the cache on the next start instead of parsed again.
+    #[test]
+    fn hidden_conversations_go_unread_and_parsed_ones_survive_a_restart() {
+        let root = std::env::temp_dir().join("corc-test-meta-cache-store");
+        let state = std::env::temp_dir().join("corc-test-meta-cache-state");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+        // The cache lands beside state.json, so point that at a temp dir.
+        // SAFETY: this is the only test that touches the environment.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+
+        let prompt = |text: &str, ts: &str| {
+            json!({"type":"user","cwd":"/work/app","message":{"content":text},
+                   "timestamp":ts})
+            .to_string()
+        };
+        let id = "conv-cached";
+        let cwd = "/work/app";
+        let dir = root.join(mangled(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!("{}\n", prompt("first", "2026-07-08T10:00:00Z")),
+        )
+        .unwrap();
+
+        let hidden = Known {
+            visible: false,
+            ..Known::shown(id, cwd)
+        };
+        let mut store = Store::with(root.clone(), locate_jsonl, apply).cached_as("test-cache");
+        store.refresh(std::slice::from_ref(&hidden)).unwrap();
+        assert!(
+            store.meta(id).is_none(),
+            "a hidden conversation must not be read at all"
+        );
+
+        // Shown, it is parsed — and stays up to date once hidden again, since
+        // that only costs a stat.
+        store.refresh(&[Known::shown(id, cwd)]).unwrap();
+        assert_eq!(
+            store.meta(id).unwrap().first_prompt.as_deref(),
+            Some("first")
+        );
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                prompt("first", "2026-07-08T10:00:00Z"),
+                json!({"type":"ai-title","aiTitle":"a title"}),
+            ),
+        )
+        .unwrap();
+        store.refresh(std::slice::from_ref(&hidden)).unwrap();
+        assert_eq!(store.meta(id).unwrap().title.as_deref(), Some("a title"));
+        store.save_cache();
+
+        // A fresh store — the next corc start — knows the conversation before
+        // it has read a single byte, and picks up from where the last one
+        // stopped.
+        let mut restarted = Store::with(root.clone(), locate_jsonl, apply).cached_as("test-cache");
+        assert_eq!(
+            restarted.meta(id).unwrap().title.as_deref(),
+            Some("a title"),
+            "the cache must survive the restart"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .map(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{}", prompt("second", "2026-07-08T10:05:00Z")).unwrap();
+            })
+            .unwrap();
+        restarted.refresh(&[Known::shown(id, cwd)]).unwrap();
+        let meta = restarted.meta(id).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("a title"));
+        assert_eq!(meta.turn_started_at, parse_iso8601("2026-07-08T10:05:00Z"));
+
+        // A conversation corc no longer owns leaves the cache with it.
+        restarted.refresh(&[]).unwrap();
+        assert!(restarted.meta(id).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// The whole relocation story against real files: a Bash `cd` into a
     /// subdirectory never moves the conversation, a real `/cd` (the
     /// transcript file moves and new records match its new home) does, and a
@@ -914,17 +1144,18 @@ mod tests {
         .unwrap();
 
         let mut store = Store::with(root.clone(), locate_jsonl, apply);
-        let known = vec![(id.to_string(), PathBuf::from(home))];
+        let known = vec![Known::shown(id, home)];
         store.refresh(&known).unwrap();
         // The shell stood in the subdir, but the conversation lives at home.
-        assert_eq!(store.meta(id).unwrap().cwd.as_deref(), Some(Path::new(home)));
+        assert_eq!(
+            store.meta(id).unwrap().cwd.as_deref(),
+            Some(Path::new(home))
+        );
 
         // Even asked with a drifted cwd (state damaged by the old bug), the
         // uuid fallback finds the file and the confirmed cwd repairs it.
         let mut drifted = Store::with(root.clone(), locate_jsonl, apply);
-        drifted
-            .refresh(&[(id.to_string(), PathBuf::from(sub))])
-            .unwrap();
+        drifted.refresh(&[Known::shown(id, sub)]).unwrap();
         assert_eq!(
             drifted.meta(id).unwrap().cwd.as_deref(),
             Some(Path::new(home))

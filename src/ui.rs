@@ -3,6 +3,7 @@
 //! currently viewed conversation's agent pane, swapped in from the hidden
 //! session (ADR-0001).
 
+use crate::discovery::Known;
 use crate::provider::{self, MetaStore};
 use crate::repo;
 use crate::state::{self, State};
@@ -247,6 +248,19 @@ impl HistoryWindow {
     /// allowed to fold conversations behind the per-project list cap.
     fn is_uncapped(self) -> bool {
         matches!(self, Self::Active | Self::AllTime)
+    }
+}
+
+/// Whether the history window would let a conversation on screen, judged from
+/// the most recent moment known about it. This is the mirror of
+/// `HistoryWindow::hides`, which decides the same thing once the metadata is
+/// in: anything this leaves out, `hides` leaves out too, so skipping the read
+/// can never cost a row its title (see `known_conversations`).
+fn within_window(cutoff: Option<u64>, alive: bool, last_active: u64, now: u64) -> bool {
+    match cutoff {
+        _ if alive => true,
+        None => true,
+        Some(cutoff) => now.saturating_sub(last_active) <= cutoff,
     }
 }
 
@@ -497,7 +511,16 @@ struct App {
     /// Background fetch of Claude plan usage (5h / weekly / model-scoped),
     /// shown as a dim readout under the provider-switch menu row.
     usage: usage::Fetcher,
+    /// When the provider stores last wrote their metadata caches. Rate-limits
+    /// the write while a conversation streams; the parse it saves the next
+    /// corc start is worth far more than writing it the instant it changes.
+    metas_saved: Instant,
 }
+
+/// How often a running corc hands its parsed metadata to disk. corc normally
+/// outlives whole work days inside its tmux session, so waiting for a clean
+/// quit to write the cache would mean rarely writing it at all.
+const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn run() -> Result<()> {
     let sidebar_pane =
@@ -566,6 +589,7 @@ pub fn run() -> Result<()> {
         last_refresh: Instant::now(),
         menu_hitboxes: Vec::new(),
         usage: usage::Fetcher::spawn(),
+        metas_saved: Instant::now(),
     };
     app.refresh();
     app.view_last();
@@ -600,6 +624,7 @@ pub fn run() -> Result<()> {
     // user's config again.
     tmux::restore_bindings();
     let _ = app.state.save();
+    app.metas.save_cache();
 
     if keyboard_enhanced {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
@@ -830,10 +855,7 @@ impl App {
                 self.focus_attention_in_list();
                 self.move_mode = true;
             }
-            KeyCode::Char('a') => {
-                self.history_window = self.history_window.next();
-                self.rebuild_keeping_selection();
-            }
+            KeyCode::Char('a') => self.cycle_history(),
             KeyCode::Char('b') => self.toggle_selected_browser(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_shortcuts(),
@@ -909,18 +931,37 @@ impl App {
         }
     }
 
-    /// Conversations and their persisted in-flight starts, fanned out to the
-    /// matching provider metadata source.
-    fn known_conversations(&self) -> Vec<(String, PathBuf, &'static str, Option<u64>)> {
+    /// Every conversation corc owns, fanned out to the matching provider
+    /// metadata source, each flagged with whether the sidebar could put it on
+    /// screen right now so the store knows which ones are worth reading a
+    /// transcript for (`Known::visible`).
+    ///
+    /// Judging that needs an age, and the accurate age comes from the very
+    /// metadata this decides whether to read. So it is judged from what is
+    /// already at hand: a live pane, whatever metadata an earlier refresh or
+    /// the on-disk cache left behind, and the timestamps in state.json. Each
+    /// of those is at least as recent as the age `rebuild_items` will judge
+    /// the row by, which is what makes the flag safe. A conversation left out
+    /// here is one the history window hides anyway, so no row can end up on
+    /// screen with its metadata missing.
+    fn known_conversations(&self) -> Vec<(Known, &'static str)> {
+        let now = state::unix_now();
+        let cutoff = self.history_window.cutoff_secs();
         self.state
             .conversations
             .iter()
             .map(|c| {
+                let active =
+                    status::last_active_ts(self.metas.meta(&c.id), c.created_at).max(c.last_viewed);
+                let visible = within_window(cutoff, c.pane_id.is_some(), active, now);
                 (
-                    c.id.clone(),
-                    c.cwd.clone(),
+                    Known {
+                        id: c.id.clone(),
+                        cwd: c.cwd.clone(),
+                        turn_started_at: c.turn_started_at,
+                        visible,
+                    },
                     provider::by_id(&c.provider).id(),
-                    c.turn_started_at,
                 )
             })
             .collect()
@@ -1007,6 +1048,10 @@ impl App {
         let known = self.known_conversations();
         if let Err(e) = self.metas.refresh(&known) {
             self.status_msg = Some(e.to_string());
+        }
+        if self.metas_saved.elapsed() >= CACHE_SAVE_INTERVAL {
+            self.metas.save_cache();
+            self.metas_saved = Instant::now();
         }
 
         // Persist the metadata that must survive a temporarily unavailable
@@ -1130,6 +1175,16 @@ impl App {
             .cloned();
         self.attention = attention_ids(&self.state, &self.statuses);
         self.attention_sel = keep.and_then(|id| self.attention.iter().position(|row| *row == id));
+    }
+
+    /// Widen or narrow the history window (D12). The refresh is the point of
+    /// doing this in one place: conversations the old window hid have had no
+    /// metadata read for them, so without it the newly revealed rows would sit
+    /// there untitled until the next poll.
+    fn cycle_history(&mut self) {
+        self.history_window = self.history_window.next();
+        self.refresh();
+        self.rebuild_keeping_selection();
     }
 
     fn rebuild_items(&mut self) {
@@ -2225,10 +2280,7 @@ impl App {
     fn activate_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::New => self.open_picker(),
-            MenuAction::CycleHistory => {
-                self.history_window = self.history_window.next();
-                self.rebuild_keeping_selection();
-            }
+            MenuAction::CycleHistory => self.cycle_history(),
             MenuAction::SwitchProvider => self.open_provider_picker(),
             MenuAction::Shortcuts => self.show_shortcuts(),
         }
@@ -2634,6 +2686,7 @@ mod tests {
         RepaintSchedule, Statuses, adjacent_panel, attention_ids, attention_panel_height,
         browser_appeared, conversation_dot, conversation_is_empty, force_full_redraw, item_pos,
         keep_first_conversation_context_visible, project_is_listed, set_list_highlight,
+        within_window,
     };
     use crate::discovery::Meta;
     use crate::state::Conversation;
@@ -2672,6 +2725,33 @@ mod tests {
         assert!(HistoryWindow::Active.hides(Status::Dead, 0));
         assert!(!HistoryWindow::Active.hides(Status::Idle, u64::MAX));
         assert!(HistoryWindow::Active.is_uncapped());
+    }
+
+    /// The rule that keeps a corc start off hundreds of megabytes of
+    /// transcript: a conversation whose metadata goes unread must be one the
+    /// list would hide anyway, whatever the history window. Live panes are
+    /// always read, however old the conversation is.
+    #[test]
+    fn a_conversation_left_unread_is_one_the_window_hides_anyway() {
+        let now = 1_000_000u64;
+        let mut window = HistoryWindow::Active;
+        for _ in 0..6 {
+            for age in [0, 1, 3600, 3601, 24 * 3600, 7 * 24 * 3600, 30 * 24 * 3600] {
+                let read = within_window(window.cutoff_secs(), false, now - age, now);
+                assert!(
+                    read || window.hides(Status::Dead, age),
+                    "{:?} skips a {age}s old conversation it would still show",
+                    window
+                );
+                assert!(
+                    within_window(window.cutoff_secs(), true, now - age, now),
+                    "{:?} skips a live conversation",
+                    window
+                );
+            }
+            window = window.next();
+        }
+        assert_eq!(window, HistoryWindow::Active, "every window covered");
     }
 
     /// A project counts as listed while the expanded list holds it, or while the
