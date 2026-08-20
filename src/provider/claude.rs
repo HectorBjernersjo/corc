@@ -43,9 +43,14 @@ impl Provider for Claude {
             // phases use different patterns, so accept the non-blank Braille
             // block rather than one observed animation sequence.
             c if ('\u{2801}'..='\u{28ff}').contains(&c) => Some(RuntimeHint::Working),
-            // At the input prompt Claude prefixes the conversation title with
-            // this static glyph.
-            '✳' => Some(RuntimeHint::Idle),
+            // Since ~2.1.2xx Claude keeps this static glyph on the title even
+            // mid-turn, so it no longer distinguishes prompt from work — it
+            // only says "Claude Code runs here". Reading it as Idle made every
+            // working conversation show as idle; fall back to the transcript.
+            // The interrupted-turn case this hint used to catch (a Mid
+            // transcript with no completion record) still settles via
+            // STALE_SECS.
+            '✳' => None,
             // Startup, disabled/custom titles, and future formats use the
             // transcript fallback rather than being guessed at.
             _ => None,
@@ -147,7 +152,7 @@ mod tests {
     use crate::status::RuntimeHint;
 
     #[test]
-    fn terminal_title_reports_working_idle_or_unknown() {
+    fn terminal_title_reports_working_or_unknown() {
         for spinner in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
             assert_eq!(
                 Claude.runtime_hint(&format!("{spinner} backup-restore")),
@@ -158,9 +163,11 @@ mod tests {
             Claude.runtime_hint("⠂ platform-restore-cleanup-runbook"),
             Some(RuntimeHint::Working)
         );
+        // The ✳ prompt glyph stays on the title mid-turn in current Claude
+        // Code, so it carries no work/idle signal — transcript decides.
         assert_eq!(
             Claude.runtime_hint("✳ Review backup restore plan status"),
-            Some(RuntimeHint::Idle)
+            None
         );
         assert_eq!(Claude.runtime_hint("Claude Code"), None);
         assert_eq!(Claude.runtime_hint("custom terminal title"), None);
