@@ -1076,11 +1076,15 @@ impl App {
             .conversations
             .iter()
             .map(|c| {
-                let runtime = c
-                    .pane_id
-                    .as_deref()
-                    .and_then(|pane| panes.as_ref()?.get(pane))
-                    .and_then(|pane| provider::by_id(&c.provider).runtime_hint(&pane.title));
+                let runtime = c.pane_id.as_deref().and_then(|id| {
+                    let pane = panes.as_ref()?.get(id)?;
+                    provider::pane_hint(
+                        provider::by_id(&c.provider),
+                        id,
+                        pane,
+                        self.metas.meta(&c.id),
+                    )
+                });
                 let status = status::derive_with_runtime(
                     c.pane_id.is_some(),
                     runtime,

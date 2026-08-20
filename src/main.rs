@@ -305,11 +305,12 @@ fn list() -> Result<()> {
         }
         println!("\n{}", display_dir(project));
         for conv in convs {
+            let meta = store.meta(&conv.id);
             let live_pane = conv.pane_id.as_deref().and_then(|pane| panes.get(pane));
             let alive = live_pane.is_some();
-            let runtime = live_pane
-                .and_then(|pane| provider::by_id(&conv.provider).runtime_hint(&pane.title));
-            let meta = store.meta(&conv.id);
+            let runtime = conv.pane_id.as_deref().and_then(|id| {
+                provider::pane_hint(provider::by_id(&conv.provider), id, panes.get(id)?, meta)
+            });
             let s = status::derive_with_runtime(
                 alive,
                 runtime,

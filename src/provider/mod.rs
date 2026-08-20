@@ -8,8 +8,9 @@ mod codex;
 mod cursor;
 mod opencode;
 
-use crate::discovery::{Meta, MetaSource};
+use crate::discovery::{Meta, MetaSource, TurnState};
 use crate::status::RuntimeHint;
+use crate::tmux;
 use anyhow::Result;
 use ratatui::style::Color;
 use std::collections::HashMap;
@@ -40,6 +41,13 @@ pub trait Provider: Send + Sync {
     /// None means the title is unknown or the provider exposes no stable-enough
     /// convention, so status falls back to transcript metadata.
     fn runtime_hint(&self, _pane_title: &str) -> Option<RuntimeHint> {
+        None
+    }
+
+    /// Interpret captured pane content as a working/idle signal, for providers
+    /// whose pane title carries none. None means the provider has no stable
+    /// content convention, or the capture matches neither state.
+    fn content_hint(&self, _pane_content: &str) -> Option<RuntimeHint> {
         None
     }
 
@@ -132,6 +140,26 @@ pub fn by_id(id: &str) -> &'static dyn Provider {
         .copied()
         .find(|p| p.id() == id)
         .unwrap_or(all()[0])
+}
+
+/// Runtime reading for a conversation's live pane: the free title hint first,
+/// then — only while the transcript claims a turn is in flight — a pane
+/// capture. Claude's title stopped distinguishing working from idle, so the
+/// capture is what catches an interrupted turn whose transcript stays Mid
+/// forever. Gating it on a Mid transcript keeps the per-refresh cost to the
+/// panes whose state is actually ambiguous, typically zero to a few.
+pub fn pane_hint(
+    provider: &dyn Provider,
+    pane_id: &str,
+    pane: &tmux::Pane,
+    meta: Option<&Meta>,
+) -> Option<RuntimeHint> {
+    provider.runtime_hint(&pane.title).or_else(|| {
+        if meta.map(|m| m.turn_state) != Some(TurnState::Mid) {
+            return None;
+        }
+        provider.content_hint(&tmux::capture_pane(pane_id).ok()?)
+    })
 }
 
 /// The metadata readers of every provider, fanned out on refresh and merged

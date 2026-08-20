@@ -57,6 +57,24 @@ impl Provider for Claude {
         }
     }
 
+    /// Read working/idle out of the visible pane content. While a turn runs,
+    /// Claude draws a status line above the input box — a spinner glyph, a
+    /// verb phrase ending in an ellipsis, and the elapsed time in parens
+    /// ("✽ Baking… (3m 18s · ↓ 8.6k tokens)") — and removes it when the turn
+    /// ends ("✻ Baked for 10m 58s"). With the title static, this is the live
+    /// signal that catches an interrupted turn whose transcript stays Mid.
+    fn content_hint(&self, pane_content: &str) -> Option<RuntimeHint> {
+        if pane_content.lines().any(is_spinner_line) {
+            return Some(RuntimeHint::Working);
+        }
+        // No spinner but Claude's input prompt is on screen: at rest. Other
+        // content (dialogs, partial redraws) stays unknown, not guessed at.
+        pane_content
+            .lines()
+            .any(|l| l.starts_with('❯'))
+            .then_some(RuntimeHint::Idle)
+    }
+
     /// `/cd` (v2.1.169+) relocates the session: transcript, `--resume` lookup
     /// and CLAUDE.md all follow the new directory. It is user-only inside the
     /// agent, which is exactly why corc types it (ADR-0003).
@@ -85,6 +103,26 @@ impl Provider for Claude {
         let entries: Vec<usage::Entry> = resp.limits.iter().filter_map(usage_entry).collect();
         (!entries.is_empty()).then_some(entries)
     }
+}
+
+/// The turn-status line: a spinner glyph at column 0, a phrase ending with an
+/// ellipsis, then the elapsed time — "✽ Baking… (3m 18s · ↓ 8.6k tokens)".
+/// The glyph cycles, so accept any leading symbol that is not a body marker
+/// (assistant bullets, tool results, the prompt) and let the "… (<digit>"
+/// shape keep prose in the scrollback from matching.
+fn is_spinner_line(line: &str) -> bool {
+    let mut chars = line.chars();
+    let Some(glyph) = chars.next() else {
+        return false;
+    };
+    if glyph.is_alphanumeric() || glyph.is_whitespace() || "●⎿❯│─".contains(glyph) {
+        return false;
+    }
+    if chars.next() != Some(' ') {
+        return false;
+    }
+    line.split_once("… (")
+        .is_some_and(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 #[derive(Deserialize)]
@@ -172,6 +210,39 @@ mod tests {
         assert_eq!(Claude.runtime_hint("Claude Code"), None);
         assert_eq!(Claude.runtime_hint("custom terminal title"), None);
         assert_eq!(Claude.runtime_hint(""), None);
+    }
+
+    /// Pane content, captured from real sessions: a turn in flight draws a
+    /// spinner status line above the input box; an idle pane shows the prompt
+    /// without one, including right after an interrupted turn.
+    #[test]
+    fn pane_content_reports_working_idle_or_unknown() {
+        let working = "  Netto -10 rader trots ny doc-kommentar.\n\n\
+                       ✽ Boondoggling… (3m 18s · ↓ 8.6k tokens)\n\n\
+                       ─────────────\n❯ \n─────────────\n  Fable 5 | 103k tokens\n";
+        assert_eq!(Claude.content_hint(working), Some(RuntimeHint::Working));
+        // A different spinner glyph and verb, elapsed still in seconds.
+        assert_eq!(
+            Claude.content_hint("✻ Compacting conversation… (8s · esc to interrupt)\n❯ \n"),
+            Some(RuntimeHint::Working)
+        );
+
+        // The completed form of the status line is not work.
+        let idle = "  Bygget går igenom med 0 fel.\n\n✻ Baked for 10m 58s\n\n\
+                    ─────────────\n❯ \n─────────────\n  Fable 5 | 153k tokens\n";
+        assert_eq!(Claude.content_hint(idle), Some(RuntimeHint::Idle));
+
+        // Prose containing an ellipsis-parens shape is body text (indented or
+        // bulleted), never a status line.
+        assert_eq!(
+            Claude.content_hint("● Klart… (3 filer ändrade)\n  mer text… (2 saker)\n❯ \n"),
+            Some(RuntimeHint::Idle)
+        );
+
+        // No prompt on screen (dialogs, partial redraws): unknown, so status
+        // falls back to the transcript instead of guessing.
+        assert_eq!(Claude.content_hint(""), None);
+        assert_eq!(Claude.content_hint("Do you want to proceed?\n  1. Yes\n"), None);
     }
 
     #[test]

@@ -594,6 +594,14 @@ pub fn pane_exists(pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The visible screen content of one pane. Providers read live agent state
+/// out of it when the pane title carries no signal (Claude's ✳ title stopped
+/// distinguishing working from idle around 2.1.2xx). One tmux subprocess per
+/// call, so callers only capture panes whose state is actually ambiguous.
+pub fn capture_pane(pane_id: &str) -> Result<String> {
+    tmux(&["capture-pane", "-p", "-t", pane_id])
+}
+
 /// Snapshot every pane currently known to tmux, including the terminal title
 /// set by the process inside it. Callers use one snapshot for both liveness and
 /// provider-specific runtime hints instead of spawning per-pane tmux queries.
