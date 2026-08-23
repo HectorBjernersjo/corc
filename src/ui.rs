@@ -2733,7 +2733,8 @@ mod tests {
     /// always read, however old the conversation is.
     #[test]
     fn a_conversation_left_unread_is_one_the_window_hides_anyway() {
-        let now = 1_000_000u64;
+        // Past every age below, so `now - age` stays a real timestamp.
+        let now = 1_000_000_000u64;
         let mut window = HistoryWindow::Active;
         for _ in 0..6 {
             for age in [0, 1, 3600, 3601, 24 * 3600, 7 * 24 * 3600, 30 * 24 * 3600] {
