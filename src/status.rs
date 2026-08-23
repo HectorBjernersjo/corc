@@ -1,7 +1,8 @@
 //! Conversation status, derived from pane liveness, an optional provider
-//! runtime hint (Claude's tmux title), transcript timing, and `last_viewed`.
-//! Runtime hints answer only whether the agent is working right now; the
-//! transcript remains authoritative for timing and Unseen state.
+//! runtime hint (Claude's tmux title or pane content), transcript timing, and
+//! `last_viewed`. Runtime hints answer only what the agent is doing right now
+//! — working, at rest, or blocked on its own question — while the transcript
+//! remains authoritative for timing and Unseen state.
 //!
 //! The five states and their time columns (PLAN.md D6):
 //!
@@ -40,6 +41,8 @@ pub enum Status {
 pub enum RuntimeHint {
     Working,
     Idle,
+    /// The agent is blocked on a question dialog it drew in the pane.
+    Question,
 }
 
 impl Status {
@@ -60,12 +63,13 @@ impl Status {
 /// jsonl for unrelated background writes.
 const STALE_SECS: u64 = 3600;
 
-/// Derive status with an optional live provider signal. A positive Working
-/// hint wins over a transcript that has not flushed its new prompt yet. An
-/// Idle hint only corrects a stale Mid transcript; completed transcripts still
-/// decide between Unseen and Idle. `is_viewed` marks the conversation currently
-/// in the content pane, which counts as continuously viewed. With no runtime
-/// hint, status falls back entirely to transcript metadata.
+/// Derive status with an optional live provider signal. A Question hint wins
+/// outright — the user is blocked on it. A positive Working hint wins over a
+/// transcript that has not flushed its new prompt yet. An Idle hint only
+/// corrects a stale Mid transcript; completed transcripts still decide between
+/// Unseen and Idle. `is_viewed` marks the conversation currently in the content
+/// pane, which counts as continuously viewed. With no runtime hint, status
+/// falls back entirely to transcript metadata.
 pub fn derive_with_runtime(
     pane_alive: bool,
     runtime: Option<RuntimeHint>,
@@ -79,9 +83,11 @@ pub fn derive_with_runtime(
         return Status::Dead;
     }
     // An unanswered provider question is an attention state even when the
-    // conversation is currently viewed. Claude uses its ordinary idle pane
-    // title here, so transcript evidence must win over that runtime hint.
-    if meta.is_some_and(|m| m.active_question) {
+    // conversation is currently viewed. Claude holds the question back from
+    // the transcript until it is answered, so the pane reading is the signal
+    // that arrives first and the transcript flag covers the panes no capture
+    // reached. Either one outranks a working/idle hint.
+    if runtime == Some(RuntimeHint::Question) || meta.is_some_and(|m| m.active_question) {
         return Status::Question;
     }
     if runtime == Some(RuntimeHint::Working) {
@@ -117,10 +123,13 @@ pub fn time_column(status: Status, meta: Option<&Meta>, created_at: u64, now: u6
             .and_then(|m| m.turn_started_at)
             .map(|start| fmt_duration(now.saturating_sub(start)))
             .unwrap_or_default(),
-        Status::Question => meta
-            .and_then(|m| m.question_asked_at)
-            .map(|asked| age(now.saturating_sub(asked)))
-            .unwrap_or_default(),
+        // A question read off the pane has no asked-at timestamp — the
+        // transcript never recorded it — so it falls back to the turn's age,
+        // a few tool calls older at most, rather than to a blank column.
+        Status::Question => age(now.saturating_sub(
+            meta.and_then(|m| m.question_asked_at)
+                .unwrap_or_else(|| last_active_ts(meta, created_at)),
+        )),
         Status::Unseen => meta
             .and_then(|m| m.turn_started_at.zip(m.turn_completed_at))
             .map(|(start, done)| fmt_duration(done.saturating_sub(start)))
@@ -371,6 +380,58 @@ mod tests {
         assert_eq!(
             time_column(Status::Question, Some(&question), 0, 1000),
             "5m"
+        );
+    }
+
+    /// The pane-read question: Claude only writes AskUserQuestion to the
+    /// transcript once it is answered, so while the user is blocked the meta
+    /// still looks like an ordinary turn in flight. The hint alone has to
+    /// carry it, and the time column falls back to the turn's age instead of
+    /// going blank.
+    #[test]
+    fn question_hint_stands_without_transcript_evidence() {
+        let mid = meta(TurnState::Mid, Some(700), None);
+        assert!(!mid.active_question);
+        assert_eq!(
+            derive_with_runtime(
+                true,
+                Some(RuntimeHint::Question),
+                Some(&mid),
+                900,
+                true,
+                1000,
+                0
+            ),
+            Status::Question
+        );
+        assert_eq!(time_column(Status::Question, Some(&mid), 0, 1000), "5m");
+
+        // Answered: the dialog leaves the pane, the hint goes back to
+        // working/idle and the row stops being an attention state.
+        assert_eq!(
+            derive_with_runtime(
+                true,
+                Some(RuntimeHint::Working),
+                Some(&mid),
+                900,
+                true,
+                1000,
+                0
+            ),
+            Status::Running
+        );
+        // A dead pane is still Dead — nobody can answer a question there.
+        assert_eq!(
+            derive_with_runtime(
+                false,
+                Some(RuntimeHint::Question),
+                Some(&mid),
+                900,
+                false,
+                1000,
+                0
+            ),
+            Status::Dead
         );
     }
 

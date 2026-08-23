@@ -44,9 +44,9 @@ pub trait Provider: Send + Sync {
         None
     }
 
-    /// Interpret captured pane content as a working/idle signal, for providers
-    /// whose pane title carries none. None means the provider has no stable
-    /// content convention, or the capture matches neither state.
+    /// Interpret captured pane content as a working/idle/question signal, for
+    /// providers whose pane title carries none. None means the provider has no
+    /// stable content convention, or the capture matches no state.
     fn content_hint(&self, _pane_content: &str) -> Option<RuntimeHint> {
         None
     }
@@ -146,8 +146,11 @@ pub fn by_id(id: &str) -> &'static dyn Provider {
 /// then — only while the transcript claims a turn is in flight — a pane
 /// capture. Claude's title stopped distinguishing working from idle, so the
 /// capture is what catches an interrupted turn whose transcript stays Mid
-/// forever. Gating it on a Mid transcript keeps the per-refresh cost to the
-/// panes whose state is actually ambiguous, typically zero to a few.
+/// forever, and the only thing that catches an open question dialog, which
+/// Claude keeps out of the transcript until it is answered. Gating it on a Mid
+/// transcript keeps the per-refresh cost to the panes whose state is actually
+/// ambiguous, typically zero to a few — and a question is always drawn over a
+/// turn the transcript still has in flight.
 pub fn pane_hint(
     provider: &dyn Provider,
     pane_id: &str,

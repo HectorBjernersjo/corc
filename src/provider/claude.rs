@@ -57,13 +57,20 @@ impl Provider for Claude {
         }
     }
 
-    /// Read working/idle out of the visible pane content. While a turn runs,
-    /// Claude draws a status line above the input box — a spinner glyph, a
-    /// verb phrase ending in an ellipsis, and the elapsed time in parens
-    /// ("✽ Baking… (3m 18s · ↓ 8.6k tokens)") — and removes it when the turn
-    /// ends ("✻ Baked for 10m 58s"). With the title static, this is the live
-    /// signal that catches an interrupted turn whose transcript stays Mid.
+    /// Read what the agent is doing out of the visible pane content. While a
+    /// turn runs, Claude draws a status line above the input box — a spinner
+    /// glyph, a verb phrase ending in an ellipsis, and the elapsed time in
+    /// parens ("✽ Baking… (3m 18s · ↓ 8.6k tokens)") — and removes it when the
+    /// turn ends ("✻ Baked for 10m 58s"). An open AskUserQuestion replaces both
+    /// with its dialog. With the title static, this is the live signal that
+    /// catches an interrupted turn whose transcript stays Mid, and the only one
+    /// that catches a question at all.
     fn content_hint(&self, pane_content: &str) -> Option<RuntimeHint> {
+        // Ahead of the spinner: the dialog is drawn over a turn Claude still
+        // counts as in flight, and answering it is the only way forward.
+        if pane_content.lines().any(is_question_footer) {
+            return Some(RuntimeHint::Question);
+        }
         if pane_content.lines().any(is_spinner_line) {
             return Some(RuntimeHint::Working);
         }
@@ -123,6 +130,18 @@ fn is_spinner_line(line: &str) -> bool {
     }
     line.split_once("… (")
         .is_some_and(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// The footer of an open AskUserQuestion dialog: "Enter to select · ↑/↓ to
+/// navigate · Esc to cancel", where the middle hint differs between the
+/// single- and multi-question forms. Claude writes the question to the
+/// transcript only once it has been answered, so while the user is actually
+/// blocked this line is the whole evidence there is. Anchored at both ends so
+/// the same sentence quoted in the scrollback — a command corc itself ran, a
+/// diff of this file — never counts.
+fn is_question_footer(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("Enter to select · ") && line.ends_with(" · Esc to cancel")
 }
 
 #[derive(Deserialize)]
@@ -246,6 +265,39 @@ mod tests {
             Claude.content_hint("Do you want to proceed?\n  1. Yes\n"),
             None
         );
+    }
+
+    /// An open AskUserQuestion, captured from a real pane in both forms: the
+    /// single-question one with arrow-key navigation, and the multi-question
+    /// one with the tab bar across the top. The options are drawn with the
+    /// same `❯` the input box uses and the dialog sits over a turn Claude is
+    /// still animating elapsed time for, so both of the other readings would
+    /// otherwise claim this pane.
+    #[test]
+    fn pane_content_reports_an_open_question() {
+        let single = "● Två saker jag vill ha svar på innan jag börjar radera:\n\
+                      ─────────────\n\
+                      │ landing-art är den andra forken. Vad gör vi med den?\n\
+                      ❯ 1. Släng den (Rekommenderat) ✔\n\
+                      \x20    landing-v2 vann. Ingen bygger eller deployar forken.\n\
+                      \x20 2. Behåll som den är\n\
+                      \x20 3. Type something.\n\
+                      ─────────────\n\
+                      \x20 4. Chat about this\n\
+                      Enter to select · ↑/↓ to navigate · Esc to cancel\n";
+        assert_eq!(Claude.content_hint(single), Some(RuntimeHint::Question));
+
+        let multi = "←  ☒ landing-art  ☐ work-docs  ✔ Submit  →\n\
+                     │ Vad gör vi med docs/work/landing-revision?\n\
+                     ❯ 1. Radera hela mappen\n\
+                     Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n";
+        assert_eq!(Claude.content_hint(multi), Some(RuntimeHint::Question));
+
+        // The same footer quoted mid-line in the scrollback — a command corc
+        // ran, a diff of this file — is prose, not a live dialog.
+        let quoted = "  ⎿  $ tmux capture-pane -p | grep \"Enter to select · Esc to cancel\"\n\
+                      ✽ Grepping… (12s · ↓ 1.2k tokens)\n❯ \n";
+        assert_eq!(Claude.content_hint(quoted), Some(RuntimeHint::Working));
     }
 
     #[test]

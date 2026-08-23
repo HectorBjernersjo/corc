@@ -127,10 +127,13 @@ turn in the provider history. Shows elapsed time since the turn started in one
 largest unit (`4m`, `1h`).
 
 **Question** (blue ●):
-A live conversation with an active provider question waiting for the user.
-For Claude Code this is an unanswered `AskUserQuestion` tool call in the
-transcript. It stays blue even while viewed and shows how long the question
-has been waiting.
+A live conversation with an active provider question waiting for the user. For
+Claude Code the dialog's own footer line in the pane (`Enter to select · … ·
+Esc to cancel`) is what corc reads, because Claude writes the
+`AskUserQuestion` tool call to the transcript only once it has been answered —
+a transcript that still has an unanswered one is the fallback for panes no
+capture reached. It stays blue even while viewed and shows how long the
+question has been waiting, or the turn's age when only the pane knows.
 
 **Unseen** (blue ●):
 A live pane whose turn completed after the user last viewed it. Shows how long the completed turn ran.
