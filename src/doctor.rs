@@ -93,6 +93,10 @@ fn check_browser_view(warnings: &mut usize) {
                 "browser view",
                 &format!("playwright loads {}", path.display()),
             );
+            if crate::browser::config_is_isolated() {
+                warn("browser view", crate::browser::ISOLATED_HINT);
+                *warnings += 1;
+            }
         }
         Ok(path) => {
             warn(

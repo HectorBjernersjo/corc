@@ -829,21 +829,59 @@ pub fn ensure_config() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Whether a Playwright MCP server is configured to load corc's config file.
-/// Read from Claude Code's config, the only provider whose MCP setup corc can
-/// currently inspect; an unreadable or absent config just reads as "not wired".
-pub fn config_is_wired() -> bool {
+/// The args of every MCP server in Claude Code's config that loads corc's
+/// config file — the only provider whose MCP setup corc can currently inspect.
+/// An unreadable or absent config just reads as nothing wired.
+fn wired_server_args() -> Vec<Vec<String>> {
     let Ok(path) = config_path() else {
-        return false;
+        return Vec::new();
     };
     let Ok(home) = std::env::var("HOME") else {
-        return false;
+        return Vec::new();
     };
     let Ok(raw) = std::fs::read_to_string(format!("{home}/.claude.json")) else {
-        return false;
+        return Vec::new();
     };
-    raw.contains(&path.to_string_lossy().to_string())
+    wired_server_args_in(&raw, &path.to_string_lossy())
 }
+
+fn wired_server_args_in(raw: &str, config_path: &str) -> Vec<Vec<String>> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(servers) = parsed.get("mcpServers").and_then(|s| s.as_object()) else {
+        return Vec::new();
+    };
+    servers
+        .values()
+        .filter_map(|server| server.get("args")?.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter(|args| args.iter().any(|a| a.contains(config_path)))
+        .collect()
+}
+
+/// Whether a Playwright MCP server is configured to load corc's config file.
+pub fn config_is_wired() -> bool {
+    !wired_server_args().is_empty()
+}
+
+/// Whether a wired server also passes `--isolated`. Playwright refuses to
+/// combine that with the profile corc hands it through `PLAYWRIGHT_MCP_USER_DATA_DIR`
+/// — the server exits before any browser exists, and the agent sees
+/// `Failed to reconnect to playwright`.
+pub fn config_is_isolated() -> bool {
+    wired_server_args()
+        .iter()
+        .any(|args| args.iter().any(|a| a == "--isolated"))
+}
+
+pub const ISOLATED_HINT: &str = "the playwright MCP server args carry `--isolated`, which \
+     Playwright rejects together with the per-conversation profile corc supplies; \
+     remove the flag and restart the agent";
 
 /// Fail early with an actionable message rather than opening a pane that can
 /// never show anything.
@@ -855,6 +893,9 @@ pub fn check_ready() -> Result<()> {
              to the playwright MCP server args, then restart the agent.",
             path.display()
         );
+    }
+    if config_is_isolated() {
+        bail!("{ISOLATED_HINT}");
     }
     Ok(())
 }
@@ -1220,6 +1261,41 @@ mod tests {
         // conversation has opened a browser yet.
         prune_profiles_in(&root.join("nothing-here"), &state);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wired_servers_are_found_by_config_path_and_isolated_is_spotted() {
+        let path = "/home/h/.config/corc/playwright.json";
+        let raw = serde_json::json!({
+            "mcpServers": {
+                "playwright": {
+                    "command": "npx",
+                    "args": ["-y", "@playwright/mcp@latest", "--isolated", "--config", path]
+                },
+                "other": { "command": "foo", "args": ["--isolated"] }
+            }
+        })
+        .to_string();
+        let wired = wired_server_args_in(&raw, path);
+        assert_eq!(
+            wired.len(),
+            1,
+            "only the server loading corc's config counts"
+        );
+        assert!(wired[0].iter().any(|a| a == "--isolated"));
+
+        let clean = serde_json::json!({
+            "mcpServers": {
+                "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--config", path] }
+            }
+        })
+        .to_string();
+        let wired = wired_server_args_in(&clean, path);
+        assert_eq!(wired.len(), 1);
+        assert!(!wired[0].iter().any(|a| a == "--isolated"));
+
+        assert!(wired_server_args_in(&raw, "/elsewhere.json").is_empty());
+        assert!(wired_server_args_in("not json", path).is_empty());
     }
 
     #[test]

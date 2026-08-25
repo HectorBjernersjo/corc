@@ -170,6 +170,20 @@ the port from `/tmp/corc-browser-test/DevToolsActivePort`.
 
 ## Failure modes, in the order worth checking
 
+**`/mcp` says `Failed to reconnect to playwright: CONNECTION_CLOSED`, and no
+browser ever appears.**
+The MCP server exits before it starts a browser. Run it by hand from the agent's
+pane to see why; the one corc causes is
+
+```
+Error: Browser userDataDir is not supported in isolated mode.
+```
+
+which means the MCP args carry `--isolated` next to the profile corc supplies
+through `PLAYWRIGHT_MCP_USER_DATA_DIR`. Older `@playwright/mcp` releases let the
+pair through; 0.0.79 rejects it. Remove `--isolated` from the args and restart
+the agent. `corc doctor` warns about this.
+
 **The agent's browser tool call fails with `Browser is already in use for
 …/mcp-chrome-…, use --isolated`.**
 The agent is not using a corc profile. A `mcp-chrome-…` path is Playwright's own
