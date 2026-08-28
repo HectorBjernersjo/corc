@@ -69,7 +69,7 @@ fn append_request(path: &Path, id: &str, dir: &Path) -> Result<()> {
 /// The directory as the agent will receive it: absolute and existing. `~` is
 /// expanded so the agent can pass what a user would type; canonicalizing also
 /// rejects a directory that does not exist before anything is typed anywhere.
-fn canonical_dir(dir: &str) -> Result<PathBuf> {
+pub fn canonical_dir(dir: &str) -> Result<PathBuf> {
     let expanded = match dir.strip_prefix("~") {
         Some(rest) => {
             let home = std::env::var("HOME").context("HOME not set")?;

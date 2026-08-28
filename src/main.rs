@@ -41,7 +41,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => open(),
-        Some("open") => open(),
+        // `corc open DIR` skips the toggle and goes straight to DIR's project
+        // session — what an outside host (a GUI's embedded terminal) runs to
+        // land on the workspace it is showing.
+        Some("open") => match args.get(1) {
+            Some(dir) => open_dir(dir),
+            None => open(),
+        },
         Some("list") => list(),
         Some("doctor") => doctor::run(),
         // Reachable from inside an agent pane, which is the point: it toggles
@@ -84,6 +90,7 @@ Usage:
 
 Commands:
   open     Open corc, or toggle back when already there
+  open DIR Go to DIR's project session (created if missing)
   list     List every conversation corc owns
   browser  Toggle this conversation's browser view [on|off]
   cd DIR   Move this conversation to DIR (corc types the agent's /cd for you)
@@ -267,6 +274,23 @@ fn open() -> Result<()> {
         tmux::switch_client(tmux::TUI_SESSION)
     } else {
         tmux::attach(tmux::TUI_SESSION)
+    }
+}
+
+/// `corc open DIR`: take this terminal to DIR's project session, creating it
+/// (with its `.tmux.sh` hook) when missing. Attaches from a plain terminal,
+/// switches the client from inside tmux. Unlike the bare `open` there is no
+/// toggle: the caller already knows where it wants to be.
+fn open_dir(dir: &str) -> Result<()> {
+    let dir = cd::canonical_dir(dir)?;
+    let state = state::State::load()?;
+    let label = repo::label_for(&dir.to_string_lossy(), &state.projects);
+    let (session, _) = tmux::ensure_session(&dir, &label)?;
+    let in_tmux = std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some();
+    if in_tmux {
+        tmux::switch_client(&session)
+    } else {
+        tmux::attach(&session)
     }
 }
 
