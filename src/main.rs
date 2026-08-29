@@ -16,7 +16,8 @@ mod usage;
 mod widget;
 mod ws;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -90,7 +91,8 @@ Usage:
 
 Commands:
   open     Open corc, or toggle back when already there
-  open DIR Go to DIR's project session (created if missing)
+  open DIR Go to DIR's project session (created if missing); without a
+           terminal of its own it moves the last-active tmux client
   list     List every conversation corc owns
   browser  Toggle this conversation's browser view [on|off]
   cd DIR   Move this conversation to DIR (corc types the agent's /cd for you)
@@ -279,8 +281,9 @@ fn open() -> Result<()> {
 
 /// `corc open DIR`: take this terminal to DIR's project session, creating it
 /// (with its `.tmux.sh` hook) when missing. Attaches from a plain terminal,
-/// switches the client from inside tmux. Unlike the bare `open` there is no
-/// toggle: the caller already knows where it wants to be.
+/// switches the client from inside tmux, and moves the last-active client when
+/// run without a terminal at all. Unlike the bare `open` there is no toggle:
+/// the caller already knows where it wants to be.
 fn open_dir(dir: &str) -> Result<()> {
     let dir = cd::canonical_dir(dir)?;
     let state = state::State::load()?;
@@ -288,9 +291,17 @@ fn open_dir(dir: &str) -> Result<()> {
     let (session, _) = tmux::ensure_session(&dir, &label)?;
     let in_tmux = std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some();
     if in_tmux {
-        tmux::switch_client(&session)
-    } else {
-        tmux::attach(&session)
+        return tmux::switch_client(&session);
+    }
+    if std::io::stdin().is_terminal() {
+        return tmux::attach(&session);
+    }
+    // No terminal of our own means a program ran us (a GUI's keybinding, a
+    // window-manager script). Attaching can only fail, so move the client the
+    // user last typed in: the terminal they are about to look at.
+    match tmux::most_recent_client() {
+        Some(client) => tmux::switch_client_of(&client, &session),
+        None => bail!("no attached tmux client to move; open a terminal first"),
     }
 }
 

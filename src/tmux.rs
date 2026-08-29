@@ -346,6 +346,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn most_recent_client_is_the_one_with_the_latest_activity() {
+        let out = "1787996254 /dev/pts/88\n1787999999 /dev/pts/87\n1787990000 /dev/pts/3\n";
+        assert_eq!(
+            parse_most_recent_client(out).as_deref(),
+            Some("/dev/pts/87")
+        );
+        assert_eq!(parse_most_recent_client(""), None);
+    }
+
+    #[test]
     fn agent_shell_invocation_passes_paths_and_arguments_positionally() {
         let args = vec!["--resume".to_string(), "id with spaces".to_string()];
         // Avoid mutating SHELL in a parallel test: only assert the stable tail.
@@ -1089,5 +1099,31 @@ pub fn attach(session: &str) -> Result<()> {
     if !status.success() {
         bail!("could not attach; from a terminal run: tmux attach -t {session}");
     }
+    Ok(())
+}
+
+/// The attached client that saw input most recently, as the tty name
+/// `switch-client -c` takes. None when nothing is attached.
+pub fn most_recent_client() -> Option<String> {
+    let out = tmux(&["list-clients", "-F", "#{client_activity} #{client_tty}"]).ok()?;
+    parse_most_recent_client(&out)
+}
+
+fn parse_most_recent_client(output: &str) -> Option<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (activity, tty) = line.trim().split_once(' ')?;
+            Some((activity.parse::<u64>().ok()?, tty.to_string()))
+        })
+        .max_by_key(|(activity, _)| *activity)
+        .map(|(_, tty)| tty)
+}
+
+/// Move one specific client to a session. What `corc open DIR` does when a
+/// program rather than a person ran it: there is no terminal to attach and no
+/// `TMUX` to name the client, so the caller picks one.
+pub fn switch_client_of(client: &str, session: &str) -> Result<()> {
+    tmux(&["switch-client", "-c", client, "-t", &format!("={session}")])?;
     Ok(())
 }

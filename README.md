@@ -235,6 +235,10 @@ still exits if you need a hard escape hatch.
 
 - `corc` — create or enter the corc session.
 - `corc open` — the explicit form of `corc` (bind this to a key).
+- `corc open DIR` — go to DIR's project session, creating it when missing.
+  From a terminal it attaches; inside tmux it switches your client; run by a
+  program with no terminal (a GUI keybinding) it moves the tmux client you
+  last typed in.
 - `corc list` — print every conversation corc owns, grouped by project.
 - `corc browser [on|off]` — toggle the browser view for the conversation the
   command runs in; meant for `!corc browser` from inside the agent.
