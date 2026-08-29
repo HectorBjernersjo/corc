@@ -90,19 +90,19 @@ or deleted**.
 - The conversation currently in the content pane counts as continuously
   viewed: it goes straight to Idle, never Unseen, and its `last_viewed`
   follows along.
-- Claude's animated/idle tmux pane-title glyph is the primary live working
-  signal for every live Claude pane. Unknown or disabled title formats fall
-  back to the transcript, including its stalled-turn timeout. The runtime
-  signal never replaces transcript timing or the Unseen distinction.
+- Claude reports what it is doing through its hooks, backed by its own live
+  session status for the transitions hooks miss (ADR-0004); no state is guessed
+  from the pane. A turn nothing has advanced for an hour has stalled and
+  settles to Idle.
 - Seconds are never shown anywhere (feature 5).
 - Known limitation (out of scope): a Claude blocked on a permission prompt is
-  mid-turn in the jsonl and shows as Running. Fixable later with a Claude Code
-  Notification hook.
+  mid-turn and shows as Running. The `Notification` and `PermissionRequest`
+  hooks would give it a state of its own.
 
 ### D7 — Turn timing
 
-From the jsonl: turn start = timestamp of the last non-sidechain user message;
-turn complete = the `end_turn`/`turn_duration` record. Running shows
+From the provider's own record — for Claude the hook log, where turn start is
+`UserPromptSubmit` and turn complete is `Stop`. Running shows
 `now - turn_start`; Unseen shows `turn_complete - turn_start`.
 
 ### D8 — Project naming (features 1, 2)

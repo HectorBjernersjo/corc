@@ -3,6 +3,7 @@
 //! currently viewed conversation's agent pane, swapped in from the hidden
 //! session (ADR-0001).
 
+use crate::hooks;
 use crate::discovery::Known;
 use crate::provider::{self, MetaStore};
 use crate::repo;
@@ -26,6 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,13 +196,16 @@ enum MenuAction {
 
 /// Which conversations remain visible in history. The Active option shows
 /// only conversations with a live tmux pane; the age windows add progressively
-/// older Dead conversations. `a` cycles through these in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HistoryWindow {
+/// older Dead conversations. `a` cycles through these in order. The choice is
+/// persisted in `state.json`, so it survives a corc restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HistoryWindow {
     Active,
     ThreeHours,
     OneDay,
     ThreeDays,
+    #[default]
     OneWeek,
     AllTime,
 }
@@ -555,6 +560,7 @@ pub fn run() -> Result<()> {
         .ok()
         .map(|dirs| dirs.iter().map(|dir| dir.display().to_string()).collect());
 
+    let history_window = state.history_window;
     let mut app = App {
         state,
         metas: MetaStore::new()?,
@@ -575,7 +581,7 @@ pub fn run() -> Result<()> {
         filter: String::new(),
         filter_input: false,
         pending_kill: None,
-        history_window: HistoryWindow::OneWeek,
+        history_window,
         hidden: 0,
         listed_dirs,
         provider_picker: None,
@@ -979,10 +985,11 @@ impl App {
         }
 
         // Relocation requests from `corc cd`, run from inside an agent pane:
-        // type the provider's `/cd` into that pane (ADR-0003). State is not
-        // touched here — the cwd follows the transcript below, once the move
-        // has actually happened.
-        if let Some(msg) = cd::apply_requests(&self.state) {
+        // type the provider's `/cd` into that pane and move the row now
+        // (ADR-0003). The agent's own report settles the move below.
+        let applied = cd::apply_requests(&mut self.state, state::unix_now());
+        dirty |= applied.moved;
+        if let Some(msg) = applied.failure {
             self.status_msg = Some(msg);
         }
 
@@ -1075,19 +1082,16 @@ impl App {
             }
         }
 
-        // A conversation whose transcript says it has moved — a `/cd`, typed
-        // by the user or by corc for `corc cd` — is re-homed to its new
-        // project (ADR-0003). The transcript is the authority on where a
-        // conversation lives; the sidebar, digit jump and real session all
-        // follow the recorded cwd.
+        // A conversation the agent reports as living somewhere else — a
+        // `/cd` typed by the user, or corc's own `corc cd` confirmed or
+        // refused — is re-homed there (ADR-0003). The agent is the authority
+        // on where a conversation lives; the sidebar, digit jump and real
+        // session all follow the recorded cwd.
         let moves: Vec<(String, PathBuf)> = self
             .state
             .conversations
             .iter()
-            .filter_map(|c| {
-                let cwd = self.metas.meta(&c.id)?.cwd.clone()?;
-                (cwd != c.cwd).then(|| (c.id.clone(), cwd))
-            })
+            .filter_map(|c| Some((c.id.clone(), c.settled_cwd(self.metas.meta(&c.id)?)?)))
             .collect();
         for (id, cwd) in moves {
             if self.state.relocate(&id, &cwd) {
@@ -1121,18 +1125,8 @@ impl App {
             .conversations
             .iter()
             .map(|c| {
-                let runtime = c.pane_id.as_deref().and_then(|id| {
-                    let pane = panes.as_ref()?.get(id)?;
-                    provider::pane_hint(
-                        provider::by_id(&c.provider),
-                        id,
-                        pane,
-                        self.metas.meta(&c.id),
-                    )
-                });
-                let status = status::derive_with_runtime(
+                let status = status::derive(
                     c.pane_id.is_some(),
-                    runtime,
                     self.metas.meta(&c.id),
                     c.last_viewed,
                     viewed.as_deref() == Some(c.id.as_str()),
@@ -1183,6 +1177,8 @@ impl App {
     /// there untitled until the next poll.
     fn cycle_history(&mut self) {
         self.history_window = self.history_window.next();
+        self.state.history_window = self.history_window;
+        self.status_msg = self.state.save().err().map(|e| e.to_string());
         self.refresh();
         self.rebuild_keeping_selection();
     }
@@ -1525,6 +1521,8 @@ impl App {
         let mut pos = item_pos(&self.items, &id);
         if pos.is_none() {
             self.filter.clear();
+            // Not written back to state: this widening reveals one row the
+            // user asked for, it is not them choosing a new window.
             self.history_window = HistoryWindow::AllTime;
             self.rebuild_items();
             pos = item_pos(&self.items, &id);
@@ -1756,8 +1754,8 @@ impl App {
     }
 
     /// Forget an empty conversation: kill its agent pane and hidden window
-    /// (if any survive) and drop it from the state file. The jsonl under
-    /// ~/.claude is never touched (D1).
+    /// (if any survive), drop it from the state file and delete the hook log
+    /// corc kept for it. The jsonl under ~/.claude is never touched (D1).
     fn discard_conversation(&mut self, id: &str) {
         if let Some(pane) = self.state.conversation(id).and_then(|c| c.pane_id.clone())
             && tmux::kill_hidden_window(id).is_err()
@@ -1766,6 +1764,7 @@ impl App {
             let _ = tmux::kill_pane(&pane);
         }
         self.state.conversations.retain(|c| c.id != id);
+        hooks::forget(id);
         self.state.prune_empty_projects();
         self.status_msg = self.state.save().err().map(|e| e.to_string());
     }
@@ -1781,6 +1780,7 @@ impl App {
         match status_of(&self.statuses, &id) {
             Status::Dead => {
                 self.state.conversations.retain(|c| c.id != id);
+                hooks::forget(&id);
                 self.state.prune_empty_projects();
                 self.status_msg = self.state.save().err().map(|e| e.to_string());
                 self.refresh();
@@ -2845,6 +2845,7 @@ mod tests {
             content_seen,
             pinned: false,
             browser: false,
+            relocation_requested_at: None,
         }
     }
 

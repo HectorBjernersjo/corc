@@ -148,11 +148,14 @@ back to tmux at an outer edge.
 Each conversation remembers which agent spawned it, so `Enter` resumes a dead
 one with the same CLI. The `s` picker only changes the agent used for
 conversations you start afterwards; it's persisted, so the choice survives
-restarts. Provider metadata is read from each CLI's local, read-only history:
-Claude and Codex JSONL transcripts, Cursor's chat stores, and OpenCode's SQLite
-database. This drives titles and the same Running, Unseen, Idle, and Dead
-states across providers, plus a blue Question state where the provider exposes
-structured interactive questions. An untouched Codex or OpenCode conversation stays
+restarts. Claude Code reports what it is doing through hooks: corc passes
+`--settings` on the spawn line, so Claude runs `corc __hook` when a turn starts,
+when a tool finishes, when it asks you something and when it stops. Nothing is
+written to your `~/.claude` and your own hooks keep running. The other CLIs are
+read from their local, read-only history instead: Codex's JSONL rollouts,
+Cursor's chat stores, and OpenCode's SQLite database. This drives titles and
+the same Running, Unseen, Idle, and Dead states across providers, plus a blue
+Question state where the provider exposes structured interactive questions. An untouched Codex or OpenCode conversation stays
 `(untitled)` until the CLI creates its real session on the first prompt.
 
 ### Browser view

@@ -1,6 +1,7 @@
 //! Persistent record of every conversation corc has spawned, plus the
 //! user-managed project display order (PLAN.md D5).
 
+use crate::ui::HistoryWindow;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -44,6 +45,35 @@ pub struct Conversation {
     /// persisted so the choice survives a corc restart.
     #[serde(default)]
     pub browser: bool,
+    /// Unix seconds corc typed `/cd` for this conversation (ADR-0003). `cwd`
+    /// is already the target, optimistically: the agent runs the queued `/cd`
+    /// only when its turn ends, and a row that sits in the old project for
+    /// the whole turn is right in a way nobody can use. Cleared once the
+    /// agent's own report settles it — see `settled_cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocation_requested_at: Option<u64>,
+}
+
+impl Conversation {
+    /// Where the agent's report says this row belongs, when it says anything
+    /// new. `meta.cwd` is the reported directory; with no relocation pending
+    /// any change is a move (a `/cd` typed by hand).
+    ///
+    /// While one is pending the row already sits at the target, and the
+    /// report counts only once it can be about the `/cd`: either it names the
+    /// target (the move happened, whichever source noticed first), or a turn
+    /// has started since the request — the queued `/cd` ran, or failed,
+    /// before that prompt — and the report is the answer either way. Anything
+    /// dated earlier is the directory the agent was in before the request,
+    /// including the `Stop` of the very turn that made it.
+    pub fn settled_cwd(&self, meta: &crate::discovery::Meta) -> Option<PathBuf> {
+        let reported = meta.cwd.clone()?;
+        let settled = match self.relocation_requested_at {
+            None => reported != self.cwd,
+            Some(since) => reported == self.cwd || meta.turn_started_at > Some(since),
+        };
+        settled.then_some(reported)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +93,10 @@ pub struct State {
     /// `~/.config/corc/directories.txt`; this half is never synced.
     #[serde(default)]
     pub directories: Vec<String>,
+    /// How far back the sidebar shows Dead conversations, cycled with `a`
+    /// (D12) and persisted so the choice survives a restart.
+    #[serde(default)]
+    pub history_window: HistoryWindow,
 }
 
 fn default_provider() -> String {
@@ -76,6 +110,7 @@ impl Default for State {
             conversations: Vec::new(),
             active_provider: default_provider(),
             directories: Vec::new(),
+            history_window: HistoryWindow::default(),
         }
     }
 }
@@ -201,20 +236,22 @@ impl State {
             content_seen: false,
             pinned: false,
             browser: false,
+            relocation_requested_at: None,
         });
     }
 
-    /// Re-home a conversation whose transcript says it has moved — a `/cd`,
-    /// typed by the user or by corc for `corc cd` (ADR-0003): update its cwd,
-    /// append the new project to the display order if it is new, and drop the
-    /// old project if this was its last conversation. Returns whether
-    /// anything changed.
+    /// Re-home a conversation on the agent's own word — a `/cd` typed by the
+    /// user, or corc's `corc cd` confirmed or refused (ADR-0003): update its
+    /// cwd, append the new project to the display order if it is new, and
+    /// drop the old project if this was its last conversation. Settles any
+    /// pending relocation. Returns whether anything changed.
     pub fn relocate(&mut self, id: &str, cwd: &Path) -> bool {
         let Some(conv) = self.conversation_mut(id) else {
             return false;
         };
+        let settled = conv.relocation_requested_at.take().is_some();
         if conv.cwd == cwd {
-            return false;
+            return settled;
         }
         conv.cwd = cwd.to_path_buf();
         let project = cwd.display().to_string();
@@ -222,6 +259,18 @@ impl State {
             self.projects.push(project);
         }
         self.prune_empty_projects();
+        true
+    }
+
+    /// The optimistic half of `corc cd` (ADR-0003): corc has just typed `/cd`
+    /// into the pane, so move the row now and remember that the agent has yet
+    /// to confirm it. `relocate` settles it later, either way.
+    pub fn request_relocation(&mut self, id: &str, cwd: &Path, now: u64) -> bool {
+        self.relocate(id, cwd);
+        let Some(conv) = self.conversation_mut(id) else {
+            return false;
+        };
+        conv.relocation_requested_at = Some(now);
         true
     }
 
@@ -280,7 +329,7 @@ pub fn state_file() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Conversation, State};
+    use super::{Conversation, HistoryWindow, State};
 
     #[test]
     fn old_conversation_state_defaults_new_persisted_metadata() {
@@ -319,6 +368,7 @@ mod tests {
                 content_seen: true,
                 pinned: false,
                 browser: false,
+                relocation_requested_at: None,
             });
         }
         state.projects.push("/work/old".into());
@@ -337,6 +387,71 @@ mod tests {
         assert_eq!(state.projects, vec!["/work/new"]);
     }
 
+    /// `corc cd` moves the row the moment `/cd` is typed, and the agent's
+    /// report settles it: a report naming the target confirms whenever it
+    /// arrives; a report from before the request is the old directory and
+    /// says nothing; a turn that started after the request means the queued
+    /// `/cd` has had its chance, so whatever the report says then is final.
+    #[test]
+    fn a_requested_relocation_is_optimistic_until_the_agent_reports() {
+        use crate::discovery::Meta;
+        use std::path::Path;
+        let mut state = State::default();
+        state.add_conversation("a".into(), "/work/old".into(), "%1".into(), "claude".into());
+        let meta = |cwd: &str, turn_started_at: Option<u64>| Meta {
+            cwd: Some(cwd.into()),
+            turn_started_at,
+            ..Meta::default()
+        };
+
+        assert!(state.request_relocation("a", Path::new("/work/new"), 1000));
+        let conv = state.conversation("a").unwrap();
+        assert_eq!(conv.cwd, Path::new("/work/new"));
+        assert_eq!(state.projects, vec!["/work/new"]);
+
+        // The hook log still ends on the old directory, from before the
+        // request: not evidence.
+        assert_eq!(conv.settled_cwd(&meta("/work/old", Some(900))), None);
+        // The transcript's `relocated` record carries no time and needs none.
+        assert_eq!(
+            conv.settled_cwd(&meta("/work/new", Some(900))),
+            Some("/work/new".into())
+        );
+        // A prompt after the request, still in the old directory: `/cd` was
+        // refused or never ran, and the row goes back.
+        assert_eq!(
+            conv.settled_cwd(&meta("/work/old", Some(1100))),
+            Some("/work/old".into())
+        );
+
+        assert!(state.relocate("a", Path::new("/work/old")));
+        let conv = state.conversation("a").unwrap();
+        assert_eq!(conv.cwd, Path::new("/work/old"));
+        assert_eq!(conv.relocation_requested_at, None);
+        // Settled: only a real change counts again.
+        assert_eq!(conv.settled_cwd(&meta("/work/old", Some(1100))), None);
+        assert_eq!(
+            conv.settled_cwd(&meta("/work/else", Some(1100))),
+            Some("/work/else".into())
+        );
+    }
+
+    /// The `a` history window is a setting, not session state: it survives a
+    /// restart, and a state file written before it existed still loads.
+    #[test]
+    fn history_window_round_trips_and_defaults_on_older_state_files() {
+        let mut state = State::default();
+        assert_eq!(state.history_window, HistoryWindow::OneWeek);
+
+        state.history_window = HistoryWindow::ThreeHours;
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.history_window, HistoryWindow::ThreeHours);
+
+        let older: State = serde_json::from_str(r#"{"conversations":[]}"#).unwrap();
+        assert_eq!(older.history_window, HistoryWindow::OneWeek);
+    }
+
     #[test]
     fn pin_toggle_is_persisted_on_the_conversation() {
         let mut state = State::default();
@@ -351,6 +466,7 @@ mod tests {
             content_seen: true,
             pinned: false,
             browser: false,
+            relocation_requested_at: None,
         });
 
         assert_eq!(state.toggle_pin("chat"), Some(true));

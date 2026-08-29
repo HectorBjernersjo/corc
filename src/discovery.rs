@@ -1,4 +1,5 @@
-//! Metadata for known conversations, read from their jsonl transcripts.
+//! Metadata for known conversations, read from an append-only jsonl their
+//! agent leaves behind: Claude's hook log and Codex's rollouts.
 //! corc only ever looks up the files of conversations it spawned (known
 //! uuid + cwd) — there is no tree scan and no adoption of foreign history
 //! (PLAN.md D1). The jsonl files are read-only: never modified, never
@@ -50,16 +51,6 @@ pub struct Meta {
     pub title: Option<String>,
     /// First real user prompt, kept as a title stand-in until `title` exists.
     pub first_prompt: Option<String>,
-    /// The slash command a conversation was started with (`/impeccable teach`)
-    /// and that reached the model, for conversations that have no real prompt
-    /// at all. Ranked below `first_prompt` — the command is the weakest of the
-    /// stand-ins, but it beats `(untitled)`.
-    pub first_command: Option<String>,
-    /// A just-seen command, held until we know whether it ran locally (a
-    /// `<local-command-stdout>` record follows and withdraws it) or reached the
-    /// model (an assistant record follows and promotes it to `first_command`).
-    /// Only `display_title` should consume it.
-    pub command_candidate: Option<String>,
     /// Whether the conversation contains a real user/assistant exchange.
     /// Deliberately independent of `title`, which providers may generate late
     /// or fail to generate at all.
@@ -83,38 +74,28 @@ pub struct Meta {
     pub active_question: bool,
     /// When the currently active question was asked, for its age column.
     pub question_asked_at: Option<u64>,
-    /// Tool-use id used to distinguish the question's answer from unrelated
-    /// tool results in the same turn.
-    pub(crate) active_question_tool_id: Option<String>,
     /// mtime of the jsonl — coarse filesystem activity, including background
     /// writes that do not advance a turn.
     pub mtime: SystemTime,
-    /// Where the conversation lives now: the latest record cwd that is
-    /// *confirmed by the transcript file's own location* (ADR-0003). A
-    /// record's cwd follows every Bash `cd` the agent makes, so on its own it
-    /// says where the shell stood, not where the session lives — but `/cd` is
-    /// the only thing that moves the transcript file, so a record cwd counts
-    /// only when its mangled form names the directory the file sits in.
-    /// None until a matching record exists, or for providers that never
-    /// report one.
+    /// Where the conversation lives now (ADR-0003). Claude reports the
+    /// session's own directory on every hook, and writes a `relocated` record
+    /// into the transcript the moment a `/cd` runs, so a move shows up here
+    /// from whichever source speaks first. None until the agent has reported
+    /// one, or for providers that never do.
     pub cwd: Option<PathBuf>,
-    /// Name of the directory the transcript file sits in (the mangled
-    /// session cwd), set by `Store` before parsing — what record cwds are
-    /// confirmed against.
-    pub(crate) project_dir_name: Option<String>,
 }
 
 impl Meta {
     /// What the sidebar should show: an explicit rename, the generated title,
-    /// the first user prompt while no title has been generated yet, or — for a
-    /// conversation opened with a slash command and nothing else — the command.
+    /// or the first thing the user sent while no title has been generated yet.
+    /// A conversation opened with a slash command and nothing else is named by
+    /// that command, which is the first prompt as far as the agent is
+    /// concerned.
     pub fn display_title(&self) -> Option<&str> {
         self.custom_title
             .as_deref()
             .or(self.title.as_deref())
             .or(self.first_prompt.as_deref())
-            .or(self.first_command.as_deref())
-            .or(self.command_candidate.as_deref())
     }
 }
 
@@ -182,8 +163,6 @@ impl Default for Meta {
             custom_title: None,
             title: None,
             first_prompt: None,
-            first_command: None,
-            command_candidate: None,
             has_content: false,
             turn_state: TurnState::Unknown,
             turn_started_at: None,
@@ -191,10 +170,8 @@ impl Default for Meta {
             turn_progress_at: None,
             active_question: false,
             question_asked_at: None,
-            active_question_tool_id: None,
             mtime: SystemTime::UNIX_EPOCH,
             cwd: None,
-            project_dir_name: None,
         }
     }
 }
@@ -219,7 +196,7 @@ struct Cache {
     files: HashMap<String, FileState>,
 }
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// Incrementally parsed metadata for the conversations corc owns.
 pub struct Store {
@@ -237,14 +214,19 @@ pub struct Store {
 }
 
 impl Store {
-    /// Claude Code's transcript store under ~/.claude/projects.
-    pub fn new() -> Result<Self> {
+    /// Claude's transcripts under ~/.claude/projects, read for titles and
+    /// for the `relocated` record a `/cd` leaves behind. Everything else about
+    /// a Claude conversation arrives through its hooks; a `/rename`, a
+    /// generated `ai-title` and a `/cd` that no hook has followed yet are
+    /// written nowhere but here.
+    pub fn titles() -> Result<Self> {
         let home = std::env::var("HOME").context("HOME not set")?;
-        Ok(Self::with(
-            PathBuf::from(home).join(".claude/projects"),
-            locate_jsonl,
-            apply,
-        ))
+        Ok(Self::titles_in(PathBuf::from(home).join(".claude/projects")).cached_as("claude-titles"))
+    }
+
+    /// The same reader over another transcript root, uncached, for tests.
+    pub(crate) fn titles_in(root: PathBuf) -> Self {
+        Self::with(root, locate_jsonl, apply_title)
     }
 
     /// The same incremental machinery over another provider's jsonl tree
@@ -332,13 +314,6 @@ impl Store {
                     // New file, or it shrank (rewritten) — parse from scratch.
                     let mut meta = Meta {
                         mtime,
-                        // The directory the file sits in vouches for record
-                        // cwds (ADR-0003); a relocated file gets re-inserted
-                        // here, so this always names its current home.
-                        project_dir_name: path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned()),
                         ..Meta::default()
                     };
                     let offset = parse_from(&path, 0, &mut meta, apply)?;
@@ -365,6 +340,13 @@ impl Store {
 
     pub fn meta(&self, id: &str) -> Option<&Meta> {
         self.files.get(id).map(|s| &s.meta)
+    }
+
+    /// The file this store located for a conversation. Where the file sits is
+    /// evidence in its own right for a transcript tree keyed by the session's
+    /// mangled directory (ADR-0003).
+    pub fn path(&self, id: &str) -> Option<&Path> {
+        self.files.get(id).map(|s| s.path.as_path())
     }
 }
 
@@ -428,7 +410,7 @@ fn locate_jsonl(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
 /// every non-alphanumeric character replaced by '-'. Lossy one way, exact as
 /// a check: a record cwd is confirmed by the transcript's location when its
 /// mangled form equals the directory name the file sits in.
-fn mangled(path: &str) -> String {
+pub(crate) fn mangled(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
@@ -462,107 +444,21 @@ fn parse_from(
     Ok(pos)
 }
 
-fn apply(meta: &mut Meta, v: &Value) {
-    let sidechain = v["isSidechain"].as_bool().unwrap_or(false);
-
-    // Every record stamps the shell cwd it was written under — which follows
-    // Bash `cd` into subdirectories, so it only counts as "the conversation
-    // lives here" when the transcript file's location vouches for it: `/cd`
-    // is the only thing that moves the file (ADR-0003). This also repairs a
-    // Conversation.cwd that drifted: the latest *confirmed* cwd is the real
-    // session directory, wherever the shell has wandered since.
-    if let Some(cwd) = v["cwd"].as_str()
-        && meta.project_dir_name.as_deref() == Some(mangled(cwd).as_str())
-    {
-        meta.cwd = Some(PathBuf::from(cwd));
-    }
-
-    // AskUserQuestion stays open in Claude's transcript until its matching
-    // tool result is written. Track that structured lifecycle instead of
-    // scraping the terminal UI, whose pane title is identical to normal idle.
-    if !sidechain
-        && v["type"] == "user"
-        && question_was_answered(v, meta.active_question_tool_id.as_deref())
-    {
-        meta.active_question = false;
-        meta.question_asked_at = None;
-        meta.active_question_tool_id = None;
-    }
-
+/// Fold one transcript line into the titles corc reads from Claude, plus the
+/// one move it cannot learn any other way. Turn state, timing, questions and
+/// the working directory otherwise arrive through the hook log
+/// (`crate::hooks`), which reports the event itself rather than the trace it
+/// left.
+fn apply_title(meta: &mut Meta, v: &Value) {
     match v["type"].as_str() {
-        Some("user") if !sidechain && !is_meta_user(v) => {
-            meta.has_content = true;
-            if let Some(ts) = record_timestamp(v) {
-                meta.turn_progress_at = Some(ts);
-            }
-            // A Ctrl+C interrupt is written as a user record too, but it ends
-            // the turn — it never produces an end_turn / turn_duration record,
-            // so if we let it fall through as a prompt the state would stay
-            // Mid (Running) forever.
-            if v.get("interruptedMessageId").is_some() {
-                meta.turn_state = TurnState::Complete;
-                meta.turn_completed_at = record_timestamp(v);
-                return;
-            }
-            meta.turn_state = TurnState::Mid;
-            // Only a real prompt starts a turn (D7); tool results arriving
-            // mid-turn keep the state Mid but never reset the start time.
-            if !is_tool_result(v) {
-                if let Some(ts) = record_timestamp(v) {
-                    meta.turn_started_at = Some(ts);
-                    meta.turn_completed_at = None;
-                }
-                if meta.first_prompt.is_none()
-                    && let Some(text) = prompt_text(v)
-                {
-                    meta.first_prompt = Some(text);
-                }
-            }
-        }
-        // Slash-command transcripts. They are meta — excluded from
-        // `first_prompt` by the arm above — but they are the only trace of what
-        // a conversation is about until a real prompt or a generated title
-        // shows up. Keep the command as a title candidate; a following
-        // `<local-command-stdout>` means it ran locally and never reached the
-        // model, so it withdraws the candidate.
-        Some("user") if !sidechain && !v["isMeta"].as_bool().unwrap_or(false) => {
-            if let Some(content) = v["message"]["content"].as_str() {
-                if content.starts_with("<local-command-stdout>") {
-                    meta.command_candidate = None;
-                } else if meta.first_command.is_none() && meta.command_candidate.is_none() {
-                    meta.command_candidate = slash_command(v);
-                }
-            }
-        }
-        Some("assistant") if !sidechain => {
-            meta.has_content = true;
-            // The model answered, so the pending command genuinely started
-            // the conversation — pin it against later local commands whose
-            // stdout would otherwise withdraw it.
-            if meta.first_command.is_none() {
-                meta.first_command = meta.command_candidate.take();
-            }
-            if let Some(ts) = record_timestamp(v) {
-                meta.turn_progress_at = Some(ts);
-            }
-            if let Some(id) = ask_user_question_id(v) {
-                meta.active_question = true;
-                meta.question_asked_at = record_timestamp(v);
-                meta.active_question_tool_id = Some(id.to_string());
-            }
-            match v["message"]["stop_reason"].as_str() {
-                Some("end_turn") | Some("stop_sequence") | Some("max_tokens") => {
-                    meta.turn_state = TurnState::Complete;
-                    meta.turn_completed_at = record_timestamp(v);
-                }
-                _ => meta.turn_state = TurnState::Mid,
-            }
-        }
-        Some("system") if v["subtype"].as_str() == Some("turn_duration") => {
-            meta.turn_state = TurnState::Complete;
-            if let Some(ts) = record_timestamp(v) {
-                meta.turn_completed_at = Some(ts);
-                meta.turn_progress_at = Some(ts);
+        // `/cd` fires no hook, so until the next prompt this record is the
+        // only word of the move. Claude writes it just before it moves the
+        // file, and the file's new location is what confirms it
+        // (`provider::claude`) — taken alone it is as unvouched as any
+        // reported cwd.
+        Some("relocated") => {
+            if let Some(cwd) = v["relocatedCwd"].as_str() {
+                meta.cwd = Some(PathBuf::from(cwd));
             }
         }
         Some("ai-title") => {
@@ -579,6 +475,8 @@ fn apply(meta: &mut Meta, v: &Value) {
                 meta.title = Some(summary.to_string());
             }
         }
+        // `/rename`. Kept apart from the generated title so a later `ai-title`
+        // can never overwrite what the user typed.
         Some("custom-title") => {
             if let Some(title) = v["customTitle"].as_str() {
                 meta.custom_title = Some(title.to_string());
@@ -586,89 +484,6 @@ fn apply(meta: &mut Meta, v: &Value) {
         }
         _ => {}
     }
-}
-
-/// User records that don't represent a prompt: caveat/meta records and the
-/// `<command-…>` transcript of local slash commands.
-fn is_meta_user(v: &Value) -> bool {
-    if v["isMeta"].as_bool().unwrap_or(false) {
-        return true;
-    }
-    matches!(
-        v["message"]["content"].as_str(),
-        Some(s) if s.starts_with("<command-") || s.starts_with("<local-command")
-    )
-}
-
-/// The invocation a `<command-…>` user record stands for, rendered the way it
-/// was typed: `/impeccable teach`. Only the name is required; a command with no
-/// arguments writes an empty (or missing) `<command-args>`.
-fn slash_command(v: &Value) -> Option<String> {
-    let content = v["message"]["content"].as_str()?;
-    let name = tagged(content, "command-name")?;
-    let line = match tagged(content, "command-args") {
-        Some(args) if !args.is_empty() => format!("{name} {args}"),
-        _ => name.to_string(),
-    };
-    title_line(&line)
-}
-
-/// The text between `<tag>` and `</tag>`, trimmed.
-fn tagged<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let rest = text.split_once(&format!("<{tag}>"))?.1;
-    Some(rest.split_once(&format!("</{tag}>"))?.0.trim())
-}
-
-/// Tool results come back as user records with a `toolUseResult` key (and
-/// `tool_result` content blocks).
-fn is_tool_result(v: &Value) -> bool {
-    if v.get("toolUseResult").is_some() {
-        return true;
-    }
-    v["message"]["content"]
-        .as_array()
-        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
-}
-
-/// The id of an AskUserQuestion tool call in an assistant record.
-fn ask_user_question_id(v: &Value) -> Option<&str> {
-    v["message"]["content"]
-        .as_array()?
-        .iter()
-        .find_map(|block| {
-            (block["type"] == "tool_use" && block["name"] == "AskUserQuestion")
-                .then(|| block["id"].as_str())?
-        })
-}
-
-/// Whether a user record answers the currently open AskUserQuestion. A real
-/// prompt also clears it as recovery for transcript versions that represent
-/// a cancelled question without a matching tool-result block.
-fn question_was_answered(v: &Value, question_id: Option<&str>) -> bool {
-    let Some(question_id) = question_id else {
-        return false;
-    };
-    if !is_tool_result(v) {
-        return !is_meta_user(v);
-    }
-    v["message"]["content"].as_array().is_some_and(|blocks| {
-        blocks.iter().any(|block| {
-            block["type"] == "tool_result" && block["tool_use_id"].as_str() == Some(question_id)
-        })
-    })
-}
-
-/// The prompt text of a user record, reduced to a one-line title stand-in.
-fn prompt_text(v: &Value) -> Option<String> {
-    let content = &v["message"]["content"];
-    let text = content.as_str().map(str::to_string).or_else(|| {
-        content.as_array()?.iter().find_map(|b| {
-            (b["type"] == "text")
-                .then(|| b["text"].as_str())?
-                .map(str::to_string)
-        })
-    })?;
-    title_line(&text)
 }
 
 /// Reduce prompt text to a one-line title stand-in: first non-empty line, at
@@ -679,10 +494,6 @@ pub(crate) fn title_line(text: &str) -> Option<String> {
         Some((i, _)) => format!("{}…", &line[..i]),
         None => line.to_string(),
     })
-}
-
-fn record_timestamp(v: &Value) -> Option<u64> {
-    parse_iso8601(v["timestamp"].as_str()?)
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SS(.frac)?(Z|±HH:MM)?` into unix seconds. The
@@ -772,255 +583,37 @@ mod tests {
         assert_eq!(parse_iso8601("garbage"), None);
     }
 
-    /// D7: turn start = last real user prompt; tool results keep the turn
-    /// Mid without resetting the start; end_turn / turn_duration complete it.
     #[test]
-    fn turn_timing() {
-        let mut meta = Meta::default();
-        let apply_all = |meta: &mut Meta, records: &[Value]| {
-            for r in records {
-                apply(meta, r);
-            }
-        };
-
-        apply_all(
-            &mut meta,
-            &[
-                // Meta/caveat and slash-command records never start a turn.
-                json!({"type":"user","isMeta":true,"message":{"content":"caveat"},
-                       "timestamp":"2026-07-08T10:00:00Z"}),
-                json!({"type":"user","message":{"content":"<command-name>/clear</command-name>"},
-                       "timestamp":"2026-07-08T10:00:01Z"}),
-            ],
-        );
-        assert_eq!(meta.turn_state, TurnState::Unknown);
-        assert_eq!(meta.turn_started_at, None);
-        assert!(!meta.has_content);
-
-        // A real prompt starts the turn.
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"do the thing"},
-                    "timestamp":"2026-07-08T10:01:00Z"}),
-        );
-        let start = parse_iso8601("2026-07-08T10:01:00Z");
-        assert_eq!(meta.turn_state, TurnState::Mid);
-        assert_eq!(meta.turn_started_at, start);
-        assert_eq!(meta.turn_progress_at, start);
-        assert_eq!(meta.turn_completed_at, None);
-        assert!(meta.has_content);
-
-        // Assistant tool_use + tool result stay Mid, start untouched.
-        apply_all(
-            &mut meta,
-            &[
-                json!({"type":"assistant","message":{"stop_reason":"tool_use"},
-                       "timestamp":"2026-07-08T10:02:00Z"}),
-                json!({"type":"user","toolUseResult":{},
-                       "message":{"content":[{"type":"tool_result"}]},
-                       "timestamp":"2026-07-08T10:03:00Z"}),
-            ],
-        );
-        assert_eq!(meta.turn_state, TurnState::Mid);
-        assert_eq!(meta.turn_started_at, start);
-        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:03:00Z"));
-
-        // The turn_duration record completes the turn.
-        apply(
-            &mut meta,
-            &json!({"type":"system","subtype":"turn_duration","durationMs":240000,
-                    "timestamp":"2026-07-08T10:05:00Z"}),
-        );
-        assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(meta.turn_started_at, start);
-        assert_eq!(
-            meta.turn_completed_at,
-            parse_iso8601("2026-07-08T10:05:00Z")
-        );
-        assert_eq!(meta.turn_progress_at, meta.turn_completed_at);
-
-        // Sidechain traffic is invisible to turn state.
-        apply(
-            &mut meta,
-            &json!({"type":"user","isSidechain":true,"message":{"content":"sub"},
-                    "timestamp":"2026-07-08T10:06:00Z"}),
-        );
-        assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
-
-        // Claude's background records can touch the jsonl but are not turn
-        // progress and must not extend the Running timeout.
-        apply(
-            &mut meta,
-            &json!({"type":"system","subtype":"away_summary",
-                    "timestamp":"2026-07-08T10:07:00Z"}),
-        );
-        assert_eq!(meta.turn_progress_at, parse_iso8601("2026-07-08T10:05:00Z"));
-
-        // The next prompt starts a fresh turn.
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"next"},
-                    "timestamp":"2026-07-08T10:10:00Z"}),
-        );
-        assert_eq!(meta.turn_state, TurnState::Mid);
-        assert_eq!(meta.turn_started_at, parse_iso8601("2026-07-08T10:10:00Z"));
-        assert_eq!(meta.turn_completed_at, None);
-        assert_eq!(meta.turn_progress_at, meta.turn_started_at);
-    }
-
-    /// A conversation opened with a slash command has no prompt to fall back
-    /// on, so the command itself names it — but it is the weakest stand-in:
-    /// a real prompt, a generated title and a rename all outrank it.
-    #[test]
-    fn slash_command_names_a_conversation_until_something_better_arrives() {
+    fn a_rename_wins_over_every_generated_title() {
         let mut meta = Meta::default();
 
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":
-                "<command-message>impeccable</command-message>\n\
-                 <command-name>/impeccable</command-name>\n\
-                 <command-args>teach</command-args>"}}),
-        );
-        assert_eq!(meta.display_title(), Some("/impeccable teach"));
-        // Still meta: the command neither counts as content nor starts a turn.
-        assert!(!meta.has_content);
-        assert_eq!(meta.turn_state, TurnState::Unknown);
-
-        // The skill's own injected text is meta too, and a later command does
-        // not rename the conversation.
-        apply(
-            &mut meta,
-            &json!({"type":"user","isMeta":true,"message":{"content":
-                [{"type":"text","text":"Base directory for this skill: …"}]}}),
-        );
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":
-                "<command-name>/clear</command-name>"}}),
-        );
-        assert_eq!(meta.display_title(), Some("/impeccable teach"));
-
-        // A real prompt is more descriptive than the command that opened the
-        // conversation, so it takes over.
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"look for sloppy frontend bits"},
-                    "timestamp":"2026-08-16T17:40:00Z"}),
-        );
-        assert_eq!(meta.display_title(), Some("look for sloppy frontend bits"));
-    }
-
-    #[test]
-    fn custom_title_wins_over_generated_titles() {
-        let mut meta = Meta::default();
-
-        apply(
-            &mut meta,
-            &json!({"type":"custom-title","customTitle":"platform api architecture"}),
-        );
-        assert_eq!(meta.display_title(), Some("platform api architecture"));
-        assert!(!meta.has_content);
-
-        apply(
+        // Claude's first stab at a title, before it has a better one.
+        apply_title(&mut meta, &json!({"type":"summary","summary":"Reviewing an API"}));
+        assert_eq!(meta.display_title(), Some("Reviewing an API"));
+        apply_title(
             &mut meta,
             &json!({"type":"ai-title","aiTitle":"Generated architecture review"}),
         );
+        assert_eq!(meta.display_title(), Some("Generated architecture review"));
+
+        // `/rename` outranks it, and a later regenerated title cannot take it
+        // back.
+        apply_title(
+            &mut meta,
+            &json!({"type":"custom-title","customTitle":"platform api architecture"}),
+        );
+        apply_title(&mut meta, &json!({"type":"ai-title","aiTitle":"Something else"}));
         assert_eq!(meta.display_title(), Some("platform api architecture"));
-    }
 
-    /// A conversation driven purely by slash commands has no free-text prompt
-    /// and often never gets a generated title; the first command that reached
-    /// the model stands in. Local commands (their `<local-command-stdout>`
-    /// follows immediately) never name the conversation.
-    #[test]
-    fn command_only_conversation_falls_back_to_the_command_that_reached_the_model() {
-        let mut meta = Meta::default();
-
-        // /model runs locally: caveat, command, stdout.
-        apply(
-            &mut meta,
-            &json!({"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>…</local-command-caveat>"}}),
-        );
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":
-                "<command-name>/model</command-name>\n<command-args>fable</command-args>"}}),
-        );
-        assert_eq!(meta.display_title(), Some("/model fable"));
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"<local-command-stdout>Set model</local-command-stdout>"}}),
-        );
-        assert_eq!(meta.display_title(), None);
-
-        // /user-story goes to the model (tag order varies) and gets pinned by
-        // the assistant reply.
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":
-                "<command-message>user-story</command-message>\n<command-name>/user-story</command-name>"}}),
-        );
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","message":{"stop_reason":"end_turn"},
-                    "timestamp":"2026-07-08T10:00:10Z"}),
-        );
-        assert_eq!(meta.display_title(), Some("/user-story"));
-        assert_eq!(meta.first_command.as_deref(), Some("/user-story"));
-
-        // A later local command must not withdraw the pinned name…
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"<local-command-stdout>usage</local-command-stdout>"}}),
-        );
-        assert_eq!(meta.display_title(), Some("/user-story"));
-
-        // …and a real prompt still outranks it.
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"actually, do this"},
-                    "timestamp":"2026-07-08T10:01:00Z"}),
-        );
-        assert_eq!(meta.display_title(), Some("actually, do this"));
-    }
-
-    /// ADR-0003: a record's cwd follows every Bash `cd` the agent makes, so
-    /// it only counts when the transcript file's location vouches for it —
-    /// the mangled cwd must name the directory the file sits in. Anything
-    /// else (a shell standing in a subdirectory) must not move the
-    /// conversation.
-    #[test]
-    fn cwd_counts_only_when_the_files_location_vouches_for_it() {
-        let mut meta = Meta {
-            project_dir_name: Some(mangled("/work/HRM/benchmark")),
+        // The prompt the hooks recorded is only a stand-in until a real title
+        // exists, never an override of one.
+        let mut fresh = Meta {
+            first_prompt: Some("fix the sidebar".to_string()),
             ..Meta::default()
         };
-
-        apply(
-            &mut meta,
-            &json!({"type":"user","cwd":"/work/HRM/benchmark",
-                    "message":{"content":"start"},
-                    "timestamp":"2026-07-08T10:00:00Z"}),
-        );
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
-
-        // The agent cd:s into a subdirectory to build — records now stamp
-        // the subdir, but the transcript file has not moved: not a
-        // relocation. This was the bug that scattered benchmark
-        // conversations across their .NET project folders.
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","cwd":"/work/HRM/benchmark/Flex.Net",
-                    "message":{"stop_reason":"end_turn"},
-                    "timestamp":"2026-07-08T10:01:00Z"}),
-        );
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
-
-        // A record with no cwd (generated title) leaves it untouched.
-        apply(&mut meta, &json!({"type":"ai-title","aiTitle":"a title"}));
-        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/HRM/benchmark")));
+        assert_eq!(fresh.display_title(), Some("fix the sidebar"));
+        apply_title(&mut fresh, &json!({"type":"ai-title","aiTitle":"Sidebar fixes"}));
+        assert_eq!(fresh.display_title(), Some("Sidebar fixes"));
     }
 
     /// The two things that keep startup off the transcripts: a conversation
@@ -1036,27 +629,20 @@ mod tests {
         // SAFETY: this is the only test that touches the environment.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
 
-        let prompt = |text: &str, ts: &str| {
-            json!({"type":"user","cwd":"/work/app","message":{"content":text},
-                   "timestamp":ts})
-            .to_string()
-        };
+        let title = |text: &str| json!({"type":"ai-title","aiTitle":text}).to_string();
         let id = "conv-cached";
         let cwd = "/work/app";
         let dir = root.join(mangled(cwd));
         std::fs::create_dir_all(&dir).unwrap();
         let transcript = dir.join(format!("{id}.jsonl"));
-        std::fs::write(
-            &transcript,
-            format!("{}\n", prompt("first", "2026-07-08T10:00:00Z")),
-        )
-        .unwrap();
+        std::fs::write(&transcript, format!("{}\n", title("first"))).unwrap();
 
         let hidden = Known {
             visible: false,
             ..Known::shown(id, cwd)
         };
-        let mut store = Store::with(root.clone(), locate_jsonl, apply).cached_as("test-cache");
+        let mut store =
+            Store::with(root.clone(), locate_jsonl, apply_title).cached_as("test-cache");
         store.refresh(std::slice::from_ref(&hidden)).unwrap();
         assert!(
             store.meta(id).is_none(),
@@ -1066,17 +652,10 @@ mod tests {
         // Shown, it is parsed — and stays up to date once hidden again, since
         // that only costs a stat.
         store.refresh(&[Known::shown(id, cwd)]).unwrap();
-        assert_eq!(
-            store.meta(id).unwrap().first_prompt.as_deref(),
-            Some("first")
-        );
+        assert_eq!(store.meta(id).unwrap().title.as_deref(), Some("first"));
         std::fs::write(
             &transcript,
-            format!(
-                "{}\n{}\n",
-                prompt("first", "2026-07-08T10:00:00Z"),
-                json!({"type":"ai-title","aiTitle":"a title"}),
-            ),
+            format!("{}\n{}\n", title("first"), title("a title")),
         )
         .unwrap();
         store.refresh(std::slice::from_ref(&hidden)).unwrap();
@@ -1086,7 +665,8 @@ mod tests {
         // A fresh store — the next corc start — knows the conversation before
         // it has read a single byte, and picks up from where the last one
         // stopped.
-        let mut restarted = Store::with(root.clone(), locate_jsonl, apply).cached_as("test-cache");
+        let mut restarted =
+            Store::with(root.clone(), locate_jsonl, apply_title).cached_as("test-cache");
         assert_eq!(
             restarted.meta(id).unwrap().title.as_deref(),
             Some("a title"),
@@ -1097,13 +677,13 @@ mod tests {
             .open(&transcript)
             .map(|mut f| {
                 use std::io::Write;
-                writeln!(f, "{}", prompt("second", "2026-07-08T10:05:00Z")).unwrap();
+                writeln!(f, "{}", json!({"type":"custom-title","customTitle":"renamed"})).unwrap();
             })
             .unwrap();
         restarted.refresh(&[Known::shown(id, cwd)]).unwrap();
         let meta = restarted.meta(id).unwrap();
         assert_eq!(meta.title.as_deref(), Some("a title"));
-        assert_eq!(meta.turn_started_at, parse_iso8601("2026-07-08T10:05:00Z"));
+        assert_eq!(meta.display_title(), Some("renamed"));
 
         // A conversation corc no longer owns leaves the cache with it.
         restarted.refresh(&[]).unwrap();
@@ -1113,168 +693,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// The whole relocation story against real files: a Bash `cd` into a
-    /// subdirectory never moves the conversation, a real `/cd` (the
-    /// transcript file moves and new records match its new home) does, and a
-    /// Conversation.cwd that drifted wrong self-repairs — the Store keeps
-    /// reporting the confirmed directory whatever cwd it is refreshed with.
-    #[test]
-    fn relocation_follows_the_file_and_repairs_drift() {
-        let root = std::env::temp_dir().join("corc-test-relocation-store");
-        let _ = std::fs::remove_dir_all(&root);
-        let record = |cwd: &str, ts: &str| {
-            json!({"type":"user","cwd":cwd,"message":{"content":"x"},
-                   "timestamp":ts})
-            .to_string()
-        };
-
-        let id = "conv-1";
-        let home = "/work/HRM/benchmark";
-        let sub = "/work/HRM/benchmark/Flex.Net";
-        let dir = root.join(mangled(home));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("{id}.jsonl")),
-            format!(
-                "{}\n{}\n",
-                record(home, "2026-07-08T10:00:00Z"),
-                record(sub, "2026-07-08T10:01:00Z"),
-            ),
-        )
-        .unwrap();
-
-        let mut store = Store::with(root.clone(), locate_jsonl, apply);
-        let known = vec![Known::shown(id, home)];
-        store.refresh(&known).unwrap();
-        // The shell stood in the subdir, but the conversation lives at home.
-        assert_eq!(
-            store.meta(id).unwrap().cwd.as_deref(),
-            Some(Path::new(home))
-        );
-
-        // Even asked with a drifted cwd (state damaged by the old bug), the
-        // uuid fallback finds the file and the confirmed cwd repairs it.
-        let mut drifted = Store::with(root.clone(), locate_jsonl, apply);
-        drifted.refresh(&[Known::shown(id, sub)]).unwrap();
-        assert_eq!(
-            drifted.meta(id).unwrap().cwd.as_deref(),
-            Some(Path::new(home))
-        );
-
-        // A real /cd: the file moves and new records stamp the new home.
-        let new_home = "/work/HRM/feature-x";
-        let new_dir = root.join(mangled(new_home));
-        std::fs::create_dir_all(&new_dir).unwrap();
-        let new_path = new_dir.join(format!("{id}.jsonl"));
-        std::fs::rename(dir.join(format!("{id}.jsonl")), &new_path).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&new_path)
-            .unwrap();
-        use std::io::Write;
-        writeln!(file, "{}", record(new_home, "2026-07-08T10:02:00Z")).unwrap();
-
-        // First refresh notices the old path vanished, the next re-locates.
-        store.refresh(&known).unwrap();
-        store.refresh(&known).unwrap();
-        assert_eq!(
-            store.meta(id).unwrap().cwd.as_deref(),
-            Some(Path::new(new_home))
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A Ctrl+C interrupt is written as a user record (with an
-    /// `interruptedMessageId`) but no end_turn / turn_duration follows, so it
-    /// must complete the turn itself — otherwise the state stays Running.
-    #[test]
-    fn interrupt_completes_turn() {
-        let mut meta = Meta::default();
-
-        // A prompt starts a turn, assistant works…
-        apply(
-            &mut meta,
-            &json!({"type":"user","message":{"content":"do the thing"},
-                    "timestamp":"2026-07-08T10:01:00Z"}),
-        );
-        apply(
-            &mut meta,
-            &json!({"type":"assistant","message":{"stop_reason":"tool_use"},
-                    "timestamp":"2026-07-08T10:01:30Z"}),
-        );
-        assert_eq!(meta.turn_state, TurnState::Mid);
-
-        // …then Ctrl+C. The interrupt record ends the turn.
-        apply(
-            &mut meta,
-            &json!({"type":"user",
-                    "message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]},
-                    "interruptedMessageId":"msg_015bfD7CH2nhHASfMRsjVfT4",
-                    "timestamp":"2026-07-08T10:02:00Z"}),
-        );
-        assert_eq!(meta.turn_state, TurnState::Complete);
-        assert_eq!(
-            meta.turn_completed_at,
-            parse_iso8601("2026-07-08T10:02:00Z")
-        );
-        // The interrupt is not a prompt: it never becomes the title stand-in.
-        assert_eq!(meta.first_prompt.as_deref(), Some("do the thing"));
-    }
-
-    #[test]
-    fn ask_user_question_stays_active_until_its_matching_answer() {
-        let mut meta = Meta::default();
-
-        apply(
-            &mut meta,
-            &json!({
-                "type":"assistant",
-                "message":{
-                    "stop_reason":"tool_use",
-                    "content":[{
-                        "type":"tool_use",
-                        "id":"question-1",
-                        "name":"AskUserQuestion",
-                        "input":{"questions":[]}
-                    }]
-                },
-                "timestamp":"2026-07-08T10:02:00Z"
-            }),
-        );
-        assert!(meta.active_question);
-        assert_eq!(
-            meta.question_asked_at,
-            parse_iso8601("2026-07-08T10:02:00Z")
-        );
-
-        // An unrelated tool result must not dismiss the question.
-        apply(
-            &mut meta,
-            &json!({
-                "type":"user",
-                "toolUseResult":{},
-                "message":{"content":[{
-                    "type":"tool_result",
-                    "tool_use_id":"some-other-tool"
-                }]}
-            }),
-        );
-        assert!(meta.active_question);
-
-        apply(
-            &mut meta,
-            &json!({
-                "type":"user",
-                "toolUseResult":{},
-                "message":{"content":[{
-                    "type":"tool_result",
-                    "tool_use_id":"question-1",
-                    "content":"selected option 1"
-                }]}
-            }),
-        );
-        assert!(!meta.active_question);
-        assert_eq!(meta.question_asked_at, None);
-    }
 }

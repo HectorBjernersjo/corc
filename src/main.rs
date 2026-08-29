@@ -3,6 +3,7 @@ mod browser;
 mod cd;
 mod discovery;
 mod doctor;
+mod hooks;
 mod kitty;
 mod picker;
 mod projects;
@@ -50,6 +51,14 @@ fn main() -> Result<()> {
             None => open(),
         },
         Some("list") => list(),
+        // Private entry point, like `__tui`: what Claude runs at each point in
+        // its own loop (ADR-0004). It reads one payload on stdin and always
+        // succeeds — this executes inside the user's agent, where a corc
+        // failure must never become their problem.
+        Some("__hook") => {
+            let _ = hooks::ingest();
+            Ok(())
+        }
         Some("doctor") => doctor::run(),
         // Reachable from inside an agent pane, which is the point: it toggles
         // the browser view for the conversation you are talking to without a
@@ -96,7 +105,7 @@ Commands:
   list     List every conversation corc owns
   browser  Toggle this conversation's browser view [on|off]
   cd DIR   Move this conversation to DIR (corc types the agent's /cd for you)
-  doctor   Check tmux, agents, PATH, and state access
+  doctor   Check tmux, agents, PATH, state access, and Claude's hooks
   help     Print this help
 
 Running corc without a command is the same as `corc open`.
@@ -345,14 +354,9 @@ fn list() -> Result<()> {
         println!("\n{}", display_dir(project));
         for conv in convs {
             let meta = store.meta(&conv.id);
-            let live_pane = conv.pane_id.as_deref().and_then(|pane| panes.get(pane));
-            let alive = live_pane.is_some();
-            let runtime = conv.pane_id.as_deref().and_then(|id| {
-                provider::pane_hint(provider::by_id(&conv.provider), id, panes.get(id)?, meta)
-            });
-            let s = status::derive_with_runtime(
+            let alive = conv.pane_id.as_deref().is_some_and(|pane| panes.contains_key(pane));
+            let s = status::derive(
                 alive,
-                runtime,
                 meta,
                 conv.last_viewed,
                 false,

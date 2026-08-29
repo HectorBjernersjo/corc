@@ -6,10 +6,9 @@
 //! The agent cannot relocate itself — `/cd` is user-only on the agent's side
 //! — so it runs `corc cd <dir>` and corc's TUI does the typing. Input typed
 //! into a running agent queues and executes when the turn ends, so timing
-//! never matters. State is not touched here: `Conversation.cwd` follows the
-//! transcript once the move has actually happened (`discovery::Meta::cwd`),
-//! so a declined trust prompt or a failed `/cd` leaves everything where it
-//! was.
+//! never matters. The row moves as soon as `/cd` is typed, and the agent's
+//! own report settles it (`state::Conversation::settled_cwd`): a declined
+//! trust prompt or a failed `/cd` puts it back at the next prompt.
 
 use crate::{provider, state, tmux};
 use anyhow::{Context, Result, bail};
@@ -85,23 +84,36 @@ pub fn canonical_dir(dir: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// What one refresh's worth of requests did.
+#[derive(Default)]
+pub struct Applied {
+    /// A row moved, so state.json needs writing.
+    pub moved: bool,
+    /// A message for the status line when something could not be delivered.
+    pub failure: Option<String>,
+}
+
 /// The TUI's half of the handover, run once per refresh: type each pending
-/// request's relocation command into its conversation's pane and empty the
-/// mailbox. Returns a message for the status line when something could not be
-/// delivered. Best-effort like the browser mailbox — a dropped request costs
-/// one `corc cd`, a stuck one would retry into the wrong turn forever.
-pub fn apply_requests(state: &state::State) -> Option<String> {
-    let path = mailbox().ok()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let mut failure = None;
+/// request's relocation command into its conversation's pane, move the row
+/// there optimistically, and empty the mailbox. Best-effort like the browser
+/// mailbox — a dropped request costs one `corc cd`, a stuck one would retry
+/// into the wrong turn forever.
+pub fn apply_requests(state: &mut state::State, now: u64) -> Applied {
+    let mut applied = Applied::default();
+    let Some(text) = mailbox().ok().and_then(|path| {
+        let text = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        Some(text)
+    }) else {
+        return applied;
+    };
     for (id, dir) in parse_requests(&text) {
         match deliver(state, &id, &dir) {
-            Ok(()) => {}
-            Err(e) => failure = Some(format!("corc cd: {e:#}")),
+            Ok(()) => applied.moved |= state.request_relocation(&id, &dir, now),
+            Err(e) => applied.failure = Some(format!("corc cd: {e:#}")),
         }
     }
-    failure
+    applied
 }
 
 fn deliver(state: &state::State, id: &str, dir: &Path) -> Result<()> {

@@ -2,7 +2,7 @@
 //! It checks tmux compatibility, agent binaries, PATH visibility and whether
 //! the persistent state can be read and written.
 
-use crate::{picker, provider, state, tmux};
+use crate::{hooks, picker, provider, state, tmux};
 use anyhow::{Result, bail};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ pub fn run() -> Result<()> {
     check_state(&mut errors);
     check_directories(&mut warnings);
     check_browser_view(&mut warnings);
+    check_claude_hooks(&mut warnings);
 
     println!();
     if errors > 0 {
@@ -38,6 +39,33 @@ pub fn run() -> Result<()> {
         println!("[ok] all checks passed");
     }
     Ok(())
+}
+
+/// Claude reports what it is doing by running `corc __hook` (ADR-0004), so the
+/// sidebar is only as good as that round trip. Nothing here can prove Claude
+/// will run the hook — that is settled per pane at spawn time — but a settings
+/// file corc cannot write, or an ingest that drops what it is handed, makes
+/// every Claude conversation read as idle forever, and neither says a word on
+/// its own.
+fn check_claude_hooks(warnings: &mut usize) {
+    let settings = match hooks::settings_file() {
+        Ok(path) => path,
+        Err(e) => {
+            warn("claude hooks", &format!("settings file cannot be written: {e}"));
+            *warnings += 1;
+            return;
+        }
+    };
+    match hooks::self_test() {
+        Ok(()) => ok(
+            "claude hooks",
+            &format!("{} installs them per pane", settings.display()),
+        ),
+        Err(e) => {
+            warn("claude hooks", &format!("events are not being recorded: {e}"));
+            *warnings += 1;
+        }
+    }
 }
 
 /// The browser view (D24) has three external requirements, none of which corc

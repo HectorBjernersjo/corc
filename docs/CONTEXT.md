@@ -14,11 +14,16 @@ _Avoid_: chat, task
 **Relocation** (`corc cd`, ADR-0003):
 A conversation moving to another directory. The agent runs `corc cd <dir>`
 from its own pane; the TUI types the provider's relocation command (Claude
-Code's `/cd`) into that pane. `Conversation.cwd` is never updated
-optimistically — it follows the latest record cwd that the transcript
-file's own location vouches for (record cwds alone track Bash `cd` into
-subdirectories; only `/cd` moves the file). This also follows a `/cd` the
-user typed by hand, and self-repairs a drifted `Conversation.cwd`.
+Code's `/cd`) into that pane and moves the row at once, provisionally
+(`relocation_requested_at`), since the queued `/cd` runs only when the turn
+ends. The agent's own report settles it: a reported cwd is the shell's and
+follows every `cd` the agent makes, so it counts only when the transcript
+file's own location vouches for it (only `/cd` moves that file), and the
+`relocated` record `/cd` writes into the transcript is read on the same terms.
+A report naming the target confirms; a turn started after the request that
+still names the old directory means `/cd` was refused, and the row goes back.
+The same reports follow a `/cd` the user typed by hand and self-repair a
+drifted `Conversation.cwd`.
 _Avoid_: move (ambiguous with Move mode)
 
 **Hidden session** (`_corc-sessions`):
@@ -107,6 +112,15 @@ _Avoid_: user data dir (Chromium's word for it), session
 **State file**:
 corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
 
+**Hook log** (ADR-0004):
+The append-only record of what a Claude conversation did, one file per session
+under `~/.local/state/corc/hooks/<session-id>.jsonl`. Claude writes it by
+running `corc __hook` at points corc subscribes to with `--settings` on the spawn
+line; corc folds it into turn state, turn timing, open questions and the
+working directory. corc's own file, deleted with the conversation, unlike the
+transcripts under `~/.claude` which are never touched (D1).
+_Avoid_: event stream, journal
+
 **Metadata cache**:
 What a provider's metadata reader parsed, kept beside the **State file** as
 `~/.local/state/corc/meta-<provider>.json` so a corc start reuses it instead of
@@ -121,19 +135,18 @@ _Avoid_: index, database
 ### Conversation states
 
 **Running** (yellow ●):
-A live pane whose agent is working. Claude's animated tmux pane title is the
-live runtime signal; an unrecognized/disabled title falls back to an in-flight
-turn in the provider history. Shows elapsed time since the turn started in one
-largest unit (`4m`, `1h`).
+A live pane whose agent is working: a turn started and has not ended. Shows
+elapsed time since it started in one largest unit (`4m`, `1h`). For Claude this
+is the **Hook log** plus Claude's own live session status, which covers the two
+things no hook reports — a turn interrupted with Esc, and a pane that started
+before corc installed its hooks. A turn whose provider has reported no progress
+for an hour has stalled and settles to Idle.
 
 **Question** (blue ●):
 A live conversation with an active provider question waiting for the user. For
-Claude Code the dialog's own footer line in the pane (`Enter to select · … ·
-Esc to cancel`) is what corc reads, because Claude writes the
-`AskUserQuestion` tool call to the transcript only once it has been answered —
-a transcript that still has an unanswered one is the fallback for panes no
-capture reached. It stays blue even while viewed and shows how long the
-question has been waiting, or the turn's age when only the pane knows.
+Claude Code the `AskUserQuestion` tool call opens it and its result closes it,
+both read from the **Hook log**. It stays blue even while viewed and shows how
+long the question has been waiting.
 
 **Unseen** (blue ●):
 A live pane whose turn completed after the user last viewed it. Shows how long the completed turn ran.
