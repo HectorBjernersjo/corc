@@ -9,6 +9,7 @@ mod picker;
 mod projects;
 mod provider;
 mod repo;
+mod resume;
 mod state;
 mod status;
 mod tmux;
@@ -66,7 +67,8 @@ fn main() -> Result<()> {
         Some("browser") => browser::command(args.get(1).map(String::as_str)),
         // Also reachable from inside an agent pane: the agent prepares a new
         // workspace and asks corc to move its own conversation there
-        // (ADR-0003) — corc's TUI types the provider's `/cd` into the pane.
+        // (ADR-0003). The provider decides whether that also needs a command
+        // typed back into the pane.
         Some("cd") => cd::command(args.get(1).map(String::as_str)),
         Some("-h" | "--help" | "help") => {
             print_help();
@@ -104,7 +106,7 @@ Commands:
            terminal of its own it moves the last-active tmux client
   list     List every conversation corc owns
   browser  Toggle this conversation's browser view [on|off]
-  cd DIR   Move this conversation to DIR (corc types the agent's /cd for you)
+  cd DIR   Move this conversation to DIR
   doctor   Check tmux, agents, PATH, state access, and Claude's hooks
   help     Print this help
 
@@ -354,15 +356,11 @@ fn list() -> Result<()> {
         println!("\n{}", display_dir(project));
         for conv in convs {
             let meta = store.meta(&conv.id);
-            let alive = conv.pane_id.as_deref().is_some_and(|pane| panes.contains_key(pane));
-            let s = status::derive(
-                alive,
-                meta,
-                conv.last_viewed,
-                false,
-                now,
-                conv.created_at,
-            );
+            let alive = conv
+                .pane_id
+                .as_deref()
+                .is_some_and(|pane| panes.contains_key(pane));
+            let s = status::derive(alive, meta, conv.last_viewed, false, now, conv.created_at);
             let title = meta.and_then(|m| m.display_title()).unwrap_or("(untitled)");
             let pane = conv.pane_id.as_deref().unwrap_or("-");
             println!(

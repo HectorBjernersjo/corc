@@ -325,6 +325,15 @@ pub fn spawn_conversation(
     };
     let mut args = base;
     args.extend(["-n", id, "-c", &dir_str, "-P", "-F", "#{pane_id}"]);
+    args.extend(["-e", "CORC_MANAGED=1"]);
+    let cli_config = if provider.id() == "opencode" {
+        Some(crate::resume::opencode_env()?)
+    } else {
+        None
+    };
+    if let Some(config) = &cli_config {
+        args.extend(["-e", config]);
+    }
     // The pane environment is the only thing that varies per conversation all
     // the way down into the agent's own tool calls, which is what gives each
     // conversation its own browser profile (D24). The login shell passes it on
@@ -384,9 +393,9 @@ mod tests {
     #[test]
     fn pane_snapshot_keeps_ids_titles_and_pids() {
         let panes = parse_panes(
-            "%32\t4711\t✳ Review backup restore plan status\n\
-             %43\t4712\t⠂ platform-restore-cleanup-runbook\n\
-             %44\t4713\t\n",
+            "%32\t4711\t\t✳ Review backup restore plan status\n\
+             %43\t4712\t{\"provider\":\"opencode\",\"id\":\"ses_live\"}\t⠂ platform-restore-cleanup-runbook\n\
+             %44\t4713\tmalformed report\t\n",
         );
 
         assert_eq!(
@@ -394,6 +403,7 @@ mod tests {
             Some(&Pane {
                 title: "✳ Review backup restore plan status".into(),
                 pid: 4711,
+                session: None,
             })
         );
         assert_eq!(
@@ -401,6 +411,10 @@ mod tests {
             Some(&Pane {
                 title: "⠂ platform-restore-cleanup-runbook".into(),
                 pid: 4712,
+                session: Some(crate::resume::Session {
+                    provider: "opencode".into(),
+                    id: "ses_live".into(),
+                }),
             })
         );
         // A pane with no title is still a pane — dropping it would read as a
@@ -410,6 +424,7 @@ mod tests {
             Some(&Pane {
                 title: String::new(),
                 pid: 4713,
+                session: None,
             })
         );
     }
@@ -612,8 +627,20 @@ pub fn all_panes() -> Result<HashMap<String, Pane>> {
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{pane_pid}\t#{pane_title}",
+        "#{pane_id}\t#{pane_pid}\t#{@corc-session}\t#{pane_title}",
     ])?))
+}
+
+pub fn report_session(pane: &str, session: &crate::resume::Session) -> Result<()> {
+    tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        "@corc-session",
+        &serde_json::to_string(session)?,
+    ])?;
+    Ok(())
 }
 
 /// A live pane: the terminal title corc reads agent state out of, and the pid
@@ -623,6 +650,7 @@ pub fn all_panes() -> Result<HashMap<String, Pane>> {
 pub struct Pane {
     pub title: String,
     pub pid: u32,
+    pub session: Option<crate::resume::Session>,
 }
 
 fn parse_panes(output: &str) -> HashMap<String, Pane> {
@@ -631,15 +659,17 @@ fn parse_panes(output: &str) -> HashMap<String, Pane> {
         .filter_map(|line| {
             // The title goes last and is the only field that can contain a
             // tab, so it takes whatever remains.
-            let mut fields = line.splitn(3, '\t');
+            let mut fields = line.splitn(4, '\t');
             let id = fields.next()?;
             let pid = fields.next()?.trim().parse().ok()?;
+            let session = crate::resume::Session::parse(fields.next()?);
             let title = fields.next()?;
             Some((
                 id.to_string(),
                 Pane {
                     title: title.to_string(),
                     pid,
+                    session,
                 },
             ))
         })

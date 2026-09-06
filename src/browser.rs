@@ -5,8 +5,9 @@
 //! launches Chromium lazily — nothing starts until the agent's first browser
 //! tool call — and talks to it over `--remote-debugging-pipe`, which no other
 //! process can join. The single thing corc needs is for that Chromium to
-//! *also* listen on a TCP port, which one flag in the Playwright MCP config
-//! arranges (`corc doctor` prints it). Port `0` lets the kernel choose, so
+//! *also* listen on a TCP port, which one flag in a Playwright config file
+//! arranges. corc writes that file and hands Claude a Playwright MCP server
+//! that loads it (`mcp_config_file`). Port `0` lets the kernel choose, so
 //! there is no allocation to coordinate and no per-conversation config file:
 //! Chromium writes the chosen port into `DevToolsActivePort` in its user data
 //! directory, and corc finds both by walking down from the agent pane's pid.
@@ -686,9 +687,6 @@ pub fn command(word: Option<&str>) -> Result<()> {
         None => Request::On,
         Some(word) => Request::parse(word).context("usage: corc browser [on|off]")?,
     };
-    if request.wants_view() {
-        check_ready()?;
-    }
     append_request(&mailbox, &conv.id, request)?;
     println!("browser view: {}", request.word());
     Ok(())
@@ -804,9 +802,10 @@ fn prune_profiles_in(root: &std::path::Path, state: &state::State) {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// The Playwright MCP config corc needs in place. Everything else about the
-/// user's Playwright setup is left alone — this only adds the debugging port.
-pub const PLAYWRIGHT_CONFIG: &str = "{\n  \"browser\": {\n    \"launchOptions\": {\n      \"args\": [\"--remote-debugging-port=0\"]\n    }\n  }\n}\n";
+/// The Playwright config corc starts a user off with: headless, and the
+/// debugging port the browser view needs. Written once and then the user's,
+/// so this is also where an `executablePath` or a `channel` goes.
+pub const PLAYWRIGHT_CONFIG: &str = "{\n  \"browser\": {\n    \"launchOptions\": {\n      \"headless\": true,\n      \"args\": [\"--remote-debugging-port=0\"]\n    }\n  }\n}\n";
 
 pub fn config_path() -> Result<PathBuf> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
@@ -829,75 +828,31 @@ pub fn ensure_config() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The args of every MCP server in Claude Code's config that loads corc's
-/// config file — the only provider whose MCP setup corc can currently inspect.
-/// An unreadable or absent config just reads as nothing wired.
-fn wired_server_args() -> Vec<Vec<String>> {
-    let Ok(path) = config_path() else {
-        return Vec::new();
-    };
-    let Ok(home) = std::env::var("HOME") else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(format!("{home}/.claude.json")) else {
-        return Vec::new();
-    };
-    wired_server_args_in(&raw, &path.to_string_lossy())
+/// The MCP config corc passes to `claude --mcp-config`: one Playwright server
+/// that loads corc's config file, so no one has to wire the debugging port into
+/// their own agent config. Claude merges it over the user's servers, and a
+/// same-named `playwright` of theirs loses to this one rather than running
+/// beside it (verified: one server starts, and it is corc's). Everything about
+/// the browser itself — headless, executable, channel — stays in the config
+/// file, which is the user's to edit.
+pub fn mcp_config_file() -> Result<PathBuf> {
+    let config = ensure_config()?;
+    let path = state::state_dir()?.join("claude-mcp.json");
+    state::write_if_changed(&path, &mcp_config_json(&config))?;
+    Ok(path)
 }
 
-fn wired_server_args_in(raw: &str, config_path: &str) -> Vec<Vec<String>> {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return Vec::new();
-    };
-    let Some(servers) = parsed.get("mcpServers").and_then(|s| s.as_object()) else {
-        return Vec::new();
-    };
-    servers
-        .values()
-        .filter_map(|server| server.get("args")?.as_array())
-        .map(|args| {
-            args.iter()
-                .filter_map(|a| a.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .filter(|args| args.iter().any(|a| a.contains(config_path)))
-        .collect()
-}
-
-/// Whether a Playwright MCP server is configured to load corc's config file.
-pub fn config_is_wired() -> bool {
-    !wired_server_args().is_empty()
-}
-
-/// Whether a wired server also passes `--isolated`. Playwright refuses to
-/// combine that with the profile corc hands it through `PLAYWRIGHT_MCP_USER_DATA_DIR`
-/// — the server exits before any browser exists, and the agent sees
-/// `Failed to reconnect to playwright`.
-pub fn config_is_isolated() -> bool {
-    wired_server_args()
-        .iter()
-        .any(|args| args.iter().any(|a| a == "--isolated"))
-}
-
-pub const ISOLATED_HINT: &str = "the playwright MCP server args carry `--isolated`, which \
-     Playwright rejects together with the per-conversation profile corc supplies; \
-     remove the flag and restart the agent";
-
-/// Fail early with an actionable message rather than opening a pane that can
-/// never show anything.
-pub fn check_ready() -> Result<()> {
-    if !config_is_wired() {
-        let path = ensure_config()?;
-        bail!(
-            "Playwright is not exposing a debugging port. Add `--config {}` \
-             to the playwright MCP server args, then restart the agent.",
-            path.display()
-        );
-    }
-    if config_is_isolated() {
-        bail!("{ISOLATED_HINT}");
-    }
-    Ok(())
+fn mcp_config_json(config: &std::path::Path) -> String {
+    let json = serde_json::json!({
+        "mcpServers": {
+            "playwright": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@playwright/mcp@latest", "--config", config.to_string_lossy()],
+            }
+        }
+    });
+    format!("{}\n", serde_json::to_string_pretty(&json).unwrap())
 }
 
 #[cfg(test)]
@@ -1262,42 +1217,6 @@ mod tests {
         prune_profiles_in(&root.join("nothing-here"), &state);
         let _ = std::fs::remove_dir_all(&root);
     }
-
-    #[test]
-    fn wired_servers_are_found_by_config_path_and_isolated_is_spotted() {
-        let path = "/home/h/.config/corc/playwright.json";
-        let raw = serde_json::json!({
-            "mcpServers": {
-                "playwright": {
-                    "command": "npx",
-                    "args": ["-y", "@playwright/mcp@latest", "--isolated", "--config", path]
-                },
-                "other": { "command": "foo", "args": ["--isolated"] }
-            }
-        })
-        .to_string();
-        let wired = wired_server_args_in(&raw, path);
-        assert_eq!(
-            wired.len(),
-            1,
-            "only the server loading corc's config counts"
-        );
-        assert!(wired[0].iter().any(|a| a == "--isolated"));
-
-        let clean = serde_json::json!({
-            "mcpServers": {
-                "playwright": { "command": "npx", "args": ["-y", "@playwright/mcp@latest", "--config", path] }
-            }
-        })
-        .to_string();
-        let wired = wired_server_args_in(&clean, path);
-        assert_eq!(wired.len(), 1);
-        assert!(!wired[0].iter().any(|a| a == "--isolated"));
-
-        assert!(wired_server_args_in(&raw, "/elsewhere.json").is_empty());
-        assert!(wired_server_args_in("not json", path).is_empty());
-    }
-
     #[test]
     fn the_shipped_config_only_adds_the_debugging_port() {
         let parsed: serde_json::Value = serde_json::from_str(PLAYWRIGHT_CONFIG).unwrap();

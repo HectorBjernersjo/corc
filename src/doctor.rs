@@ -51,7 +51,10 @@ fn check_claude_hooks(warnings: &mut usize) {
     let settings = match hooks::settings_file() {
         Ok(path) => path,
         Err(e) => {
-            warn("claude hooks", &format!("settings file cannot be written: {e}"));
+            warn(
+                "claude hooks",
+                &format!("settings file cannot be written: {e}"),
+            );
             *warnings += 1;
             return;
         }
@@ -62,17 +65,20 @@ fn check_claude_hooks(warnings: &mut usize) {
             &format!("{} installs them per pane", settings.display()),
         ),
         Err(e) => {
-            warn("claude hooks", &format!("events are not being recorded: {e}"));
+            warn(
+                "claude hooks",
+                &format!("events are not being recorded: {e}"),
+            );
             *warnings += 1;
         }
     }
 }
 
-/// The browser view (D24) has three external requirements, none of which corc
-/// can fix on the user's behalf: a terminal that draws images, tmux forwarding
-/// the escapes, and Playwright launching Chromium with a debugging port. All
-/// three are warnings — corc works fine without the view — and the config file
-/// is written here so the remedy is a single line to paste.
+/// The browser view (D24) has two external requirements corc cannot fix on
+/// the user's behalf, a terminal that draws images and tmux forwarding the
+/// escapes, and one it arranges itself: a Playwright launching Chromium with a
+/// debugging port, which Claude gets from the MCP config written here. All are
+/// warnings — corc works fine without the view.
 fn check_browser_view(warnings: &mut usize) {
     let terminal = tmux::client_terminal();
     if terminal.is_unknown() {
@@ -115,30 +121,19 @@ fn check_browser_view(warnings: &mut usize) {
         *warnings += 1;
     }
 
-    match crate::browser::ensure_config() {
-        Ok(path) if crate::browser::config_is_wired() => {
-            ok(
-                "browser view",
-                &format!("playwright loads {}", path.display()),
-            );
-            if crate::browser::config_is_isolated() {
-                warn("browser view", crate::browser::ISOLATED_HINT);
-                *warnings += 1;
-            }
-        }
-        Ok(path) => {
+    match crate::browser::mcp_config_file() {
+        Ok(path) => ok(
+            "browser view",
+            &format!(
+                "{} gives every claude pane a playwright with a debugging port",
+                path.display()
+            ),
+        ),
+        Err(e) => {
             warn(
                 "browser view",
-                &format!(
-                    "playwright is not exposing a debugging port — add `--config {}` \
-                     to its MCP server args",
-                    path.display()
-                ),
+                &format!("the playwright MCP config cannot be written: {e}"),
             );
-            *warnings += 1;
-        }
-        Err(e) => {
-            warn("browser view", &format!("could not write the config: {e}"));
             *warnings += 1;
         }
     }

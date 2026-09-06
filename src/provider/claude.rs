@@ -1,7 +1,8 @@
 //! Claude Code. corc generates the session uuid itself and passes it to
 //! `--session-id` (new) / `--resume` (revive), along with a `--settings` file
 //! that makes Claude report what it is doing through corc's hooks
-//! (`crate::hooks`, ADR-0004).
+//! (`crate::hooks`, ADR-0004) and an `--mcp-config` file that gives it a
+//! Playwright server the browser view can attach to (`crate::browser`).
 //!
 //! Metadata comes from three places, in descending order of how much corc
 //! trusts them. The hook log is the record of what the agent did and is the
@@ -14,7 +15,7 @@
 use super::Provider;
 use crate::discovery;
 use crate::discovery::{Known, Meta, MetaSource, Store, TurnState};
-use crate::{hooks, state, usage};
+use crate::{browser, hooks, state, usage};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -41,20 +42,30 @@ impl Provider for Claude {
         state::new_uuid()
     }
 
-    /// `--settings` is what installs corc's hooks for this pane only. Claude
-    /// merges it over the user's own settings, so their hooks keep running and
-    /// nothing under ~/.claude is written to. A settings file corc cannot
-    /// write is not worth refusing to spawn over: the conversation runs, and
-    /// the sidebar falls back to knowing only whether the pane is alive.
+    /// `--settings` is what installs corc's hooks for this pane only, and
+    /// `--mcp-config` what gives it corc's Playwright server. Claude merges
+    /// both over the user's own config, so their hooks and servers keep
+    /// working and nothing under ~/.claude is written to. A file corc cannot
+    /// write is not worth refusing to spawn over: the conversation runs, the
+    /// sidebar falls back to knowing only whether the pane is alive, and the
+    /// agent gets whatever browser the user wired up themselves.
     fn spawn_args(&self, id: &str, resume: bool) -> Vec<String> {
-        spawn_args(id, resume, hooks::settings_file().ok().as_deref())
+        spawn_args(
+            id,
+            resume,
+            hooks::settings_file().ok().as_deref(),
+            browser::mcp_config_file().ok().as_deref(),
+        )
     }
 
     /// `/cd` (v2.1.169+) relocates the session: transcript, `--resume` lookup
     /// and CLAUDE.md all follow the new directory. It is user-only inside the
     /// agent, which is exactly why corc types it (ADR-0003).
-    fn cd_command(&self, dir: &Path) -> Option<String> {
-        Some(format!("/cd {}", dir.display()))
+    fn relocation(&self, dir: &Path) -> Option<super::Relocation> {
+        Some(super::Relocation::TypeIntoPane(format!(
+            "/cd {}",
+            dir.display()
+        )))
     }
 
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
@@ -85,14 +96,23 @@ impl Provider for Claude {
 }
 
 /// The argv Claude is spawned with. Split out from the trait method so the
-/// settings file is an argument rather than something read from the
+/// generated files are arguments rather than something read from the
 /// environment mid-call.
-fn spawn_args(id: &str, resume: bool, settings: Option<&Path>) -> Vec<String> {
+fn spawn_args(
+    id: &str,
+    resume: bool,
+    settings: Option<&Path>,
+    mcp_config: Option<&Path>,
+) -> Vec<String> {
     let flag = if resume { "--resume" } else { "--session-id" };
     let mut args = vec![flag.to_string(), id.to_string()];
     if let Some(settings) = settings {
         args.push("--settings".to_string());
         args.push(settings.to_string_lossy().into_owned());
+    }
+    if let Some(mcp_config) = mcp_config {
+        args.push("--mcp-config".to_string());
+        args.push(mcp_config.to_string_lossy().into_owned());
     }
     args
 }
@@ -122,12 +142,14 @@ impl MetaSource for ClaudeSource {
                 // started outside corc, has no log — it still has a transcript
                 // worth a title and a live status worth reading. Nothing known
                 // from any source is what means "nothing known".
-                let mut meta = hooks.or(titles).cloned().or_else(|| {
-                    live.contains_key(&k.id).then(Meta::default)
-                })?;
+                let mut meta = hooks
+                    .or(titles)
+                    .cloned()
+                    .or_else(|| live.contains_key(&k.id).then(Meta::default))?;
                 if let Some(titles) = titles {
                     meta.custom_title = titles.custom_title.clone();
                     meta.title = titles.title.clone();
+                    meta.first_prompt = titles.first_prompt.clone().or(meta.first_prompt.take());
                     meta.has_content |= titles.has_content;
                 }
                 // `/cd` fires no hook, so the hook log keeps naming the old
@@ -415,7 +437,10 @@ mod tests {
             status::derive(true, Some(&unhooked), 0, false, 1240, 0),
             Status::Running
         );
-        assert_eq!(status::time_column(Status::Running, Some(&unhooked), 0, 1240), "4m");
+        assert_eq!(
+            status::time_column(Status::Running, Some(&unhooked), 0, 1240),
+            "4m"
+        );
         apply_live_status(&mut unhooked, IDLE, 1300);
         assert_eq!(unhooked.turn_state, TurnState::Complete);
 
@@ -487,13 +512,19 @@ mod tests {
         .unwrap();
         std::fs::write(
             project.join("hooked.jsonl"),
-            format!("{}\n", json!({"type":"ai-title","aiTitle":"Sidebar rewrite"})),
+            format!(
+                "{}\n",
+                json!({"type":"ai-title","aiTitle":"Sidebar rewrite"})
+            ),
         )
         .unwrap();
         // Spawned before hooks existed: a transcript and nothing else.
         std::fs::write(
             project.join("older.jsonl"),
-            format!("{}\n", json!({"type":"custom-title","customTitle":"the old one"})),
+            format!(
+                "{}\n",
+                json!({"type":"custom-title","customTitle":"the old one"})
+            ),
         )
         .unwrap();
 
@@ -565,33 +596,70 @@ mod tests {
         )
         .unwrap();
         source.refresh(&[Known::shown("older", cwd)]).unwrap();
-        assert_eq!(source.meta("older").unwrap().cwd.as_deref(), Some(Path::new(cwd)));
+        assert_eq!(
+            source.meta("older").unwrap().cwd.as_deref(),
+            Some(Path::new(cwd))
+        );
+        // /resume imports a session from another project, before it has any
+        // corc hook history or generated title.
+        std::fs::write(
+            project.join("imported.jsonl"),
+            format!(
+                "{}\n",
+                json!({"type":"user", "cwd":cwd,
+                    "message":{"content":[{"type":"text","text":"An imported conversation"}]}})
+            ),
+        )
+        .unwrap();
+        source
+            .refresh(&[Known::shown("imported", "/another/project")])
+            .unwrap();
+        let imported = source.meta("imported").unwrap();
+        assert_eq!(imported.display_title(), Some("An imported conversation"));
+        assert_eq!(imported.cwd.as_deref(), Some(Path::new(cwd)));
+        assert!(imported.has_content);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Every spawn carries the hook settings, resume included — a revived
-    /// conversation that reported nothing would read as permanently idle. A
-    /// settings file corc could not write is not worth refusing to spawn over.
+    /// Every spawn carries the hook settings and the Playwright server, resume
+    /// included — a revived conversation that reported nothing would read as
+    /// permanently idle. A file corc could not write is not worth refusing to
+    /// spawn over.
     #[test]
-    fn every_spawn_installs_the_hooks() {
+    fn every_spawn_installs_the_hooks_and_the_browser() {
         let settings = Path::new("/state/corc/claude-hooks.json");
+        let mcp = Path::new("/state/corc/claude-mcp.json");
         assert_eq!(
-            spawn_args("uuid", false, Some(settings)),
-            ["--session-id", "uuid", "--settings", "/state/corc/claude-hooks.json"]
+            spawn_args("uuid", false, Some(settings), Some(mcp)),
+            [
+                "--session-id",
+                "uuid",
+                "--settings",
+                "/state/corc/claude-hooks.json",
+                "--mcp-config",
+                "/state/corc/claude-mcp.json"
+            ]
         );
         assert_eq!(
-            spawn_args("uuid", true, Some(settings)),
-            ["--resume", "uuid", "--settings", "/state/corc/claude-hooks.json"]
+            spawn_args("uuid", true, Some(settings), None),
+            [
+                "--resume",
+                "uuid",
+                "--settings",
+                "/state/corc/claude-hooks.json"
+            ]
         );
-        assert_eq!(spawn_args("uuid", true, None), ["--resume", "uuid"]);
+        assert_eq!(spawn_args("uuid", true, None, None), ["--resume", "uuid"]);
     }
 
     #[test]
-    fn cd_command_types_the_slash_command() {
-        assert_eq!(
-            Claude.cd_command(std::path::Path::new("/work/HRM/feature x")),
-            Some("/cd /work/HRM/feature x".to_string())
-        );
+    fn relocation_types_the_slash_command() {
+        let Some(crate::provider::Relocation::TypeIntoPane(command)) =
+            Claude.relocation(std::path::Path::new("/work/HRM/feature x"))
+        else {
+            panic!("Claude should relocate through /cd");
+        };
+        assert_eq!(command, "/cd /work/HRM/feature x");
     }
 
     #[test]

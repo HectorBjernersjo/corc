@@ -70,6 +70,13 @@ impl Provider for Cursor {
         vec!["--resume".to_string(), id.to_string()]
     }
 
+    fn relocation(&self, _dir: &Path) -> Option<super::Relocation> {
+        // The Cursor agent chose this directory before calling `corc cd` and
+        // can use it directly in later tool calls. Cursor has no session-level
+        // `/cd`, so there is nothing to type back into its pane.
+        Some(super::Relocation::BookkeepingOnly)
+    }
+
     fn meta_source(&self) -> Result<Box<dyn MetaSource>> {
         Ok(Box::new(CursorStore::new()?))
     }

@@ -126,6 +126,9 @@ pub fn ingest() -> Result<()> {
     let Some(event) = translate(&payload, state::unix_now()) else {
         return Ok(());
     };
+    if payload["hook_event_name"] == "SessionStart" {
+        let _ = crate::resume::report_claude(session);
+    }
     append(session, &event)
 }
 
@@ -178,9 +181,7 @@ const ASK_TOOL: &str = "AskUserQuestion";
 /// A session id becomes a filename, so it may only be one. Claude's are
 /// uuids; anything else is dropped rather than sanitized.
 fn is_session_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn append(session: &str, event: &Event) -> Result<()> {
@@ -257,14 +258,7 @@ fn locate(root: &Path, _cwd: &Path, id: &str) -> Option<PathBuf> {
 /// Settings merge, so the user's own hooks in ~/.claude keep running.
 pub fn settings_file() -> Result<PathBuf> {
     let path = state::state_dir()?.join("claude-hooks.json");
-    let wanted = settings_json(&crate::self_exe());
-    if fs::read_to_string(&path).ok().as_deref() != Some(wanted.as_str()) {
-        let dir = path.parent().context("state dir has no parent")?;
-        fs::create_dir_all(dir)?;
-        let tmp = dir.join("claude-hooks.json.tmp");
-        fs::write(&tmp, &wanted)?;
-        fs::rename(&tmp, &path)?;
-    }
+    state::write_if_changed(&path, &settings_json(&crate::self_exe()))?;
     Ok(path)
 }
 
@@ -382,7 +376,10 @@ mod tests {
             ..Meta::default()
         };
 
-        apply(&mut meta, &serde_json::to_value(translate(&ask, 700).unwrap()).unwrap());
+        apply(
+            &mut meta,
+            &serde_json::to_value(translate(&ask, 700).unwrap()).unwrap(),
+        );
         assert!(meta.active_question);
         assert_eq!(meta.question_asked_at, Some(700));
         assert_eq!(
@@ -405,7 +402,8 @@ mod tests {
     /// Tool calls are what keep a long turn from ageing out as stalled.
     #[test]
     fn tool_calls_keep_a_long_turn_running() {
-        let tool = payload(r#"{"session_id":"x","hook_event_name":"PostToolUse","tool_name":"Read"}"#);
+        let tool =
+            payload(r#"{"session_id":"x","hook_event_name":"PostToolUse","tool_name":"Read"}"#);
         let mut meta = Meta {
             turn_state: TurnState::Mid,
             turn_started_at: Some(0),
@@ -417,7 +415,10 @@ mod tests {
             status::derive(true, Some(&meta), 0, false, 7200, 0),
             Status::Idle
         );
-        apply(&mut meta, &serde_json::to_value(translate(&tool, 7100).unwrap()).unwrap());
+        apply(
+            &mut meta,
+            &serde_json::to_value(translate(&tool, 7100).unwrap()).unwrap(),
+        );
         assert_eq!(
             status::derive(true, Some(&meta), 0, false, 7200, 0),
             Status::Running
@@ -457,7 +458,10 @@ mod tests {
 
         // `/cd` is the one thing that moves the transcript file, and that is
         // the one thing that relocates the conversation.
-        let relocated = home("/work/other", "/home/h/.claude/projects/-work-other/x.jsonl");
+        let relocated = home(
+            "/work/other",
+            "/home/h/.claude/projects/-work-other/x.jsonl",
+        );
         apply(
             &mut meta,
             &serde_json::to_value(translate(&relocated, 3).unwrap()).unwrap(),
@@ -469,8 +473,14 @@ mod tests {
     /// future Claude, are dropped rather than guessed at.
     #[test]
     fn unknown_payloads_are_dropped() {
-        assert_eq!(translate(&payload(r#"{"hook_event_name":"SessionEnd"}"#), 1), None);
-        assert_eq!(translate(&payload(r#"{"hook_event_name":"WhateverNext"}"#), 1), None);
+        assert_eq!(
+            translate(&payload(r#"{"hook_event_name":"SessionEnd"}"#), 1),
+            None
+        );
+        assert_eq!(
+            translate(&payload(r#"{"hook_event_name":"WhateverNext"}"#), 1),
+            None
+        );
         assert_eq!(translate(&payload("{}"), 1), None);
 
         // A line the current corc does not understand leaves metadata alone.
@@ -501,7 +511,10 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(command, "'/home/a b/.local/bin/corc' __hook");
-        assert_eq!(parsed["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion");
+        assert_eq!(
+            parsed["hooks"]["PreToolUse"][0]["matcher"],
+            "AskUserQuestion"
+        );
         assert_eq!(parsed["hooks"]["PostToolUse"][0]["matcher"], "*");
         assert!(parsed["hooks"]["UserPromptSubmit"][0]["matcher"].is_null());
     }

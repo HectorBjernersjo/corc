@@ -196,7 +196,7 @@ struct Cache {
     files: HashMap<String, FileState>,
 }
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// Incrementally parsed metadata for the conversations corc owns.
 pub struct Store {
@@ -221,7 +221,10 @@ impl Store {
     /// written nowhere but here.
     pub fn titles() -> Result<Self> {
         let home = std::env::var("HOME").context("HOME not set")?;
-        Ok(Self::titles_in(PathBuf::from(home).join(".claude/projects")).cached_as("claude-titles"))
+        Ok(
+            Self::titles_in(PathBuf::from(home).join(".claude/projects"))
+                .cached_as("claude-titles"),
+        )
     }
 
     /// The same reader over another transcript root, uncached, for tests.
@@ -451,6 +454,26 @@ fn parse_from(
 /// left.
 fn apply_title(meta: &mut Meta, v: &Value) {
     match v["type"].as_str() {
+        Some("user") if v["isSidechain"] != true && v["isMeta"] != true => {
+            // Imported sessions may predate corc's hooks. The transcript gives
+            // them a prompt title and a candidate home, verified against its
+            // project directory by ClaudeSource before it can move a row.
+            let content = &v["message"]["content"];
+            meta.has_content |= content.is_string() || content.is_array();
+            let text = content.as_str().or_else(|| {
+                content.as_array()?.iter().find_map(|block| {
+                    (block["type"] == "text")
+                        .then(|| block["text"].as_str())
+                        .flatten()
+                })
+            });
+            if meta.first_prompt.is_none() {
+                meta.first_prompt = text.and_then(title_line);
+            }
+            if meta.cwd.is_none() {
+                meta.cwd = v["cwd"].as_str().map(PathBuf::from);
+            }
+        }
         // `/cd` fires no hook, so until the next prompt this record is the
         // only word of the move. Claude writes it just before it moves the
         // file, and the file's new location is what confirms it
@@ -588,7 +611,10 @@ mod tests {
         let mut meta = Meta::default();
 
         // Claude's first stab at a title, before it has a better one.
-        apply_title(&mut meta, &json!({"type":"summary","summary":"Reviewing an API"}));
+        apply_title(
+            &mut meta,
+            &json!({"type":"summary","summary":"Reviewing an API"}),
+        );
         assert_eq!(meta.display_title(), Some("Reviewing an API"));
         apply_title(
             &mut meta,
@@ -602,7 +628,10 @@ mod tests {
             &mut meta,
             &json!({"type":"custom-title","customTitle":"platform api architecture"}),
         );
-        apply_title(&mut meta, &json!({"type":"ai-title","aiTitle":"Something else"}));
+        apply_title(
+            &mut meta,
+            &json!({"type":"ai-title","aiTitle":"Something else"}),
+        );
         assert_eq!(meta.display_title(), Some("platform api architecture"));
 
         // The prompt the hooks recorded is only a stand-in until a real title
@@ -612,7 +641,10 @@ mod tests {
             ..Meta::default()
         };
         assert_eq!(fresh.display_title(), Some("fix the sidebar"));
-        apply_title(&mut fresh, &json!({"type":"ai-title","aiTitle":"Sidebar fixes"}));
+        apply_title(
+            &mut fresh,
+            &json!({"type":"ai-title","aiTitle":"Sidebar fixes"}),
+        );
         assert_eq!(fresh.display_title(), Some("Sidebar fixes"));
     }
 
@@ -677,7 +709,12 @@ mod tests {
             .open(&transcript)
             .map(|mut f| {
                 use std::io::Write;
-                writeln!(f, "{}", json!({"type":"custom-title","customTitle":"renamed"})).unwrap();
+                writeln!(
+                    f,
+                    "{}",
+                    json!({"type":"custom-title","customTitle":"renamed"})
+                )
+                .unwrap();
             })
             .unwrap();
         restarted.refresh(&[Known::shown(id, cwd)]).unwrap();
@@ -692,5 +729,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&state);
     }
-
 }

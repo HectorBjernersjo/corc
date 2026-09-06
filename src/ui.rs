@@ -3,8 +3,8 @@
 //! currently viewed conversation's agent pane, swapped in from the hidden
 //! session (ADR-0001).
 
-use crate::hooks;
 use crate::discovery::Known;
+use crate::hooks;
 use crate::provider::{self, MetaStore};
 use crate::repo;
 use crate::state::{self, State};
@@ -985,8 +985,8 @@ impl App {
         }
 
         // Relocation requests from `corc cd`, run from inside an agent pane:
-        // type the provider's `/cd` into that pane and move the row now
-        // (ADR-0003). The agent's own report settles the move below.
+        // Cursor only moves the row; Claude also receives `/cd` in its pane
+        // and reports where the session ended up (ADR-0003).
         let applied = cd::apply_requests(&mut self.state, state::unix_now());
         dirty |= applied.moved;
         if let Some(msg) = applied.failure {
@@ -1048,6 +1048,12 @@ impl App {
         // session id — state row, hidden window and viewed pointer together —
         // before the metadata refresh, so meta starts flowing under the new
         // key in the same tick.
+        let resumed = panes
+            .as_ref()
+            .and_then(|panes| self.follow_resumed_sessions(panes));
+        if resumed.is_some() {
+            dirty = true;
+        }
         if self.resolve_pending_ids() {
             dirty = true;
         }
@@ -1082,11 +1088,9 @@ impl App {
             }
         }
 
-        // A conversation the agent reports as living somewhere else — a
-        // `/cd` typed by the user, or corc's own `corc cd` confirmed or
-        // refused — is re-homed there (ADR-0003). The agent is the authority
-        // on where a conversation lives; the sidebar, digit jump and real
-        // session all follow the recorded cwd.
+        // Follow the provider's session directory, including OpenCode's
+        // session_move and Claude's /cd (ADR-0003). Cursor's bookkeeping-only
+        // move has no provider cwd to settle.
         let moves: Vec<(String, PathBuf)> = self
             .state
             .conversations
@@ -1157,6 +1161,72 @@ impl App {
         self.sync_browser_pane();
 
         self.rebuild_keeping_selection();
+        if let Some(id) = resumed
+            && self.viewed.as_deref() == Some(id.as_str())
+            && let Some(pos) = item_pos(&self.items, &id)
+        {
+            self.selected = pos;
+        }
+    }
+
+    fn follow_resumed_sessions(&mut self, panes: &HashMap<String, tmux::Pane>) -> Option<String> {
+        let mut changed = None;
+        for (pane, info) in panes {
+            let Some(session) = &info.session else {
+                continue;
+            };
+            let Some(old) = self
+                .state
+                .conversations
+                .iter()
+                .find(|c| c.pane_id.as_deref() == Some(pane) && c.provider == session.provider)
+                .cloned()
+            else {
+                continue;
+            };
+            if old.id == session.id {
+                continue;
+            }
+            let target = self.state.conversation(&session.id).cloned();
+            if target
+                .as_ref()
+                .is_some_and(|c| c.provider != session.provider)
+            {
+                continue;
+            }
+            // If the duplicate is on screen, park it before removing its window
+            // so the content placeholder stays alive.
+            let target_viewed = self.viewed.as_deref() == Some(&session.id);
+            if target_viewed {
+                self.park();
+            }
+            if let Some(other) = target.and_then(|c| c.pane_id)
+                && other != *pane
+                && tmux::pane_exists(&other)
+                && let Err(e) = tmux::kill_pane(&other)
+            {
+                self.status_msg = Some(e.to_string());
+                continue;
+            }
+            // A dead destination may still have a placeholder window left over.
+            let _ = tmux::kill_hidden_window(&session.id);
+            if let Err(e) = tmux::rename_hidden_window(&old.id, &session.id) {
+                self.status_msg = Some(e.to_string());
+                continue;
+            }
+            self.state.resume_in_pane(pane, session);
+            if self.viewed.as_deref() == Some(&old.id) {
+                self.viewed = Some(session.id.clone());
+            }
+            if target_viewed {
+                self.status_msg = self.view(&session.id).err().map(|e| e.to_string());
+            }
+            if self.is_empty_conversation(&old.id) {
+                self.mark_pending_discard(old.id);
+            }
+            changed = Some(session.id.clone());
+        }
+        changed
     }
 
     /// Rebuild the top panel, keeping its cursor on the same conversation. A
@@ -2052,7 +2122,6 @@ impl App {
         match (wanted, self.browser_pane.clone()) {
             (true, None) => {
                 let result = (|| -> Result<()> {
-                    browser::check_ready()?;
                     if !tmux::passthrough_enabled() {
                         anyhow::bail!(
                             "tmux swallows image escapes; add `set -g allow-passthrough on` to tmux.conf"

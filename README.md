@@ -158,6 +158,22 @@ the same Running, Unseen, Idle, and Dead states across providers, plus a blue
 Question state where the provider exposes structured interactive questions. An untouched Codex or OpenCode conversation stays
 `(untitled)` until the CLI creates its real session on the first prompt.
 
+### Resuming inside an agent
+
+Running `/resume` in a corc-managed Claude Code or OpenCode pane updates corc
+to the selected conversation, including its title and project directory.
+Conversations started outside corc are added when you resume them here. The
+previous conversation stays in history and can be reopened with Enter.
+
+If the selected conversation already has a live corc pane, the pane where you
+ran `/resume` takes over and corc closes the older pane. Pins and browser-view
+preferences stay with the conversation.
+
+Claude reports the switch through its session-start hook. OpenCode gets a
+small CLI plugin through its pane environment; corc keeps the generated plugin
+in its own state directory. Restart existing agent panes after upgrading corc
+to enable this reporting.
+
 ### Browser view
 
 `b` opens a pane beside the agent showing, live, whatever page it is driving
@@ -205,17 +221,21 @@ It needs three things, all checked by `corc doctor`:
    pane blank — verified on Windows 11 25H2 (26200), so being up to date is not
    enough. Both files ship with Windows Terminal and with wezterm.
 2. `set -g allow-passthrough on` in your tmux config.
-3. Playwright launching Chromium with a debugging port. `corc doctor` writes
-   `~/.config/corc/playwright.json` for you; add it to the Playwright MCP
-   server's arguments and restart the agent:
+3. Playwright launching Chromium with a debugging port. For Claude Code corc
+   arranges this itself: every pane it spawns gets `--mcp-config` pointing at a
+   Playwright MCP server corc generates, and that server loads
+   `~/.config/corc/playwright.json`. Claude merges corc's server over your own,
+   so a `playwright` server you had wired up in `~/.claude.json` is replaced in
+   corc's panes rather than run beside it. You can delete it.
 
-   ```
-   --config ~/.config/corc/playwright.json
-   ```
+   The config file is written once and is then yours. It starts out headless
+   with `--remote-debugging-port=0`, letting the kernel pick a free port that
+   corc then finds on its own. It is also where an `executablePath` or a
+   `channel` goes under `launchOptions` if Playwright should not use the Chrome
+   it finds by itself.
 
-   The file only adds `--remote-debugging-port=0`, letting the kernel pick a
-   free port that corc then finds on its own. Nothing else about your
-   Playwright setup changes.
+   Other agents still need a Playwright server of their own, with
+   `--config ~/.config/corc/playwright.json` in its arguments.
 
 Every conversation gets its own browser, and its own profile to go with it, in
 `~/.cache/corc/browsers/<conversation>`. That is not cosmetic: Chromium locks a
@@ -223,9 +243,7 @@ profile while it lives, and Playwright's own choice of profile is keyed by
 working directory — so without this, two conversations in one repo would fight
 over one browser and the second to open would simply fail. corc sets
 `PLAYWRIGHT_MCP_USER_DATA_DIR` on the agent's pane, which every process below it
-inherits. Nothing is asked of your Playwright config beyond the port above, and
-an explicit `--user-data-dir` in the MCP args still wins if you want one profile
-for everything.
+inherits.
 
 Logins therefore persist per conversation, resumes included, and the profiles of
 conversations you have removed are deleted the next time corc starts.

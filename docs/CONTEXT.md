@@ -95,7 +95,9 @@ frames as kitty graphics (see ADR-0002). It belongs to one **Conversation**: a
 persisted per-conversation flag decides whether the pane opens while that
 conversation is the one in view. Three ways to set it, all the same flag: `b`
 in the sidebar, `Ctrl+b` anywhere in the **corc session**, or `corc browser`
-from inside the agent pane.
+from inside the agent pane. For Claude Code the Playwright MCP server is corc's,
+passed with `--mcp-config` on the spawn line and loading
+`~/.config/corc/playwright.json`; other agents bring their own.
 _Avoid_: preview pane, screenshot pane
 
 **Browser profile**:

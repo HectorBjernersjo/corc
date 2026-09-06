@@ -1,14 +1,13 @@
 //! Conversation relocation (`corc cd <dir>`, ADR-0003): the agent asks corc
-//! to move its own conversation to another directory, and corc types the
-//! provider's relocation command (Claude Code's `/cd`) into the
-//! conversation's pane.
+//! to move its own conversation to another directory. Claude needs corc to
+//! type its user-only `/cd` command into the pane; Cursor already knows the
+//! directory it chose and needs only corc's bookkeeping to follow.
 //!
-//! The agent cannot relocate itself — `/cd` is user-only on the agent's side
-//! — so it runs `corc cd <dir>` and corc's TUI does the typing. Input typed
-//! into a running agent queues and executes when the turn ends, so timing
-//! never matters. The row moves as soon as `/cd` is typed, and the agent's
-//! own report settles it (`state::Conversation::settled_cwd`): a declined
-//! trust prompt or a failed `/cd` puts it back at the next prompt.
+//! For Claude, input typed into a running agent queues and executes when the
+//! turn ends, so timing never matters. The row moves as soon as `/cd` is
+//! typed, and the agent's own report settles it
+//! (`state::Conversation::settled_cwd`): a declined trust prompt or a failed
+//! `/cd` puts it back at the next prompt.
 
 use crate::{provider, state, tmux};
 use anyhow::{Context, Result, bail};
@@ -39,14 +38,19 @@ pub fn command(dir: Option<&str>) -> Result<()> {
         .iter()
         .find(|c| c.pane_id.as_deref() == Some(pane.as_str()))
         .context("this pane is not a corc conversation — run corc cd inside an agent pane")?;
-    let command = provider::by_id(&conv.provider)
-        .cd_command(&dir)
+    let relocation = provider::by_id(&conv.provider)
+        .relocation(&dir)
         .with_context(|| format!("{} cannot relocate a running session", conv.provider))?;
     append_request(&mailbox()?, &conv.id, &dir)?;
-    println!(
-        "corc will type `{command}` into this conversation; \
-         it runs once the current turn ends"
-    );
+    match relocation {
+        provider::Relocation::TypeIntoPane(command) => println!(
+            "corc will type `{command}` into this conversation; \
+             it runs once the current turn ends"
+        ),
+        provider::Relocation::BookkeepingOnly => {
+            println!("corc will move this conversation to {}", dir.display())
+        }
+    }
     Ok(())
 }
 
@@ -65,9 +69,9 @@ fn append_request(path: &Path, id: &str, dir: &Path) -> Result<()> {
     writeln!(file, "{id}\t{}", dir.display()).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The directory as the agent will receive it: absolute and existing. `~` is
-/// expanded so the agent can pass what a user would type; canonicalizing also
-/// rejects a directory that does not exist before anything is typed anywhere.
+/// The directory corc will record: absolute and existing. `~` is expanded so
+/// the agent can pass what a user would type; canonicalizing also rejects a
+/// directory that does not exist before anything is delivered or recorded.
 pub fn canonical_dir(dir: &str) -> Result<PathBuf> {
     let expanded = match dir.strip_prefix("~") {
         Some(rest) => {
@@ -93,11 +97,10 @@ pub struct Applied {
     pub failure: Option<String>,
 }
 
-/// The TUI's half of the handover, run once per refresh: type each pending
-/// request's relocation command into its conversation's pane, move the row
-/// there optimistically, and empty the mailbox. Best-effort like the browser
-/// mailbox — a dropped request costs one `corc cd`, a stuck one would retry
-/// into the wrong turn forever.
+/// The TUI's half of the handover, run once per refresh: apply each provider's
+/// relocation strategy and empty the mailbox. Best-effort like the browser
+/// mailbox — a dropped request costs one `corc cd`, while a stuck one could
+/// otherwise land in the wrong turn later.
 pub fn apply_requests(state: &mut state::State, now: u64) -> Applied {
     let mut applied = Applied::default();
     let Some(text) = mailbox().ok().and_then(|path| {
@@ -108,24 +111,30 @@ pub fn apply_requests(state: &mut state::State, now: u64) -> Applied {
         return applied;
     };
     for (id, dir) in parse_requests(&text) {
-        match deliver(state, &id, &dir) {
-            Ok(()) => applied.moved |= state.request_relocation(&id, &dir, now),
+        match apply_request(state, &id, &dir, now) {
+            Ok(moved) => applied.moved |= moved,
             Err(e) => applied.failure = Some(format!("corc cd: {e:#}")),
         }
     }
     applied
 }
 
-fn deliver(state: &state::State, id: &str, dir: &Path) -> Result<()> {
+fn apply_request(state: &mut state::State, id: &str, dir: &Path, now: u64) -> Result<bool> {
     let conv = state.conversation(id).context("conversation is gone")?;
-    let pane = conv
-        .pane_id
-        .as_deref()
-        .context("conversation is dead — nothing to type into")?;
-    let command = provider::by_id(&conv.provider)
-        .cd_command(dir)
-        .context("provider cannot relocate")?;
-    tmux::type_into_pane(pane, &command)
+    match provider::by_id(&conv.provider)
+        .relocation(dir)
+        .context("provider cannot relocate")?
+    {
+        provider::Relocation::TypeIntoPane(command) => {
+            let pane = conv
+                .pane_id
+                .as_deref()
+                .context("conversation is dead — nothing to type into")?;
+            tmux::type_into_pane(pane, &command)?;
+            Ok(state.request_relocation(id, dir, now))
+        }
+        provider::Relocation::BookkeepingOnly => Ok(state.relocate(id, dir)),
+    }
 }
 
 fn parse_requests(text: &str) -> Vec<(String, PathBuf)> {
@@ -169,5 +178,22 @@ mod tests {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(canonical_dir("~").unwrap(), PathBuf::from(&home));
         assert!(canonical_dir("/definitely/not/a/real/dir").is_err());
+    }
+
+    #[test]
+    fn cursor_relocation_only_moves_corcs_bookkeeping() {
+        let mut state = state::State::default();
+        state.add_conversation(
+            "cursor-chat".into(),
+            PathBuf::from("/work/old"),
+            "%1".into(),
+            "cursor".into(),
+        );
+
+        assert!(apply_request(&mut state, "cursor-chat", Path::new("/work/new"), 1000).unwrap());
+        let conv = state.conversation("cursor-chat").unwrap();
+        assert_eq!(conv.cwd, Path::new("/work/new"));
+        assert_eq!(conv.relocation_requested_at, None);
+        assert_eq!(state.projects, vec!["/work/new"]);
     }
 }

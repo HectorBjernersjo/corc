@@ -18,9 +18,13 @@ assumed:
   writes it to `DevToolsActivePort` in its user data directory — which is on
   its command line.
 
-So the whole integration is one flag in the user's Playwright MCP config
-(`--config ~/.config/corc/playwright.json`, which `corc doctor` writes and
-tells them to wire up). Everything else corc discovers — except *which profile*
+So the whole integration is one flag in a Playwright config file corc writes
+(`~/.config/corc/playwright.json`). For Claude Code, corc also supplies the
+Playwright MCP server that loads it, with `--mcp-config` on the spawn line the
+same way `--settings` carries the hooks (ADR-0004); Claude lets a server named
+in `--mcp-config` replace a same-named one from the user's config, so a
+`playwright` they wired up by hand is not run twice. Other agents still bring
+their own server, pointed at the file. Everything else corc discovers — except *which profile*
 each browser uses, which corc has to decide, because Playwright's own answer
 makes two conversations in one repo fight over one browser.
 
@@ -46,9 +50,10 @@ makes two conversations in one repo fight over one browser.
   for as long as the conversation exists. The two are mutually exclusive anyway:
   Playwright rejects a `userDataDir` in isolated mode.
 - **A Playwright config file per conversation**, with `--config` pointing at it.
-  Rejected: the MCP args live in the user's own agent config as one entry shared
-  by every conversation, so the path cannot vary per conversation — the same
-  reason the profile has to arrive as environment rather than as a flag.
+  Rejected: the MCP args are one server entry shared by every conversation —
+  the user's own for most agents, corc's `--mcp-config` file for Claude — so
+  the path cannot vary per conversation; the same reason the profile has to
+  arrive as environment rather than as a flag.
 - **`corc browser` writing the flag straight into `state.json`.** Rejected:
   the TUI owns that file and rewrites it wholesale from its in-memory copy, so
   a second process editing a conversation's flag there is overwritten on the
@@ -74,9 +79,12 @@ makes two conversations in one repo fight over one browser.
 
 ## Consequences
 
-- The browser view is **read-only and best-effort**. If the user never wires
-  up the config, `b` explains what to add and does nothing else; corc works
-  exactly as before.
+- The browser view is **read-only and best-effort**. An agent with no browser
+  under it just reads as having none, and corc works exactly as before. A
+  Claude pane gets a Playwright that exposes the port without the user doing
+  anything; the price is that Claude's browser settings now live in
+  `playwright.json` rather than in MCP args the user controls, so `headless`
+  ships in the file corc writes and an `executablePath` goes there too.
 - Frames only arrive when the page repaints, because that is when Chromium
   emits them. A static page costs nothing, and the pane keeps showing the last
   frame — the placeholder cells are tmux's text, so they survive redraws.

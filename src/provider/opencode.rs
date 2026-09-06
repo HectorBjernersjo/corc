@@ -182,6 +182,7 @@ impl MetaSource for OpenCodeStore {
 }
 
 struct SessionRow {
+    directory: PathBuf,
     /// Nullable since `session_v2`: a session OpenCode has not named yet has
     /// either no title at all or its `New session - <timestamp>` placeholder.
     title: Option<String>,
@@ -194,7 +195,7 @@ struct SessionRow {
 fn read_meta(conn: &Connection, id: &str, persisted_start: Option<u64>) -> Result<Option<Meta>> {
     let session = conn
         .query_row(
-            "SELECT title, time_updated, time_idle
+            "SELECT title, time_updated, time_idle, directory
              FROM session_v2
              WHERE id = ?1 AND parent_id IS NULL",
             [id],
@@ -203,6 +204,7 @@ fn read_meta(conn: &Connection, id: &str, persisted_start: Option<u64>) -> Resul
                     title: row.get(0)?,
                     updated_ms: row.get(1)?,
                     idle_ms: row.get(2)?,
+                    directory: PathBuf::from(row.get::<_, String>(3)?),
                 })
             },
         )
@@ -223,9 +225,12 @@ fn read_meta(conn: &Connection, id: &str, persisted_start: Option<u64>) -> Resul
     let latest_user_ms = latest_prompt_ms(conn, id)?;
 
     let mut meta = Meta {
+        cwd: Some(session.directory),
         has_content: latest_user_ms.is_some(),
         first_prompt: first_prompt(conn, id)?,
-        title: session.title.filter(|t| !t.starts_with(DEFAULT_TITLE_PREFIX)),
+        title: session
+            .title
+            .filter(|t| !t.starts_with(DEFAULT_TITLE_PREFIX)),
         turn_progress_at: progress_ms.and_then(nonnegative).map(millis_to_secs),
         mtime: millis_to_system_time(progress_ms.unwrap_or_default().max(session.updated_ms)),
         ..Meta::default()
@@ -551,6 +556,7 @@ mod tests {
         store.refresh(&known).unwrap();
         let meta = store.meta(session).unwrap();
         assert_eq!(meta.display_title(), Some("Generated title"));
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/work/app")));
         assert_eq!(meta.turn_state, TurnState::Complete);
         assert_eq!(meta.turn_started_at, Some(101));
         assert_eq!(meta.turn_completed_at, Some(104));
@@ -573,9 +579,75 @@ mod tests {
     }
 
     #[test]
+    fn session_move_rehomes_the_existing_conversation_on_refresh() {
+        let (path, conn) = fixture("session-move");
+        let id = "ses_moved";
+        insert_session(
+            &conn,
+            id,
+            None,
+            "/work/app",
+            Some("Keep title"),
+            100_000,
+            100_000,
+        );
+        let mut store = OpenCodeStore {
+            database: path,
+            cache: HashMap::new(),
+        };
+        let mut state = state::State::default();
+        state.add_conversation(
+            id.into(),
+            "/work/app".into(),
+            "%42".into(),
+            "opencode".into(),
+        );
+        state.conversation_mut(id).unwrap().pinned = true;
+        let known = [Known::shown(id, "/work/app")];
+        store.refresh(&known).unwrap();
+        assert!(
+            state
+                .conversation(id)
+                .unwrap()
+                .settled_cwd(store.meta(id).unwrap())
+                .is_none()
+        );
+
+        // session_move changes the session row without restarting its CLI or
+        // requiring another user prompt. The cached metadata must follow it.
+        conn.execute(
+            "UPDATE session_v2 SET directory = '/work/app-feature', time_updated = 110000 WHERE id = ?1",
+            [id],
+        ).unwrap();
+        store.refresh(&known).unwrap();
+        let cwd = state
+            .conversation(id)
+            .unwrap()
+            .settled_cwd(store.meta(id).unwrap())
+            .unwrap();
+        assert!(state.relocate(id, &cwd));
+        assert_eq!(state.projects, vec!["/work/app-feature"]);
+        assert_eq!(state.conversations.len(), 1);
+        let moved = state.conversation(id).unwrap();
+        assert_eq!(moved.cwd, Path::new("/work/app-feature"));
+        assert_eq!(moved.pane_id.as_deref(), Some("%42"));
+        assert!(moved.pinned);
+        assert_eq!(store.meta(id).unwrap().display_title(), Some("Keep title"));
+        assert!(moved.settled_cwd(store.meta(id).unwrap()).is_none());
+    }
+
+    #[test]
     fn empty_session_is_known_but_has_no_content() {
         let (path, conn) = fixture("empty");
-        insert_session(&conn, "ses_empty", None, "/work/app", None, 100_000, 100_000);
+        insert_session(
+            &conn,
+            "ses_empty",
+            None,
+            "/work/app",
+            None,
+            100_000,
+            100_000,
+        );
         drop(conn);
         let mut store = OpenCodeStore {
             database: path,

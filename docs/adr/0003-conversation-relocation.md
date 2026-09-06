@@ -1,19 +1,24 @@
-# Relocation types `/cd` into the pane; state follows the transcript
+# Relocation follows what each provider can move
 
 A conversation can move to another directory — the agent prepares a new
 workspace and asks to live there (`corc cd <dir>`), or the user types `/cd`
 into the agent themselves. Either way corc's involvement has two halves that
-are deliberately decoupled:
+depend on the provider:
 
-- **Delivery**: `corc cd <dir>` appends to a mailbox (same single-writer
+- **Cursor bookkeeping**: the Cursor agent has already chosen the new
+  directory when it calls `corc cd`. Cursor has no persistent `/cd` and does
+  not report a changed conversation directory, so the TUI only re-homes the
+  row in corc's state. The move is final. Nothing is typed back into the pane
+  and no confirmation is expected from Cursor.
+- **Claude delivery**: `corc cd <dir>` appends to a mailbox (same single-writer
   handover as the browser-view mailbox), and the TUI types the provider's
-  relocation command — Claude Code's `/cd <dir>` — into the conversation's
-  pane with `send-keys -l`. Strictly the calling pane's conversation, no
+  `/cd <dir>` into the conversation's pane with `send-keys -l`. Strictly the
+  calling pane's conversation, no
   viewed-conversation fallback: relocating the wrong conversation is a real
   move, not a toggled view. Input typed into a busy agent queues and executes
   when the turn ends (documented Claude Code behavior), so delivery never
   waits for idle.
-- **Bookkeeping**: the agent has the last word on `Conversation.cwd`. Every
+- **Claude bookkeeping**: the agent has the last word on `Conversation.cwd`. Every
   Claude hook payload carries the session's own working directory (ADR-0004),
   which `discovery` folds into `Meta.cwd` so the next refresh re-homes the
   row. A `/cd` the user typed by hand is followed that way, and a
@@ -54,6 +59,13 @@ record.
 
 ## Considered options
 
+- **Prompting Cursor with the new directory**: rejected — Cursor itself calls
+  `corc cd`, so it already knows what directory it chose. Sending the same
+  instruction back would spend a turn and add no information.
+- **Restarting Cursor with `--workspace`**: rejected — corc only needs to
+  group the conversation under the directory where the agent says it is
+  working. Restarting would discard the live process and prompt cache to make
+  Cursor's own workspace metadata agree with bookkeeping that already works.
 - **Transcript surgery** (kill pane, move the jsonl, respawn with
   `--resume`): rejected — depends on undocumented storage layout, loses the
   live process and its prompt cache, and `/cd` does all of it supported.

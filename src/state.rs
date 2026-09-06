@@ -45,11 +45,11 @@ pub struct Conversation {
     /// persisted so the choice survives a corc restart.
     #[serde(default)]
     pub browser: bool,
-    /// Unix seconds corc typed `/cd` for this conversation (ADR-0003). `cwd`
-    /// is already the target, optimistically: the agent runs the queued `/cd`
-    /// only when its turn ends, and a row that sits in the old project for
-    /// the whole turn is right in a way nobody can use. Cleared once the
-    /// agent's own report settles it — see `settled_cwd`.
+    /// Unix seconds corc typed Claude's `/cd` for this conversation
+    /// (ADR-0003). `cwd` is already the target, optimistically: Claude runs
+    /// the queued `/cd` only when its turn ends. Cleared once Claude's own
+    /// report settles it — see `settled_cwd`. Cursor moves are bookkeeping
+    /// only and never enter this pending state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relocation_requested_at: Option<u64>,
 }
@@ -211,6 +211,53 @@ impl State {
         self.conversations.iter_mut().find(|c| c.id == id)
     }
 
+    /// Transfer a pane after its CLI switched sessions. Existing destination
+    /// preferences survive; the previous session remains resumable in history.
+    pub fn resume_in_pane(
+        &mut self,
+        pane: &str,
+        session: &crate::resume::Session,
+    ) -> Option<String> {
+        let source = self
+            .conversations
+            .iter()
+            .position(|c| c.pane_id.as_deref() == Some(pane) && c.provider == session.provider)?;
+        let old = self.conversations[source].clone();
+        if old.id == session.id {
+            return None;
+        }
+        if self
+            .conversation(&session.id)
+            .is_some_and(|c| c.provider != session.provider)
+        {
+            return None;
+        }
+        self.conversations[source].pane_id = None;
+        let pending = crate::provider::by_id(&old.provider).is_pending(&old.id);
+        if self.conversation(&session.id).is_none() {
+            if pending {
+                self.conversations[source].id = session.id.clone();
+                self.conversations[source].pane_id = Some(pane.into());
+            } else {
+                self.add_conversation(
+                    session.id.clone(),
+                    old.cwd.clone(),
+                    pane.into(),
+                    session.provider.clone(),
+                );
+            }
+        } else {
+            let target = self.conversation_mut(&session.id).unwrap();
+            target.pane_id = Some(pane.into());
+            target.last_viewed = unix_now();
+            target.relocation_requested_at = None;
+        }
+        if pending {
+            self.conversations.retain(|c| c.id != old.id);
+        }
+        Some(old.id)
+    }
+
     /// Record a freshly spawned conversation, appending its project to the
     /// order list if this is the project's first conversation (D9).
     pub fn add_conversation(
@@ -240,10 +287,9 @@ impl State {
         });
     }
 
-    /// Re-home a conversation on the agent's own word — a `/cd` typed by the
-    /// user, or corc's `corc cd` confirmed or refused (ADR-0003): update its
-    /// cwd, append the new project to the display order if it is new, and
-    /// drop the old project if this was its last conversation. Settles any
+    /// Re-home a conversation: directly for a bookkeeping-only Cursor move,
+    /// or on Claude's own word after `/cd` (ADR-0003). Appends a new project
+    /// to the display order, drops an empty old project, and settles any
     /// pending relocation. Returns whether anything changed.
     pub fn relocate(&mut self, id: &str, cwd: &Path) -> bool {
         let Some(conv) = self.conversation_mut(id) else {
@@ -262,9 +308,9 @@ impl State {
         true
     }
 
-    /// The optimistic half of `corc cd` (ADR-0003): corc has just typed `/cd`
-    /// into the pane, so move the row now and remember that the agent has yet
-    /// to confirm it. `relocate` settles it later, either way.
+    /// The optimistic half of Claude's `corc cd` (ADR-0003): corc has just
+    /// typed `/cd` into the pane, so move the row now and remember that Claude
+    /// has yet to confirm it. `relocate` settles it later, either way.
     pub fn request_relocation(&mut self, id: &str, cwd: &Path, now: u64) -> bool {
         self.relocate(id, cwd);
         let Some(conv) = self.conversation_mut(id) else {
@@ -325,6 +371,25 @@ pub fn state_dir() -> Result<PathBuf> {
 
 pub fn state_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("state.json"))
+}
+
+/// Write a generated file only when its content has drifted, atomically. For
+/// the files corc hands to an agent on its spawn line: regenerated from the
+/// current binary and environment on every use, so they follow a moved
+/// install without anyone remembering to refresh them.
+pub fn write_if_changed(path: &Path, wanted: &str) -> Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(wanted) {
+        return Ok(());
+    }
+    let dir = path.parent().context("path has no parent")?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        "{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+    ));
+    std::fs::write(&tmp, wanted)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]

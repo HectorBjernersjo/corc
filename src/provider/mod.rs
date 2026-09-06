@@ -15,6 +15,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
+/// What `corc cd` must do after moving its own row.
+pub enum Relocation {
+    /// Type a provider command into the pane, then wait for provider metadata
+    /// to confirm where the session ended up.
+    TypeIntoPane(String),
+    /// The agent already chose the directory when it called `corc cd`; only
+    /// corc's bookkeeping needs to move.
+    BookkeepingOnly,
+}
+
 /// Everything corc needs to know about one agent CLI.
 pub trait Provider: Send + Sync {
     /// Stable id persisted in `state.json` (`"claude"`, `"opencode"`, ...). Never
@@ -64,10 +74,8 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
-    /// The line to type into a live pane to relocate the conversation's
-    /// primary working directory (ADR-0003), for agent CLIs that support it
-    /// (Claude Code's `/cd`). None makes `corc cd` refuse for this provider.
-    fn cd_command(&self, _dir: &Path) -> Option<String> {
+    /// How this provider handles `corc cd` (ADR-0003). None refuses the move.
+    fn relocation(&self, _dir: &Path) -> Option<Relocation> {
         None
     }
 
