@@ -112,7 +112,7 @@ startup.
 _Avoid_: user data dir (Chromium's word for it), session
 
 **State file**:
-corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on, and sticky proof once real content has been observed; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots without mistaking temporary provider-metadata loss for an empty conversation.
+corc's persistent record (`~/.local/state/corc/state.json`) of every conversation it has spawned (id, cwd), per-conversation last-viewed times, user-controlled pins, whether the **Browser view** is on; what makes dead conversations listable, pinnable at the top, and resumable across tmux/reboots.
 
 **Hook log** (ADR-0004):
 The append-only record of what a Claude conversation did, one file per session

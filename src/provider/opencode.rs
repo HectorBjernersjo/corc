@@ -3,7 +3,8 @@
 //! conversations therefore start under a corc-minted provisional id; once
 //! OpenCode writes the matching top-level row to its SQLite database, corc
 //! adopts the real `ses_...` id. Dead conversations resume with
-//! `opencode --session <id>`.
+//! `opencode --standalone --session <id>`. A private server keeps the Playwright
+//! MCP and Chromium below the pane's pid and inherits its browser profile.
 //!
 //! OpenCode keeps sessions and messages in
 //! `$XDG_DATA_HOME/opencode/opencode.db` (normally
@@ -48,11 +49,15 @@ impl Provider for OpenCode {
 
     fn spawn_args(&self, id: &str, resume: bool) -> Vec<String> {
         if resume && !self.is_pending(id) {
-            vec!["--session".to_string(), id.to_string()]
+            vec![
+                "--standalone".to_string(),
+                "--session".to_string(),
+                id.to_string(),
+            ]
         } else {
             // The home screen creates a real session when its first prompt
             // is submitted. A pending conversation has nothing to resume.
-            Vec::new()
+            vec!["--standalone".to_string()]
         }
     }
 
@@ -409,11 +414,11 @@ mod tests {
         let provider = OpenCode;
         let pending = "pending-opencode-123";
         assert!(provider.is_pending(pending));
-        assert_eq!(provider.spawn_args(pending, false), Vec::<String>::new());
-        assert_eq!(provider.spawn_args(pending, true), Vec::<String>::new());
+        assert_eq!(provider.spawn_args(pending, false), vec!["--standalone"]);
+        assert_eq!(provider.spawn_args(pending, true), vec!["--standalone"]);
         assert_eq!(
             provider.spawn_args("ses_real", true),
-            vec!["--session".to_string(), "ses_real".to_string()]
+            vec!["--standalone", "--session", "ses_real"]
         );
     }
 

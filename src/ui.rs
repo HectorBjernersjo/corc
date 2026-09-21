@@ -269,11 +269,6 @@ fn within_window(cutoff: Option<u64>, alive: bool, last_active: u64, now: u64) -
     }
 }
 
-/// Grace period before an empty conversation the user left is discarded
-/// (D17). A message sent an instant before leaving can still be flushing to
-/// disk — Cursor lags noticeably — so we wait and re-check emptiness rather
-/// than discarding on the spot.
-const DISCARD_GRACE: Duration = Duration::from_secs(30);
 /// Most recent conversations shown per project before the rest are hidden
 /// (D13) — the all-time window reveals them. Keeps each project's list short.
 const MAX_PER_PROJECT: usize = 7;
@@ -497,9 +492,6 @@ struct App {
     provider_picker: Option<ProviderPicker>,
     /// Move mode (D9): `K`/`J` reorder the selected row's project.
     move_mode: bool,
-    /// Empty conversations the user has left, awaiting the `DISCARD_GRACE`
-    /// re-check before being discarded (D17). (id, when it was marked.)
-    pending_discard: Vec<(String, Instant)>,
     /// Persistent list state so the scroll offset survives between frames —
     /// what lets a mouse click map back to the item under the pointer (D11).
     list_state: ListState,
@@ -586,7 +578,6 @@ pub fn run() -> Result<()> {
         listed_dirs,
         provider_picker: None,
         move_mode: false,
-        pending_discard: Vec::new(),
         list_state: ListState::default(),
         attention_state: ListState::default(),
         list_area: Rect::default(),
@@ -619,10 +610,6 @@ pub fn run() -> Result<()> {
     app.close_browser_pane();
     // Swap the viewed pane home and remove the content pane we created (D10).
     app.park();
-    // Respect the normal grace period on shutdown too. A message sent just
-    // before Ctrl+C may still be flushing, especially for Cursor; keeping a
-    // genuinely empty row is safer than deleting a real conversation.
-    app.process_pending_discards();
     if tmux::pane_exists(&app.placeholder_pane) {
         let _ = tmux::kill_pane(&app.placeholder_pane);
     }
@@ -1021,7 +1008,6 @@ impl App {
                 }
             }
         }
-        let mut died_id = None;
         if viewed_died {
             // The Claude in the content slot exited: its pane is gone and our
             // placeholder shell is parked in its hidden window. Reclaim the
@@ -1032,7 +1018,6 @@ impl App {
                 Ok(pane) => self.placeholder_pane = pane,
                 Err(e) => self.status_msg = Some(e.to_string()),
             }
-            died_id = Some(id);
         } else if self.viewed.is_none()
             && panes
                 .as_ref()
@@ -1067,18 +1052,12 @@ impl App {
             self.metas_saved = Instant::now();
         }
 
-        // Persist the metadata that must survive a temporarily unavailable
-        // provider store. The turn start preserves an elapsed clock across a
-        // restart; content_seen is sticky proof that a title-less conversation
-        // is real and must never be removed by empty-conversation cleanup.
+        // Persist the turn start so an in-flight turn keeps its elapsed clock
+        // across a restart, even if the provider store is briefly unavailable.
         for conv in &mut self.state.conversations {
             let Some(meta) = self.metas.meta(&conv.id) else {
                 continue;
             };
-            if meta.has_content && !conv.content_seen {
-                conv.content_seen = true;
-                dirty = true;
-            }
             let started = (meta.turn_state == crate::discovery::TurnState::Mid)
                 .then_some(meta.turn_started_at)
                 .flatten();
@@ -1102,16 +1081,6 @@ impl App {
                 dirty = true;
             }
         }
-
-        // A conversation whose agent exited before a single message was ever
-        // sent is forgotten rather than left as an (untitled) Dead row (D17) —
-        // after the grace re-check, in case a final message is still flushing.
-        if let Some(id) = died_id
-            && self.is_empty_conversation(&id)
-        {
-            self.mark_pending_discard(id);
-        }
-        self.process_pending_discards();
 
         // The conversation in the content pane counts as continuously
         // viewed (D6): its last_viewed follows along in memory and is
@@ -1220,9 +1189,6 @@ impl App {
             }
             if target_viewed {
                 self.status_msg = self.view(&session.id).err().map(|e| e.to_string());
-            }
-            if self.is_empty_conversation(&old.id) {
-                self.mark_pending_discard(old.id);
             }
             changed = Some(session.id.clone());
         }
@@ -1663,7 +1629,8 @@ impl App {
             Some(p) if tmux::pane_exists(&p) => p,
             _ => {
                 let prov = provider::by_id(&conv.provider);
-                let pane = tmux::spawn_conversation(&conv.cwd, prov, id, true)?;
+                let pane =
+                    tmux::spawn_conversation(&conv.cwd, prov, id, true, conv.browser_profile())?;
                 let c = self.state.conversation_mut(id).unwrap();
                 c.pane_id = Some(pane.clone());
                 pane
@@ -1690,10 +1657,6 @@ impl App {
         let Some(id) = self.viewed.take() else {
             return;
         };
-        // Pick up a message sent moments before leaving, so a conversation
-        // that was just written to is never mistaken for empty (D17).
-        let known = self.known_conversations();
-        let _ = self.metas.refresh(&known);
         if let Some(c) = self.state.conversation_mut(&id) {
             c.last_viewed = state::unix_now();
         }
@@ -1718,23 +1681,13 @@ impl App {
                 }
             }
         }
-        // A conversation the user opened but never sent a message in is
-        // discarded rather than left as an (untitled) row (D17) — but only
-        // after the grace re-check, so a message sent just before leaving
-        // (Cursor flushes with a lag) isn't mistaken for an empty one.
-        if self.is_empty_conversation(&id) {
-            self.mark_pending_discard(id);
-        }
     }
 
     /// Migrate conversations whose provisional id can now be resolved to the
     /// agent's real session id (Codex/OpenCode persist it with the first
     /// message). Everything keyed by the id moves together — the state
-    /// row, the hidden tmux window's name and the viewed pointer. An entry in
-    /// `pending_discard` intentionally does not: keyed by the old id, it
-    /// cancels itself on the next check, which is exactly right — a resolved
-    /// conversation has a message and must not be discarded. Returns whether
-    /// anything changed (the caller persists).
+    /// row, the hidden tmux window's name and the viewed pointer. Returns
+    /// whether anything changed (the caller persists).
     fn resolve_pending_ids(&mut self) -> bool {
         let mut taken: Vec<String> = self
             .state
@@ -1771,72 +1724,11 @@ impl App {
             if self.viewed.as_deref() == Some(id.as_str()) {
                 self.viewed = Some(real.clone());
             }
-            self.state.conversations[i].id = real.clone();
+            self.state.conversations[i].resolve_id(real.clone());
             taken.push(real);
             changed = true;
         }
         changed
-    }
-
-    /// Queue an empty conversation for discard after `DISCARD_GRACE`, unless
-    /// it is already queued.
-    fn mark_pending_discard(&mut self, id: String) {
-        if !self.pending_discard.iter().any(|(pid, _)| *pid == id) {
-            self.pending_discard.push((id, Instant::now()));
-        }
-    }
-
-    /// Discard queued conversations whose grace period has elapsed and that
-    /// are still empty. A conversation cancels its own discard by gaining a
-    /// message (no longer empty), being viewed again, or already being gone.
-    fn process_pending_discards(&mut self) {
-        let now = Instant::now();
-        let mut discard = Vec::new();
-        let mut keep = Vec::new();
-        for (id, marked) in std::mem::take(&mut self.pending_discard) {
-            // Cancel: gone, re-viewed, or now has content.
-            if self.state.conversation(&id).is_none()
-                || self.viewed.as_deref() == Some(id.as_str())
-                || !self.is_empty_conversation(&id)
-            {
-                continue;
-            }
-            if now.duration_since(marked) >= DISCARD_GRACE {
-                discard.push(id);
-            } else {
-                keep.push((id, marked)); // keep waiting
-            }
-        }
-        self.pending_discard = keep;
-        for id in discard {
-            self.discard_conversation(&id);
-        }
-    }
-
-    /// Whether the conversation has never been observed with a real exchange
-    /// and current provider metadata still reads as empty. A missing metadata
-    /// record is how an untouched provider session normally starts, so it also
-    /// counts as empty after the grace period. Once `content_seen` is true it
-    /// is sticky: later metadata/title loss can never make the conversation
-    /// eligible for automatic cleanup again.
-    fn is_empty_conversation(&self, id: &str) -> bool {
-        conversation_is_empty(self.state.conversation(id), self.metas.meta(id))
-    }
-
-    /// Forget an empty conversation: kill its agent pane and hidden window
-    /// (if any survive), drop it from the state file and delete the hook log
-    /// corc kept for it. The jsonl under ~/.claude is never touched (D1).
-    fn discard_conversation(&mut self, id: &str) {
-        if let Some(pane) = self.state.conversation(id).and_then(|c| c.pane_id.clone())
-            && tmux::kill_hidden_window(id).is_err()
-            && tmux::pane_exists(&pane)
-        {
-            let _ = tmux::kill_pane(&pane);
-        }
-        self.state.conversations.retain(|c| c.id != id);
-        hooks::forget(id);
-        self.state.prune_empty_projects();
-        self.status_msg = self.state.save().err().map(|e| e.to_string());
     }
 
     /// `x` per state (D12): a live conversation's Claude and hidden window
@@ -2022,7 +1914,7 @@ impl App {
         let result = (|| -> Result<()> {
             let prov = provider::by_id(&self.state.active_provider);
             let id = prov.new_session_id(&dir)?;
-            let pane_id = tmux::spawn_conversation(&dir, prov, &id, false)?;
+            let pane_id = tmux::spawn_conversation(&dir, prov, &id, false, &id)?;
             self.state
                 .add_conversation(id.clone(), dir, pane_id, prov.id().to_string());
             self.state.save()?;
@@ -2706,15 +2598,6 @@ fn contains(area: Rect, col: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn conversation_is_empty(
-    conversation: Option<&state::Conversation>,
-    meta: Option<&crate::discovery::Meta>,
-) -> bool {
-    conversation.is_some_and(|conversation| {
-        !conversation.content_seen && meta.is_none_or(|meta| !meta.has_content)
-    })
-}
-
 /// Whether a browser the agent has open should turn the view on: only on the
 /// transition from absent to present, recorded in `seen`. Level-triggering it
 /// instead would reopen a view the user closed by hand while the browser was
@@ -2753,11 +2636,10 @@ mod tests {
     use super::{
         HistoryWindow, IDLE_POLL, Item, PINNED_DOT, Panel, RenderKind, RenderSchedule,
         RepaintSchedule, Statuses, adjacent_panel, attention_ids, attention_panel_height,
-        browser_appeared, conversation_dot, conversation_is_empty, force_full_redraw, item_pos,
+        browser_appeared, conversation_dot, force_full_redraw, item_pos,
         keep_first_conversation_context_visible, project_is_listed, set_list_highlight,
         within_window,
     };
-    use crate::discovery::Meta;
     use crate::state::Conversation;
     use crate::status::Status;
     use ratatui::Terminal;
@@ -2902,7 +2784,7 @@ mod tests {
         assert_eq!(attention_panel_height(2, 3), 2);
     }
 
-    fn conversation(content_seen: bool) -> Conversation {
+    fn conversation() -> Conversation {
         Conversation {
             id: "conversation".into(),
             cwd: "/tmp".into(),
@@ -2911,33 +2793,33 @@ mod tests {
             created_at: 0,
             provider: "claude".into(),
             turn_started_at: None,
-            content_seen,
             pinned: false,
             browser: false,
+            browser_profile: None,
             relocation_requested_at: None,
         }
     }
 
     #[test]
     fn attention_sorts_blue_then_yellow_then_pinned() {
-        let mut running = conversation(true);
+        let mut running = conversation();
         running.id = "running".into();
         running.created_at = 20;
 
-        let mut pinned = conversation(true);
+        let mut pinned = conversation();
         pinned.id = "pinned".into();
         pinned.created_at = 10;
         pinned.pinned = true;
 
-        let mut unseen = conversation(true);
+        let mut unseen = conversation();
         unseen.id = "unseen".into();
         unseen.created_at = 30;
 
-        let mut question = conversation(true);
+        let mut question = conversation();
         question.id = "question".into();
         question.created_at = 35;
 
-        let mut idle = conversation(true);
+        let mut idle = conversation();
         idle.id = "idle".into();
         idle.created_at = 40;
 
@@ -2992,36 +2874,6 @@ mod tests {
         assert_eq!(conversation_dot(Status::Unseen, true), ("●", Color::Blue));
         assert_eq!(conversation_dot(Status::Idle, true), ("●", PINNED_DOT));
         assert_eq!(conversation_dot(Status::Dead, true), ("○", PINNED_DOT));
-    }
-
-    #[test]
-    fn untouched_conversation_is_empty_with_or_without_metadata() {
-        let conversation = conversation(false);
-        assert!(conversation_is_empty(Some(&conversation), None));
-        assert!(conversation_is_empty(
-            Some(&conversation),
-            Some(&Meta::default())
-        ));
-    }
-
-    #[test]
-    fn current_content_prevents_empty_cleanup_before_it_is_persisted() {
-        let conversation = conversation(false);
-        let meta = Meta {
-            has_content: true,
-            ..Meta::default()
-        };
-        assert!(!conversation_is_empty(Some(&conversation), Some(&meta)));
-    }
-
-    #[test]
-    fn previously_seen_content_survives_missing_or_empty_metadata() {
-        let conversation = conversation(true);
-        assert!(!conversation_is_empty(Some(&conversation), None));
-        assert!(!conversation_is_empty(
-            Some(&conversation),
-            Some(&Meta::default())
-        ));
     }
 
     #[test]

@@ -234,10 +234,9 @@ impl MetaSource for CursorStore {
             {
                 meta.mtime = ts;
             }
-            // A chat with no exchange yet is "empty" — no title — so leaving
-            // it discards it, exactly like an untouched Claude conversation
-            // (D17). Cursor may stamp a placeholder name before the first
-            // message, so `hasConversation` is the signal, not the name.
+            // A chat with no exchange yet has no title. Cursor may stamp a
+            // placeholder name before the first message, so
+            // `hasConversation` is the signal, not the name.
             meta.has_content = info.has_conversation || store.has_content;
             if meta.has_content {
                 meta.title = store.title.or(info.title);
@@ -712,9 +711,9 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
-    /// A chat with `hasConversation:false` reports no activity — it reads as
-    /// empty, so leaving it discards the conversation (D17); once a message
-    /// lands, `hasConversation` flips true and the title comes through.
+    /// A chat with `hasConversation:false` reports no activity and no title;
+    /// once a message lands, `hasConversation` flips true and the title
+    /// comes through.
     #[test]
     fn meta_json_emptiness() {
         let dir = std::env::temp_dir().join(format!("corc-cursor-test-{}", std::process::id()));

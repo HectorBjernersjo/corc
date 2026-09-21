@@ -30,12 +30,6 @@ pub struct Conversation {
     /// its elapsed time after corc restarts. Cleared when the turn completes.
     #[serde(default)]
     pub turn_started_at: Option<u64>,
-    /// Sticky proof that this conversation has contained a real exchange.
-    /// Provider metadata can temporarily disappear or lose its title; once
-    /// content has been observed, the empty-conversation cleanup must never
-    /// mistake that uncertainty for an untouched conversation.
-    #[serde(default)]
-    pub content_seen: bool,
     /// User-controlled placement in the always-visible top panel. Defaults to
     /// false so state files written before pinning support remain compatible.
     #[serde(default)]
@@ -45,6 +39,10 @@ pub struct Conversation {
     /// persisted so the choice survives a corc restart.
     #[serde(default)]
     pub browser: bool,
+    /// Profile key stays fixed when a provisional agent id becomes a real id.
+    /// Older records use their session id until it first changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_profile: Option<String>,
     /// Unix seconds corc typed Claude's `/cd` for this conversation
     /// (ADR-0003). `cwd` is already the target, optimistically: Claude runs
     /// the queued `/cd` only when its turn ends. Cleared once Claude's own
@@ -55,6 +53,17 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    pub fn browser_profile(&self) -> &str {
+        self.browser_profile.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn resolve_id(&mut self, id: String) {
+        if self.browser_profile.is_none() {
+            self.browser_profile = Some(self.id.clone());
+        }
+        self.id = id;
+    }
+
     /// Where the agent's report says this row belongs, when it says anything
     /// new. `meta.cwd` is the reported directory; with no relocation pending
     /// any change is a move (a `/cd` typed by hand).
@@ -236,7 +245,7 @@ impl State {
         let pending = crate::provider::by_id(&old.provider).is_pending(&old.id);
         if self.conversation(&session.id).is_none() {
             if pending {
-                self.conversations[source].id = session.id.clone();
+                self.conversations[source].resolve_id(session.id.clone());
                 self.conversations[source].pane_id = Some(pane.into());
             } else {
                 self.add_conversation(
@@ -280,9 +289,9 @@ impl State {
             created_at: now,
             provider,
             turn_started_at: None,
-            content_seen: false,
             pinned: false,
             browser: false,
+            browser_profile: None,
             relocation_requested_at: None,
         });
     }
@@ -410,7 +419,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(conversation.turn_started_at, None);
-        assert!(!conversation.content_seen);
         assert!(!conversation.pinned);
         assert!(!conversation.browser);
     }
@@ -430,9 +438,9 @@ mod tests {
                 created_at: 1,
                 provider: "claude".into(),
                 turn_started_at: None,
-                content_seen: true,
                 pinned: false,
                 browser: false,
+                browser_profile: None,
                 relocation_requested_at: None,
             });
         }
@@ -528,9 +536,9 @@ mod tests {
             created_at: 1,
             provider: "claude".into(),
             turn_started_at: None,
-            content_seen: true,
             pinned: false,
             browser: false,
+            browser_profile: None,
             relocation_requested_at: None,
         });
 

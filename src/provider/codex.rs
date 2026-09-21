@@ -4,8 +4,7 @@
 //! provisional `pending-<uuid>` id and spawned as plain `codex`; every
 //! refresh, `resolve_spawned_id` looks for a rollout matching the
 //! conversation's cwd and spawn time and corc migrates the row to the real
-//! id. Until then the conversation has no metadata, reads as empty, and is
-//! discarded on leave like any untouched conversation (D17).
+//! id. Until then the conversation has no metadata and shows as untitled.
 //!
 //! Rollouts live at `~/.codex/sessions/YYYY/MM/DD/rollout-<local ts>-
 //! <uuid>.jsonl`; `codex resume <uuid>` appends to the same file, so the

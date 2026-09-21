@@ -62,9 +62,7 @@ pub trait Provider: Send + Sync {
     /// conversations already claimed — without it, two pending conversations
     /// in the same directory would both resolve to the same session and one
     /// could never advance to its own. `Ok(None)` means "not discoverable
-    /// yet" — usually that the user simply hasn't sent a message; until they
-    /// do the conversation reads as empty and is subject to the usual
-    /// empty-discard on leave (D17).
+    /// yet" — usually that the user simply hasn't sent a message.
     fn resolve_spawned_id(
         &self,
         _dir: &Path,

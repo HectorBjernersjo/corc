@@ -126,7 +126,6 @@ mod tests {
                 state.conversation(first).unwrap().pane_id.as_deref(),
                 Some("%1")
             );
-            state.conversation_mut(first).unwrap().content_seen = true;
             state.relocate(first, Path::new("/work/b"));
 
             state.add_conversation(
@@ -138,7 +137,6 @@ mod tests {
             state.conversation_mut(second).unwrap().pinned = true;
             state.resume_in_pane("%1", &report(second)).unwrap();
             assert!(state.conversation(first).unwrap().pane_id.is_none());
-            assert!(state.conversation(first).unwrap().content_seen);
             let target = state.conversation(second).unwrap();
             assert_eq!(target.cwd, Path::new("/work/c"));
             assert!(target.pinned);

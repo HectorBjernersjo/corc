@@ -307,6 +307,7 @@ pub fn spawn_conversation(
     provider: &dyn Provider,
     id: &str,
     resume: bool,
+    browser_profile: &str,
 ) -> Result<String> {
     if !dir.is_dir() {
         bail!("directory {} no longer exists", dir.display());
@@ -334,11 +335,19 @@ pub fn spawn_conversation(
     if let Some(config) = &cli_config {
         args.extend(["-e", config]);
     }
+    let browser_config = if provider.id() == "opencode" {
+        Some(crate::browser::opencode_env()?)
+    } else {
+        None
+    };
+    if let Some(config) = &browser_config {
+        args.extend(["-e", config]);
+    }
     // The pane environment is the only thing that varies per conversation all
     // the way down into the agent's own tool calls, which is what gives each
     // conversation its own browser profile (D24). The login shell passes it on
     // untouched, so it reaches the Playwright MCP server the agent starts.
-    let profile = crate::browser::profile_env(id);
+    let profile = crate::browser::profile_env(browser_profile);
     if let Some(profile) = profile.as_deref() {
         args.extend(["-e", profile]);
     }

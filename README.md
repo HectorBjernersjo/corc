@@ -21,9 +21,9 @@ they exit or you reboot.
     with `codex resume <uuid>`. Codex only reveals its session id once the
     first message is sent, so a brand-new conversation shows as untitled
     until then.
-  - **OpenCode** (`opencode`, optional) — corc spawns plain `opencode` and
-    resumes with `opencode --session <id>`. OpenCode creates its session when
-    the first prompt is sent, after which corc adopts its `ses_...` id.
+  - **OpenCode** (`opencode`, optional) uses `opencode --standalone` and
+    resumes with `opencode --standalone --session <id>`. OpenCode creates its
+    session when the first prompt is sent, after which corc adopts its `ses_...` id.
   - Switch which one new conversations use with `s` (see below).
 - **git** / **jj** (both optional) — only used to expand a repo into its other
   checkouts (git worktrees, jj workspaces) for the directory picker. Project
@@ -234,7 +234,13 @@ It needs three things, all checked by `corc doctor`:
    `channel` goes under `launchOptions` if Playwright should not use the Chrome
    it finds by itself.
 
-   Other agents still need a Playwright server of their own, with
+   OpenCode also gets the Playwright server automatically, through a config
+   overlay in its pane environment. corc runs it with `--standalone` so its
+   private server and browser stay under the pane's process tree. This uses
+   Playwright tools, not OpenCode's desktop-only browser tools. Restart existing
+   OpenCode panes to pick up the integration.
+
+   Codex and Cursor still need a Playwright server of their own, with
    `--config ~/.config/corc/playwright.json` in its arguments.
 
 Every conversation gets its own browser, and its own profile to go with it, in
@@ -247,6 +253,8 @@ inherits.
 
 Logins therefore persist per conversation, resumes included, and the profiles of
 conversations you have removed are deleted the next time corc starts.
+When a provisional session id becomes a real id, corc keeps the original profile
+directory and records its name for subsequent resumes.
 
 There is no quit key — corc is meant to live in its own tmux session. To stop
 it, kill that session yourself (e.g. `tmux kill-session -t _corc`). `Ctrl+C`

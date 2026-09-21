@@ -6,8 +6,9 @@
 //! tool call — and talks to it over `--remote-debugging-pipe`, which no other
 //! process can join. The single thing corc needs is for that Chromium to
 //! *also* listen on a TCP port, which one flag in a Playwright config file
-//! arranges. corc writes that file and hands Claude a Playwright MCP server
-//! that loads it (`mcp_config_file`). Port `0` lets the kernel choose, so
+//! arranges. corc writes that file and hands Claude and OpenCode a Playwright
+//! MCP server that loads it. OpenCode runs a private server with `--standalone`
+//! so its tools stay below the pane's pid too. Port `0` lets the kernel choose, so
 //! there is no allocation to coordinate and no per-conversation config file:
 //! Chromium writes the chosen port into `DevToolsActivePort` in its user data
 //! directory, and corc finds both by walking down from the agent pane's pid.
@@ -742,8 +743,8 @@ const PROFILE_ENV: &str = "PLAYWRIGHT_MCP_USER_DATA_DIR";
 ///
 /// `--isolated` would too, by keeping the profile in memory, but it throws away
 /// every login the agent ever performs. A directory per conversation keeps them
-/// for as long as the conversation exists, resumes included, since a resumed
-/// conversation keeps its id.
+/// for as long as the conversation exists, resumes included. The profile key
+/// survives the replacement of a provisional session id with the real one.
 ///
 /// Cache rather than state: a lost profile costs a fresh login, nothing here is
 /// worth backing up, and `prune_profiles` is free to delete.
@@ -792,7 +793,11 @@ fn prune_profiles_in(root: &std::path::Path, state: &state::State) {
         let Some(id) = name.to_str() else {
             continue;
         };
-        if state.conversation(id).is_none() {
+        if !state
+            .conversations
+            .iter()
+            .any(|c| c.browser_profile() == id)
+        {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -840,6 +845,48 @@ pub fn mcp_config_file() -> Result<PathBuf> {
     let path = state::state_dir()?.join("claude-mcp.json");
     state::write_if_changed(&path, &mcp_config_json(&config))?;
     Ok(path)
+}
+
+/// The private OpenCode server inherits this overlay from its pane. Preserve
+/// the caller's inline settings and replace only the Playwright server.
+pub fn opencode_env() -> Result<String> {
+    let config = ensure_config()?;
+    let inline = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    let merged = opencode_config(inline.as_deref(), &config)?;
+    Ok(format!("OPENCODE_CONFIG_CONTENT={merged}"))
+}
+
+fn opencode_config(inline: Option<&str>, config: &std::path::Path) -> Result<serde_json::Value> {
+    let mut value: serde_json::Value = match inline {
+        Some(raw) => serde_json::from_str(raw).context("reading OpenCode inline config")?,
+        None => serde_json::json!({}),
+    };
+    anyhow::ensure!(
+        value.is_object(),
+        "OpenCode inline config must be an object"
+    );
+    let mcp = value
+        .as_object_mut()
+        .unwrap()
+        .entry("mcp")
+        .or_insert_with(|| serde_json::json!({}));
+    let mcp = mcp
+        .as_object_mut()
+        .context("OpenCode inline mcp must be an object")?;
+    let servers = mcp
+        .entry("servers")
+        .or_insert_with(|| serde_json::json!({}));
+    let servers = servers
+        .as_object_mut()
+        .context("OpenCode inline mcp.servers must be an object")?;
+    servers.insert(
+        "playwright".into(),
+        serde_json::json!({
+            "type": "local",
+            "command": ["npx", "-y", "@playwright/mcp@latest", "--config", config],
+        }),
+    );
+    Ok(value)
 }
 
 fn mcp_config_json(config: &std::path::Path) -> String {
@@ -924,9 +971,19 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":{id},"method":{method_and_params}}}"#
             )
             .unwrap();
-            let mut response = String::new();
-            self.stdout.read_line(&mut response).unwrap();
-            response
+            loop {
+                let mut response = String::new();
+                assert_ne!(
+                    self.stdout.read_line(&mut response).unwrap(),
+                    0,
+                    "MCP server exited"
+                );
+                let message: serde_json::Value = serde_json::from_str(&response).unwrap();
+                if message["id"] == id {
+                    assert!(message.get("error").is_none(), "{response}");
+                    return response;
+                }
+            }
         }
 
         /// The agent's first browser tool call, which is what launches Chromium.
@@ -948,6 +1005,11 @@ mod tests {
     /// about — and it would outlive the test run to block a real conversation.
     impl Drop for Mcp {
         fn drop(&mut self) {
+            // Close Chromium before terminating npx, which may not forward a
+            // signal to the MCP process it launched.
+            if !std::thread::panicking() {
+                self.request(r#""tools/call","params":{"name":"browser_close","arguments":{}}"#);
+            }
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -1208,10 +1270,38 @@ mod tests {
 
         let mut state = state::State::default();
         state.add_conversation("live".into(), "/tmp".into(), "%1".into(), "claude".into());
+        // Resolving a pending id and restarting corc must retain the original
+        // profile, including when resolution arrives through the resume hook.
+        state.add_conversation(
+            "pending-opencode-test".into(),
+            "/tmp".into(),
+            "%2".into(),
+            "opencode".into(),
+        );
+        std::fs::create_dir_all(root.join("pending-opencode-test/Default")).unwrap();
+        state.resume_in_pane(
+            "%2",
+            &crate::resume::Session {
+                provider: "opencode".into(),
+                id: "ses_real".into(),
+            },
+        );
+        let mut state: state::State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let resumed = state.conversation("ses_real").unwrap();
+        assert_eq!(resumed.browser_profile(), "pending-opencode-test");
+        assert_eq!(
+            profile_env(resumed.browser_profile()),
+            profile_env("pending-opencode-test")
+        );
         prune_profiles_in(&root, &state);
 
         assert!(root.join("live/Default").exists());
         assert!(!root.join("forgotten").exists());
+        assert!(root.join("pending-opencode-test/Default").exists());
+        state.conversations.retain(|c| c.id != "ses_real");
+        prune_profiles_in(&root, &state);
+        assert!(!root.join("pending-opencode-test").exists());
         // A root that was never created is not an error worth reporting: no
         // conversation has opened a browser yet.
         prune_profiles_in(&root.join("nothing-here"), &state);
@@ -1227,5 +1317,146 @@ mod tests {
         // Port 0 is the whole point: the kernel picks, so two conversations
         // never contend for one port.
         assert_eq!(parsed["browser"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn opencode_overlay_preserves_settings_and_replaces_only_playwright() {
+        let inline = serde_json::json!({
+            "model": "test/model",
+            "permissions": [{"action": "shell", "resource": "*", "effect": "ask"}],
+            "mcp": {
+                "timeout": {"startup": 45000},
+                "servers": {
+                    "other": {"type": "local", "command": ["other"]},
+                    "playwright": {"type": "remote", "url": "https://old.invalid", "disabled": true}
+                }
+            }
+        });
+        let path = std::path::Path::new("/config with spaces/playwright.json");
+        let merged = opencode_config(Some(&inline.to_string()), path).unwrap();
+        assert_eq!(merged["model"], inline["model"]);
+        assert_eq!(merged["permissions"], inline["permissions"]);
+        assert_eq!(merged["mcp"]["timeout"], inline["mcp"]["timeout"]);
+        assert_eq!(
+            merged["mcp"]["servers"]["other"],
+            inline["mcp"]["servers"]["other"]
+        );
+        assert_eq!(
+            merged["mcp"]["servers"]["playwright"],
+            opencode_config(None, path).unwrap()["mcp"]["servers"]["playwright"]
+        );
+        for invalid in [
+            "null",
+            "[]",
+            "{",
+            r#"{"mcp":false}"#,
+            r#"{"mcp":{"servers":[]}}"#,
+        ] {
+            assert!(opencode_config(Some(invalid), path).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs opencode, curl, npx and network"]
+    fn private_opencode_server_connects_to_the_supplied_playwright_server() {
+        struct Server(Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = scratch_profiles("opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = opencode_config(None, &ensure_config().unwrap()).unwrap();
+        let marker = root.join("mcp-environment");
+        let profile = root.join("profile");
+        // Observe the process boundary, then exec the real supplied MCP command.
+        let command = config["mcp"]["servers"]["playwright"]["command"]
+            .as_array_mut()
+            .unwrap();
+        command.splice(0..0, [
+            serde_json::json!("sh"), serde_json::json!("-c"),
+            serde_json::json!("printf '%s\\n%s\\n' \"$$\" \"$PLAYWRIGHT_MCP_USER_DATA_DIR\" > \"$1\"; shift; exec \"$@\""),
+            serde_json::json!("corc-mcp-test"), serde_json::json!(marker),
+        ]);
+        let mut server = Server(
+            Command::new("opencode")
+                .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+                .current_dir(&root)
+                .env("OPENCODE_CONFIG_CONTENT", config.to_string())
+                .env(PROFILE_ENV, &profile)
+                .env("OPENCODE_DB", root.join("opencode.db"))
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("starting private OpenCode server"),
+        );
+        let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
+        let mut listening = String::new();
+        let mut password = String::new();
+        stdout.read_line(&mut listening).unwrap();
+        stdout.read_line(&mut password).unwrap();
+        let url = listening
+            .trim()
+            .strip_prefix("server listening on ")
+            .expect("server URL");
+        let password = password
+            .trim()
+            .strip_prefix("server password ")
+            .expect("server password");
+        let request = |method: &str, path: &str| -> serde_json::Value {
+            let output = Command::new("curl")
+                .args([
+                    "--silent",
+                    "--show-error",
+                    "--fail-with-body",
+                    "--max-time",
+                    "45",
+                    "--user",
+                    &format!("opencode:{password}"),
+                    "-X",
+                    method,
+                    &format!("{url}{path}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            if output.stdout.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&output.stdout).unwrap()
+            }
+        };
+        // Load the location before accessing its lazily initialized MCP runtime.
+        request("GET", "/api/config");
+        wait_for(|| {
+            let servers = request("GET", "/api/mcp");
+            servers["data"]
+                .as_array()?
+                .iter()
+                .any(|s| s["name"] == "playwright")
+                .then_some(())
+        })
+        .expect("Playwright registered in the private server");
+        request("POST", "/api/experimental/mcp/playwright/connect");
+        let servers = request("GET", "/api/mcp");
+        let playwright = servers["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "playwright")
+            .expect("Playwright server");
+        assert_eq!(playwright["status"]["status"], "connected", "{playwright}");
+        let observed = std::fs::read_to_string(&marker).unwrap();
+        let mut lines = observed.lines();
+        let pid: u32 = lines.next().unwrap().parse().unwrap();
+        assert!(descendants(&child_map(), server.0.id()).contains(&pid));
+        assert_eq!(lines.next().unwrap(), profile.to_str().unwrap());
+        request("POST", "/api/experimental/mcp/playwright/disconnect");
     }
 }
